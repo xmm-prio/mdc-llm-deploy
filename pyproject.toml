@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Transformers-compatible LLM compression and MDC ONNX export library"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.11,<3.13"
 authors = [{ name = "MDC LLM Deploy contributors" }]
 dependencies = [
   "numpy>=2.0,<3",
@@ -48,7 +48,7 @@ addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]
@@ -56,7 +56,7 @@ select = ["E", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
 ignore = ["E501"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.11"
 strict = true
 packages = ["mdc_llm_deploy"]
 warn_unreachable = true

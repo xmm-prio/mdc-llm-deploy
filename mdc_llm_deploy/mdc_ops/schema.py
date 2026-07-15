@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-type AttributeValue = bool | float | int | str
+AttributeValue = bool | float | int | str
 
 MDC_ONNX_DOMAIN = "ai.onnx"
 MDC_ONNX_OPSET = 18

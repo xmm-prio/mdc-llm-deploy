@@ -442,7 +442,7 @@ def validate_capability_request(
 T = TypeVar("T", bound="GraphModule")
 
 
-def transactional_update(graph: T, mutator: Callable[[T], None]) -> T:  # noqa: UP047
+def transactional_update(graph: T, mutator: Callable[[T], None]) -> T:
     """Validate a candidate then atomically replace state, preserving identity."""
     validate_graph(graph)
     candidate = copy.deepcopy(graph)

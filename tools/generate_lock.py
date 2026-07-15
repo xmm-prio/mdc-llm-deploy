@@ -79,10 +79,9 @@ def generate(output: str | Path = ROOT / "requirements.lock") -> Path:
         version = Version(distribution.version).public
         hashes = _hashes(name, distribution.version)
         lines.append(f"{name}=={version} \\")
-        lines.extend(
-            f"    --hash=sha256:{digest}{' \\' if index < len(hashes) - 1 else ''}"
-            for index, digest in enumerate(hashes)
-        )
+        for index, digest in enumerate(hashes):
+            continuation = " \\" if index < len(hashes) - 1 else ""
+            lines.append(f"    --hash=sha256:{digest}{continuation}")
     target = Path(output)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{target.name}.",

@@ -13,7 +13,7 @@ from torch.nn import functional
 
 from .schema import OPERATOR_SCHEMAS, TORCH_NAMESPACE
 
-type Kernel = Callable[..., Tensor | tuple[Tensor, Tensor]]
+Kernel = Callable[..., Tensor | tuple[Tensor, Tensor]]
 _FLOAT_DTYPES = {torch.float16, torch.float32, torch.bfloat16}
 _ATTENTION_DTYPES = _FLOAT_DTYPES | {torch.int8}
 _MASK_DTYPES = {torch.bool, torch.int8, torch.uint8}

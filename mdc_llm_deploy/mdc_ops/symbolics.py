@@ -11,7 +11,7 @@ from torch.onnx.symbolic_helper import parse_args
 
 from .schema import OPERATOR_SCHEMAS
 
-type Symbolic = Callable[..., Any]
+Symbolic = Callable[..., Any]
 
 
 def _schema(name: str) -> Any:

@@ -41,7 +41,7 @@
 
 ## 4. 技术与依赖约束
 
-- Python 3.12 是 `0.1.0` 唯一受支持、唯一发布阻塞的开发与验证环境；其他 Python 版本即使被包元数据接受，也只能视为未验证兼容性，不得用于发布结论。
+- Python 3.11 和 3.12 均受 `0.1.0` 支持；A 端发布门禁固定使用 Python 3.12，B 端 GPU 与 ATC 验证允许使用实际部署环境的 Python 3.11。
 - 核心依赖包括 PyTorch、Transformers、Accelerate、ONNX、ONNXScript、Datasets、Evaluate 和 Triton。
 - 核心依赖采用“经过验证的版本范围”策略，开发环境同时提供带哈希的锁定版本。依赖上下界、锁文件和 B 端环境摘要必须在首次发布候选验收前固化。
 - ONNX opset 固定为 18。
@@ -414,7 +414,7 @@ GPTQ-linear 和 GPTQ-moe 仅执行 FX 验收，不生成 ONNX/OM。
 - `BLOCKED`：外部环境、工具链、依赖或待修复缺陷使必需证据无法取得。`BLOCKED` 不是失败豁免，也不是“尚未执行”的美化；任何发布阻塞项处于该状态时不得发布。
 - `WAIVED`：仅适用于 PRD 明确列为非发布范围或信息性附加检查的项目，必须记录范围、原因、影响、批准人和批准日期。不得用于下列不可豁免门禁。
 
-不可豁免门禁包括：Python 3.12 全量限定测试；候选图完整验证与事务失败不变性；标准中间 ONNX checker/shape inference；最终 MDC 方言结构检查；GPTQ ONNX 明确拒绝；六个自定义算子 CPU reference；B 端六算子 GPU reference 对照；六个自定义节点和扩展 INT8 `MatMul` parser 探针；28 项发布矩阵的 ATC 成功定义。任一未 `PASS`，发布状态必须是 `BLOCKED`。
+不可豁免门禁包括：A 端 Python 3.12 全量限定测试；B 端 Python 3.11 或 3.12 GPU/ATC 验证；候选图完整验证与事务失败不变性；标准中间 ONNX checker/shape inference；最终 MDC 方言结构检查；GPTQ ONNX 明确拒绝；六个自定义算子 CPU reference；B 端六算子 GPU reference 对照；六个自定义节点和扩展 INT8 `MatMul` parser 探针；28 项发布矩阵的 ATC 成功定义。任一未 `PASS`，发布状态必须是 `BLOCKED`。
 
 ### 11.6 不在当前范围内的验收
 
@@ -431,6 +431,6 @@ GPTQ-linear 和 GPTQ-moe 仅执行 FX 验收，不生成 ONNX/OM。
 ## 12. 明确不承诺的兼容性
 
 - FX 图只作为进程内交换对象，`0.1.0` 不承诺复制、保存、加载或跨版本兼容。
-- 包元数据虽然允许 Python `>=3.11`，但除 Python 3.12 外均不作为发布阻塞环境。
+- 包元数据允许 Python `>=3.11,<3.13`；A 端在 Python 3.12 执行发布门禁，B 端在 Python 3.11 或 3.12 执行 GPU/ATC 门禁。
 - B 端工具链升级后，同一提交的 ATC 结果可能变化；`0.1.0` 不承诺跨工具链版本结果相同，但每次结果必须能在其记录的环境版本上复现。
 

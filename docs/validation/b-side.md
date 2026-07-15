@@ -41,7 +41,7 @@ commit_requested_by_a: <40位SHA>
 branch: <分支名>
 workspace_clean_before: <true|false>
 workspace_clean_after: <true|false>
-python: <必须为3.12.x>
+python: <必须为3.11.x或3.12.x>
 dependency_lock_sha256: <SHA-256或BLOCKED:锁文件不存在>
 config_sha256: <SHA-256；阶段0无配置时填N/A>
 os: <名称和版本>
@@ -59,7 +59,7 @@ artifact_returned_to_a: false
 code_changed_on_b: false
 ```
 
-`commit_sha` 必须等于 `commit_requested_by_a`；否则整体 `BLOCKED`。Python 非 3.12、工作区不干净、SoC/CANN/OPP/ATC 任一未知时，不运行探针，先返回环境阻塞摘要。
+`commit_sha` 必须等于 `commit_requested_by_a`；否则整体 `BLOCKED`。Python 非 3.11/3.12、工作区不干净、SoC/CANN/OPP/ATC 任一未知时，不运行探针，先返回环境阻塞摘要。ATC/CANN/OPP 事实通过 mailbox MCP 编译结果采集，不以远端交互 shell 的 `PATH` 判断可用性。
 
 ## 单项探针记录模板
 
