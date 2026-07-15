@@ -123,29 +123,34 @@ def test_dequant_rejects_high_bits_nonfinite_and_shape() -> None:
         ascend_dequant(x, torch.ones(2, dtype=torch.uint64))
 
 
-def test_moe_rejects_wrong_contract_and_route_values() -> None:
+@pytest.mark.parametrize(
+    ("argument_index", "replacement", "message"),
+    [
+        (4, torch.ones(20), "21 ordered scales"),
+        (1, torch.tensor([[1, 1, 4]], dtype=torch.int16), "unique"),
+        (1, torch.tensor([[0, 1, 3]], dtype=torch.int16), "shared id 4"),
+        (
+            2,
+            torch.tensor([[0.25, 0.5, 1.0]], dtype=torch.float16),
+            "sum to one",
+        ),
+        (5, torch.zeros(20, dtype=torch.int32), "21-scale order"),
+    ],
+    ids=(
+        "scale-count",
+        "duplicate-expert-ids",
+        "shared-expert-id",
+        "route-weight-sum",
+        "offset-count",
+    ),
+)
+def test_moe_rejects_wrong_contract_and_route_values(
+    argument_index: int,
+    replacement: torch.Tensor,
+    message: str,
+) -> None:
     valid = list(_valid_moe_inputs())
-    invalid_scales = valid.copy()
-    invalid_scales[4] = torch.ones(20)
-    with pytest.raises(ValueError, match="21 ordered scales"):
-        moe_expert(*invalid_scales)
+    valid[argument_index] = replacement
 
-    duplicate_ids = valid.copy()
-    duplicate_ids[1] = torch.tensor([[1, 1, 4]], dtype=torch.int16)
-    with pytest.raises(ValueError, match="unique"):
-        moe_expert(*duplicate_ids)
-
-    wrong_shared = valid.copy()
-    wrong_shared[1] = torch.tensor([[0, 1, 3]], dtype=torch.int16)
-    with pytest.raises(ValueError, match="shared id 4"):
-        moe_expert(*wrong_shared)
-
-    wrong_weight_sum = valid.copy()
-    wrong_weight_sum[2] = torch.tensor([[0.25, 0.5, 1.0]], dtype=torch.float16)
-    with pytest.raises(ValueError, match="sum to one"):
-        moe_expert(*wrong_weight_sum)
-
-    wrong_offsets = valid.copy()
-    wrong_offsets[5] = torch.zeros(20, dtype=torch.int32)
-    with pytest.raises(ValueError, match="21-scale order"):
-        moe_expert(*wrong_offsets)
+    with pytest.raises(ValueError, match=message):
+        moe_expert(*valid)

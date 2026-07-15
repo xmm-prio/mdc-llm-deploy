@@ -152,18 +152,10 @@ def _validate_custom_node_reachability(
             continue
         pending.extend(name for name in producer.input if name)
 
-    reachable_ops = {
-        "NPURmsNorm",
-        "ApplyRotaryPosEmb",
-        "FusedInferAttentionScore",
-        "NPUAscendQuantV2",
-        "AscendDequant",
-    }
     custom_nodes = [
         node
         for node in model.graph.node
-        if node.op_type in reachable_ops
-        and not node.name.startswith("mdc.moe.")
+        if node.op_type in CUSTOM_OPS
     ]
     isolated = [
         node.name or node.op_type
@@ -256,11 +248,102 @@ def _validate_mask_initializer(
         )
 
 
+def _validate_attention_quantization_contract(
+    model: onnx.ModelProto,
+    attention: onnx.NodeProto,
+) -> None:
+    types = {
+        item.name: item.type.tensor_type.elem_type
+        for item in (*model.graph.input, *model.graph.output, *model.graph.value_info)
+    }
+    types.update(
+        (item.name, item.data_type)
+        for item in model.graph.initializer
+    )
+    if not all(types.get(attention.input[index]) == TensorProto.INT8 for index in range(3)):
+        return
+
+    required = {
+        7: "dequant_scale1",
+        8: "quant_scale1",
+        9: "dequant_scale2",
+        17: "key_antiquant_scale",
+        19: "value_antiquant_scale",
+        27: "dequant_scale_query",
+    }
+    initializers = {item.name: item for item in model.graph.initializer}
+    for index, slot_name in required.items():
+        input_name = attention.input[index]
+        initializer = initializers.get(input_name)
+        if not input_name or initializer is None:
+            raise OnnxExportError(
+                f"INT8 per-tensor attention requires {slot_name}"
+            )
+        if (
+            initializer.data_type != TensorProto.FLOAT
+            or tuple(initializer.dims) not in {(), (1,)}
+        ):
+            raise OnnxExportError(
+                f"Attention {slot_name} must be a one-element FLOAT32 initializer"
+            )
+        value = float(numpy_helper.to_array(initializer).reshape(-1)[0])
+        if not math.isfinite(value) or value <= 0:
+            raise OnnxExportError(
+                f"Attention {slot_name} must be finite and positive"
+            )
+
+
 def _validate_moe_contract(model: onnx.ModelProto, properties: dict[str, str]) -> None:
     node = next(item for item in model.graph.node if item.op_type == "MoeExpert")
     initializers = {item.name: item for item in model.graph.initializer}
+    specs = {
+        item.name: (item.type.tensor_type.elem_type, _shape(item))
+        for item in (*model.graph.input, *model.graph.output, *model.graph.value_info)
+    }
+    specs.update(
+        (item.name, (item.data_type, tuple(item.dims)))
+        for item in model.graph.initializer
+    )
+    expected_types = (
+        TensorProto.INT8,
+        TensorProto.INT16,
+        TensorProto.FLOAT16,
+        TensorProto.INT8,
+        TensorProto.FLOAT,
+        TensorProto.INT32,
+    )
+    if len(node.input) != 6 or any(
+        specs.get(name, (None, ()))[0] != expected
+        for name, expected in zip(node.input, expected_types, strict=True)
+    ):
+        raise OnnxExportError("MoeExpert input dtypes must match the six-input ATC ABI")
+    x_shape = specs[node.input[0]][1]
+    ids_shape = specs[node.input[1]][1]
+    weights_shape = specs[node.input[2]][1]
+    output_shape = specs.get(node.output[0])
+    if len(x_shape) != 2 or x_shape[1] % 256 != 0:
+        raise OnnxExportError(
+            "MoeExpert hidden_size must use the ATC-verified 256-element alignment"
+        )
+    token_count, hidden_size = x_shape
+    if ids_shape != (token_count, 3) or weights_shape != ids_shape:
+        raise OnnxExportError("MoeExpert routing inputs must use matching [tokenNum, 3] shapes")
+    if output_shape != (TensorProto.FLOAT16, x_shape):
+        raise OnnxExportError("MoeExpert output must use FLOAT16[tokenNum, hiddenSize]")
+
+    packed = initializers.get(node.input[3])
     scales = initializers.get(node.input[4])
-    offsets = initializers.get(node.input[5]) if len(node.input) == 6 else None
+    offsets = initializers.get(node.input[5])
+    if packed is None or len(packed.dims) != 1:
+        raise OnnxExportError("MoeExpert expert_weights must be a one-dimensional initializer")
+    denominator = 5 * 3 * hidden_size
+    if packed.dims[0] % denominator:
+        raise OnnxExportError("MoeExpert expert_weights packed length is invalid")
+    intermediate_size = packed.dims[0] // denominator
+    if intermediate_size <= 0 or intermediate_size % 128 != 0:
+        raise OnnxExportError(
+            "MoeExpert intermediate_size must use the ATC-verified 128-element alignment"
+        )
     if scales is None or scales.data_type != TensorProto.FLOAT or tuple(scales.dims) != (21,):
         raise OnnxExportError("MoeExpert quant_scales must be FLOAT32[21]")
     if (
@@ -273,10 +356,32 @@ def _validate_moe_contract(model: onnx.ModelProto, properties: dict[str, str]) -
         "mdc.moe.expert_order",
         "mdc.moe.weight_projection_order",
         "mdc.moe.weight_offsets",
+        "mdc.moe.weight_lengths",
+        "mdc.moe.hidden_size",
+        "mdc.moe.intermediate_size",
         "mdc.moe.quant_parameter_count",
     }
     if required - properties.keys() or properties["mdc.moe.quant_parameter_count"] != "21":
         raise OnnxExportError("MoE packing metadata is incomplete")
+    try:
+        metadata_offsets = tuple(
+            int(item) for item in properties["mdc.moe.weight_offsets"].split(",")
+        )
+        metadata_lengths = tuple(
+            int(item) for item in properties["mdc.moe.weight_lengths"].split(",")
+        )
+        metadata_hidden = int(properties["mdc.moe.hidden_size"])
+        metadata_intermediate = int(properties["mdc.moe.intermediate_size"])
+    except ValueError as error:
+        raise OnnxExportError("MoE packing metadata is invalid") from error
+    segment = hidden_size * intermediate_size
+    if (
+        metadata_offsets != tuple(index * segment for index in range(15))
+        or metadata_lengths != (segment,) * 15
+        or metadata_hidden != hidden_size
+        or metadata_intermediate != intermediate_size
+    ):
+        raise OnnxExportError("MoE packing metadata does not match tensor shapes")
 
 
 def validate_mdc_model(model: onnx.ModelProto) -> None:
@@ -380,6 +485,7 @@ def validate_mdc_model(model: onnx.ModelProto) -> None:
     attention = next(
         node for node in model.graph.node if node.op_type == "FusedInferAttentionScore"
     )
+    _validate_attention_quantization_contract(model, attention)
     if mask_mode == "masked":
         _validate_mask_initializer(model, attention, stage)
     if "moe" in properties["mdc.target"]:

@@ -22,7 +22,7 @@ from ..graph import (
     metadata,
     validate_capability_request,
 )
-from .validator import validate_mdc_model, validate_serialized_model
+from .validator import CUSTOM_OPS, validate_mdc_model, validate_serialized_model
 
 MaskMode = Literal["masked", "maskless"]
 
@@ -343,14 +343,9 @@ def _replace_nodes(
 
 def _prune_unreachable(model: onnx.ModelProto) -> None:
     """Remove standard lowering remnants that cannot affect graph outputs."""
+    _remove_redundant_identities(model)
     producers = _producer_map(model)
     required_values = [item.name for item in model.graph.output]
-    required_values.extend(
-        output
-        for node in model.graph.node
-        if node.op_type == "MoeExpert"
-        for output in node.output
-    )
     required_outputs: set[str] = set()
     while required_values:
         value_name = required_values.pop()
@@ -368,14 +363,76 @@ def _prune_unreachable(model: onnx.ModelProto) -> None:
     ]
     del model.graph.node[:]
     model.graph.node.extend(retained)
-    used_initializers = {
-        name for node in model.graph.node for name in node.input if name
-    }
+    used_initializers = {name for node in model.graph.node for name in node.input if name}
+    used_initializers.update(item.name for item in model.graph.output)
     retained_initializers = [
         item for item in model.graph.initializer if item.name in used_initializers
     ]
     del model.graph.initializer[:]
     model.graph.initializer.extend(retained_initializers)
+    valid_values = {item.name for item in model.graph.input}
+    valid_values.update(item.name for item in model.graph.output)
+    valid_values.update(item.name for item in model.graph.initializer)
+    valid_values.update(output for node in model.graph.node for output in node.output)
+    retained_value_info = [
+        item for item in model.graph.value_info if item.name in valid_values
+    ]
+    del model.graph.value_info[:]
+    model.graph.value_info.extend(retained_value_info)
+
+
+def _remove_redundant_identities(model: onnx.ModelProto) -> None:
+    """Remove strict Identity nodes without crossing an MDC custom operator."""
+    while True:
+        nodes = list(model.graph.node)
+        graph_outputs = {item.name for item in model.graph.output}
+        producers = _producer_map(model)
+        consumer_counts: dict[str, int] = {}
+        for node in nodes:
+            for name in node.input:
+                if name:
+                    consumer_counts[name] = consumer_counts.get(name, 0) + 1
+        removable: tuple[onnx.NodeProto, onnx.NodeProto, str, str] | None = None
+        for identity in nodes:
+            if (
+                identity.op_type != "Identity"
+                or identity.domain not in {"", "ai.onnx"}
+                or identity.attribute
+                or len(identity.input) != 1
+                or len(identity.output) != 1
+            ):
+                continue
+            source = identity.input[0]
+            output = identity.output[0]
+            producer = producers.get(source)
+            if (
+                not source
+                or not output
+                or source in graph_outputs
+                or consumer_counts.get(source) != 1
+                or producer is None
+                or producer.op_type in CUSTOM_OPS
+            ):
+                continue
+            removable = identity, producer, source, output
+            break
+        if removable is None:
+            return
+        identity, producer, source, output = removable
+        producer.output[:] = [
+            output if name == source else name for name in producer.output
+        ]
+        typed_values = {item.name for item in model.graph.input}
+        typed_values.update(item.name for item in model.graph.output)
+        typed_values.update(item.name for item in model.graph.value_info)
+        if output not in typed_values:
+            source_info = next(
+                (item for item in model.graph.value_info if item.name == source),
+                None,
+            )
+            if source_info is not None:
+                source_info.name = output
+        model.graph.node.remove(identity)
 
 
 def _topologically_sort(model: onnx.ModelProto) -> None:
@@ -630,6 +687,33 @@ def _scale_initializer(
         values = 1.0 / values
     result = _unique(model, name)
     model.graph.initializer.append(_initializer(result, values.astype(dtype).squeeze()))
+    return result
+
+
+def _product_scale_initializer(
+    model: onnx.ModelProto,
+    name: str,
+    left: QuantizedTarget,
+    right: QuantizedTarget,
+) -> str:
+    if (
+        left.granularity != "per_tensor"
+        or right.granularity != "per_tensor"
+        or len(left.scale) != 1
+        or len(right.scale) != 1
+    ):
+        raise OnnxExportError(
+            "Quantized Attention accumulator scales require per-tensor inputs"
+        )
+    value = float(left.scale[0]) * float(right.scale[0])
+    if not math.isfinite(value) or value <= 0:
+        raise OnnxExportError(
+            "Quantized Attention accumulator scale must be finite and positive"
+        )
+    result = _unique(model, name)
+    model.graph.initializer.append(
+        _initializer(result, np.asarray(value, dtype=np.float32))
+    )
     return result
 
 
@@ -957,9 +1041,23 @@ def _append_rope_attention(
         mask_name = _unique(model, "mdc.attention.mask")
         model.graph.initializer.append(_initializer(mask_name, mask))
         inputs[4] = mask_name
+    if query_target is not None and key_target is not None:
+        inputs[7] = _product_scale_initializer(
+            model,
+            "mdc.attention.dequant_scale1",
+            query_target,
+            key_target,
+        )
     if score_target is not None:
         inputs[8] = _scale_initializer(
             model, "mdc.attention.quant_scale1", score_target, inverse=True
+        )
+    if score_target is not None and value_target is not None:
+        inputs[9] = _product_scale_initializer(
+            model,
+            "mdc.attention.dequant_scale2",
+            score_target,
+            value_target,
         )
     if key_target is not None:
         inputs[17] = _scale_initializer(
@@ -1242,11 +1340,46 @@ def _append_moe(model: onnx.ModelProto, value: GraphMetadata) -> None:
     if value.model_kind != "moe" or not targets:
         return
     hidden_size = int(value.properties.get("hidden_size") or 64)
-    source, _, source_shape = _pick_rank(
-        model,
-        3,
-        shape_filter=lambda shape: shape[-1] == hidden_size,
+    post_attention_norm = next(
+        (
+            node
+            for node in model.graph.node
+            if node.name == "mdc.rms_norm.post_attention_norm"
+        ),
+        None,
     )
+    final_norm = next(
+        (
+            node
+            for node in model.graph.node
+            if node.name == "mdc.rms_norm.final_norm"
+        ),
+        None,
+    )
+    if post_attention_norm is None or final_norm is None:
+        raise OnnxExportError("Cannot locate MoE normalization boundaries")
+    source = post_attention_norm.output[0]
+    source_type = _types(model).get(source)
+    if source_type is None:
+        raise OnnxExportError("MoE source lacks static type metadata")
+    _, source_shape = source_type
+    if len(source_shape) != 3 or source_shape[-1] != hidden_size:
+        raise OnnxExportError("MoE source shape is invalid")
+    final_residual = _producer_map(model).get(final_norm.input[0])
+    residual_input = post_attention_norm.input[0]
+    if (
+        final_residual is None
+        or final_residual.op_type != "Add"
+        or residual_input not in final_residual.input
+    ):
+        raise OnnxExportError("Cannot locate MoE residual merge")
+    body_indices = [
+        index
+        for index, input_name in enumerate(final_residual.input)
+        if input_name != residual_input
+    ]
+    if len(body_indices) != 1:
+        raise OnnxExportError("MoE residual merge has an invalid ABI")
     token_count = int(np.prod(source_shape[:-1]))
     activation = _activation_target(value, targets[0])
     quantized = _append_quant(model, source, source_shape, activation, "mdc.moe.quant")
@@ -1409,6 +1542,21 @@ def _append_moe(model: onnx.ModelProto, value: GraphMetadata) -> None:
         )
     )
     _append_value(model, output, TensorProto.FLOAT16, (token_count, hidden_size))
+    output_shape_name = _unique(model, "mdc.moe.output_shape")
+    output_3d = _unique(model, "mdc.moe.output_3d")
+    model.graph.initializer.append(
+        _initializer(output_shape_name, np.asarray(source_shape, dtype=np.int64))
+    )
+    model.graph.node.append(
+        helper.make_node(
+            "Reshape",
+            [output, output_shape_name],
+            [output_3d],
+            name="mdc.moe.output_reshape",
+        )
+    )
+    _append_value(model, output_3d, TensorProto.FLOAT16, source_shape)
+    final_residual.input[body_indices[0]] = output_3d
 
 
 def _lower(
@@ -1461,6 +1609,11 @@ def _lower(
         properties["mdc.moe.weight_offsets"] = ",".join(
             str(index * segment) for index in range(15)
         )
+        properties["mdc.moe.weight_lengths"] = ",".join(
+            str(segment) for _ in range(15)
+        )
+        properties["mdc.moe.hidden_size"] = str(hidden_size)
+        properties["mdc.moe.intermediate_size"] = str(intermediate_size)
         properties["mdc.moe.quant_parameter_count"] = "21"
     _remove_dynamic_value_info(model)
     helper.set_model_props(

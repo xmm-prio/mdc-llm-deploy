@@ -492,6 +492,16 @@ def convert_to_decode(graph: GraphModule) -> GraphModule:
                 continue
             node.args = _replace_static_sequence(node.args, value.sequence_length)
             node.kwargs = _replace_static_sequence(dict(node.kwargs), value.sequence_length)
+        candidate.graph.eliminate_dead_code()
+        live_nodes = {node.name for node in candidate.graph.nodes}
+        boundaries = tuple(
+            replace(
+                boundary,
+                nodes=tuple(node for node in boundary.nodes if node in live_nodes),
+            )
+            for boundary in value.boundaries
+            if any(node in live_nodes for node in boundary.nodes)
+        )
 
         key_target = _cache_target(value, "key")
         value_target = _cache_target(value, "value")
@@ -539,6 +549,10 @@ def convert_to_decode(graph: GraphModule) -> GraphModule:
                 "query_length": 1,
                 "position_ids": (value.sequence_length - 1,),
                 "mask_semantics": "all cached and current tokens visible",
+                "aten_node_count": sum(
+                    node.op == "call_function" and "aten::" in _node_target(node)
+                    for node in candidate.graph.nodes
+                ),
             }
         )
         next_stage = (
@@ -553,6 +567,7 @@ def convert_to_decode(graph: GraphModule) -> GraphModule:
                 stage=next_stage,
                 input_abi=updated_inputs,
                 output_abi=updated_outputs,
+                boundaries=boundaries,
                 absolute_position=value.sequence_length - 1,
                 properties=properties,
             ),

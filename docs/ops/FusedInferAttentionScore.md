@@ -137,7 +137,9 @@ FusedInferAttentionScore(
 - masked 模式显式提供 BOOL `atten_mask`，并使用 `sparse_mode=0`；maskless 模式省略 `atten_mask`，使用 `sparse_mode=0`、`pre_tokens=next_tokens=2147483647`。
 - `softmax_lse_flag=false`，第二输出必须是 shape `[1]` 的 FP32 零 Tensor。
 - K Cache 是 RoPE 后的 K，V Cache 是 value projection 后、进入 Attention 前的 V。
-- Q/K/V 的 INT8 量化参数分别映射到 query dequant、`key_antiquant_*` 和 `value_antiquant_*`；softmax score 的 INT8 量化映射到 `quant_scale1`。K/V 参数完全相同时允许合并为 `antiquant_*`。
+- Q/K/V 的 INT8 量化参数分别映射到 query dequant、`key_antiquant_*` 和 `value_antiquant_*`；softmax score 的 INT8 量化映射到 `quant_scale1`。
+- 全 per-tensor INT8 场景必须同时提供 `dequant_scale1=query_scale×key_scale`、`quant_scale1=1/score_scale`、`dequant_scale2=score_scale×value_scale`。缺少任一项会导致 ATC tiling 失败。
+- K/V 参数完全相同时允许合并为 `antiquant_*`。
 - Q 和 softmax score 只允许对称量化，因为 `0.1.0` 接口没有对应 zero-point 输入；非对称 Q/score 必须在 `onnx_export` 阶段拒绝。K/V 非对称量化分别使用 `key_antiquant_offset` 和 `value_antiquant_offset`。
 - `0.1.0` 的模型 ONNX 只允许浮点或 INT8 K/V；`INT4(INT32)` 仅保留为算子接口能力，不进入发布模型。
 

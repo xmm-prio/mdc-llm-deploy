@@ -3,9 +3,18 @@
 ## 当前状态
 
 - 状态：`BLOCKED`
-- 原因：阶段 0 仅完成 A 端契约、探针需求和记录模板；尚未在 B 端执行命令。
-- 已验证结论：无。本文中的算子、参数和命令均为待执行要求，不代表 parser、ATC、GPU、NPU 或 MDC 真机已通过。
-- 解锁条件：A 端提交并推送指定 commit 后，B 端按本文拉取该 commit，完成环境登记和最小 parser 探针，返回纯文本摘要。
+- 原因：已完成部分 ATC 探针，但尚未以修复后的指定 commit 重跑完整八项门禁和 28 项矩阵。
+- 已验证结论：CANN 9.1.0、SoC `MC62CM12AA` 已接受下方 Attention 与 MoE 探针并生成 OM；不代表 MDC 真机已验证。
+- 解锁条件：A 端提交并推送修复后，B 端拉取指定 commit，重跑完整门禁和发布矩阵。
+
+## 2026-07-15 ATC 探针事实
+
+- 量化 `FusedInferAttentionScore`：原导出缺少 slot 7 `dequant_scale1` 和 slot 9 `dequant_scale2`，ATC 报 `deqScale1, quantScale1 or deqScale2 is nullptr`。补齐两个乘积 scale 后编译成功。
+- `MoeExpert` 失败规格：`hiddenSize=64/128`，均在 tiling 阶段失败；序长缩短、删除 offset、调整 TopK 均不能消除失败。
+- `MoeExpert` 通过规格：`hiddenSize=256`、`expertInterDim=128/256`、`topkExpertNum=3`、五专家、offset 存在；`tokenNum=8/3072` 均编译成功并生成 OM。
+- 结论：发布 MoE 测试模型固定使用 `hiddenSize=256`、`expertInterDim=128`；`hiddenSize=64` 的 Tiny 默认配置只用于本地功能测试，不作为 ATC 发布规格。
+- ATC 对 `FusedInferAttentionScore` 持续输出 `output index 1 shape:[0] not valid`。将 `softmax_lse_flag` 改为 true 或省略第二输出后告警仍存在，判定为当前 OPP parser 的固定行为；完整门禁结论继续记为 `BLOCKED`，不得据此宣称无告警通过。
+- 本轮只完成 ATC 编译，没有执行 MDC 真机推理。
 
 ## 权限与数据边界
 

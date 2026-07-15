@@ -18,7 +18,10 @@ from tools.release_matrix import (
     build_release_matrix,
 )
 
+pytestmark = pytest.mark.integration
 
+
+@pytest.mark.slow
 def test_runner_short_slice_generates_and_validates_all_28_models(tmp_path: Path) -> None:
     artifacts = build_release_matrix(tmp_path, sequence_length=8)
 

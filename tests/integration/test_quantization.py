@@ -27,6 +27,8 @@ from mdc_llm_deploy.quantization.math import (
     gptq_weight_quantize,
 )
 
+pytestmark = pytest.mark.integration
+
 
 def _inputs(sequence: int = 8) -> dict[str, torch.Tensor]:
     return {"input_ids": torch.arange(sequence).reshape(1, sequence) % 128}

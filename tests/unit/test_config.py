@@ -12,7 +12,7 @@ import pytest
 from mdc_llm_deploy.config import QuantizationConfig, schema_json
 from mdc_llm_deploy.errors import MdcDeployError, QuantizationConfigError
 
-ROOT = Path(__file__).parents[1]
+ROOT = Path(__file__).parents[2]
 CONFIG_PATHS = sorted((ROOT / "configs").glob("*.json"))
 EXPECTED_FINGERPRINTS = {
     "gptq-linear-w4a8.json": "5269c98570f4c92e88f27c54495bb3b4b4031b023e7ed0a19cfbb8c9099221f6",
@@ -126,6 +126,17 @@ def test_fingerprint_ignores_order_whitespace_and_implicit_defaults(tmp_path: Pa
         {"modifiers": "minmax"},
         {"modifiers": [], "include": None},
     ],
+    ids=(
+        "unknown-root-field",
+        "unknown-modifier-field",
+        "invalid-granularity",
+        "gptq-attention-target",
+        "gptq-per-tensor-linear",
+        "non-finite-percdamp",
+        "gptq-without-linear-target",
+        "modifiers-not-list",
+        "null-root-include",
+    ),
 )
 def test_invalid_config_fails_without_mutating_input(value: dict[str, object]) -> None:
     original = copy.deepcopy(value)

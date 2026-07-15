@@ -70,6 +70,10 @@ def test_tiny_models_have_deterministic_forward(model_type: type[torch.nn.Module
 
 @pytest.mark.parametrize("model_type", [TinyQwen3Dense, TinyQwen3Moe])
 def test_prefill_abi_shape_dtype_and_hash(model_type: type[torch.nn.Module]) -> None:
+    platform_hashes = EXPECTED_OUTPUT_HASHES.get(sys.platform)
+    if platform_hashes is None:
+        pytest.skip(f"No release hash is defined for platform {sys.platform!r}")
+
     model = model_type()
     input_ids = torch.from_numpy(release_input_ids().copy())
 
@@ -86,7 +90,7 @@ def test_prefill_abi_shape_dtype_and_hash(model_type: type[torch.nn.Module]) -> 
     assert output.value_cache.dtype == torch.float16
     output_hash = _tensor_hash(*output)
     assert len(output_hash) == 64
-    assert output_hash == EXPECTED_OUTPUT_HASHES[sys.platform][model_type]
+    assert output_hash == platform_hashes[model_type]
 
 
 def test_tiny_architecture_is_frozen() -> None:
@@ -119,6 +123,7 @@ def test_tiny_architecture_is_frozen() -> None:
         (torch.zeros((1, 3073), dtype=torch.int64), ValueError),
         (torch.zeros((1, 1), dtype=torch.int32), TypeError),
     ],
+    ids=("rank", "batch-size", "sequence-length", "dtype"),
 )
 def test_input_abi_rejects_invalid_values(
     input_ids: torch.Tensor,

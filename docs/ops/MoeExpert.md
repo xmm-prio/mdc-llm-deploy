@@ -11,7 +11,7 @@
 - Python reference：`mdc_llm_deploy.mdc_ops.operators.moe_expert`
 - 集中 schema 键：`OPERATOR_SCHEMAS["MoeExpert"]`
 - `OperatorSchema.inputs` 记录五个必选输入；`quant_offsets` 是下方原型定义的第六个可选输入，省略时按对称量化处理。
-- 本文定义待验收契约，不代表 GPU、NPU、parser、ATC 或真机已验证。B 端 parser/ATC 状态以 `docs/validation/b-side.md` 文本记录为准。
+- CANN 9.1.0、SoC `MC62CM12AA` 已完成部分 ATC 编译探针；真机推理仍未验证。完整状态以 `docs/validation/b-side.md` 为准。
 
 ## ONNX OP 原型
 
@@ -58,6 +58,7 @@ Tiny Qwen3-MoE 使用 4 个 routed expert 和 1 个 shared expert，因此 `expe
 
 ## 前置条件与错误
 
+- 当前 ATC 发布规格要求 `hiddenSize` 按 256 对齐、`expertInterDim` 按 128 对齐。已验证 `hiddenSize=256`、`expertInterDim=128/256`、`tokenNum=8/3072`；`hiddenSize=64/128` 会在 tiling 阶段失败。
 - `topk_ids` 值域必须为 `[0, expertNum)`；每行 routed id 不得重复，shared id 必须且只能出现一次。
 - 每行前两个 routed weight 必须有限、非负且在 FP32 下和为 1；shared weight 必须为 1。
 - `x`、weights、scale/offset 必须位于同一设备，shape 和打包元数据必须一致。

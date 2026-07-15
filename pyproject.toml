@@ -46,6 +46,10 @@ include = [
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
+markers = [
+  "integration: exercises multiple library layers or serialized artifacts",
+  "slow: takes materially longer than focused unit tests",
+]
 
 [tool.ruff]
 target-version = "py311"

@@ -22,7 +22,7 @@ from mdc_llm_deploy.capabilities import (
     Target,
 )
 from mdc_llm_deploy.export import convert_to_decode, export
-from mdc_llm_deploy.models import TinyQwen3Dense, TinyQwen3Moe
+from mdc_llm_deploy.models import TinyConfig, TinyQwen3Dense, TinyQwen3Moe
 from mdc_llm_deploy.onnx_export import onnx_export
 from mdc_llm_deploy.onnx_export.api import MaskMode as OnnxMaskMode
 from mdc_llm_deploy.onnx_export.validator import validate_serialized_model
@@ -30,6 +30,14 @@ from mdc_llm_deploy.quantization import oneshot
 
 ROOT = Path(__file__).parents[1]
 RELEASE_SEQUENCE_LENGTH = 3072
+ATC_MOE_CONFIG = TinyConfig(
+    hidden_size=256,
+    intermediate_size=512,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=64,
+    moe_intermediate_size=128,
+)
 UNBORN_COMMIT_SHA = "0" * 40
 FP16_CONFIGURATION = {
     "algorithm": "fp16",
@@ -148,12 +156,12 @@ def build_release_matrix(
     release_qualified = sequence_length == RELEASE_SEQUENCE_LENGTH
     for capability in LOCAL_ONNX_MATRIX:
         config_sha256 = _configuration_sha256(capability)
-        model_type = (
-            TinyQwen3Dense
+        model = (
+            TinyQwen3Dense()
             if capability.model is ModelKind.DENSE
-            else TinyQwen3Moe
+            else TinyQwen3Moe(ATC_MOE_CONFIG)
         )
-        graph = export(model_type().eval().half(), calibration)
+        graph = export(model.eval().half(), calibration)
         if capability.algorithm is Algorithm.MINMAX:
             if capability.target is None:
                 raise AssertionError("MinMax matrix entry must declare a target")
