@@ -1,0 +1,25 @@
+{
+  "include": [],
+  "exclude": [],
+  "modifiers": [
+    {
+      "type": "gptq",
+      "linear": {
+        "weight": {
+          "bits": 4,
+          "granularity": "per_channel",
+          "symmetric": true
+        },
+        "activation": {
+          "bits": 8,
+          "granularity": "per_tensor",
+          "mode": "static",
+          "symmetric": true
+        }
+      },
+      "percdamp": 0.01,
+      "actorder": true,
+      "block_size": 128
+    }
+  ]
+}

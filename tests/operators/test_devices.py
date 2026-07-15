@@ -1,0 +1,78 @@
+"""Conditional CUDA and NPU device-dispatch tests."""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from mdc_llm_deploy.mdc_ops import (
+    apply_rotary_pos_emb,
+    ascend_dequant,
+    ascend_quant_v2,
+    fused_infer_attention_score,
+    moe_expert,
+    registered_device_dispatches,
+    rms_norm,
+)
+
+
+def _device_smoke(device: torch.device) -> None:
+    normalized, _ = rms_norm(
+        torch.ones(2, 4, device=device), torch.ones(4, device=device)
+    )
+    assert normalized.device == device
+
+    query = torch.ones(1, 2, 2, 4, device=device)
+    key = torch.ones(1, 2, 1, 4, device=device)
+    cos = torch.ones(1, 2, 1, 4, device=device)
+    rope_query, _ = apply_rotary_pos_emb(query, key, cos, torch.zeros_like(cos))
+    assert rope_query.device == device
+
+    attention, _ = fused_infer_attention_score(
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        key.transpose(1, 2),
+        scale=0.5,
+    )
+    assert attention.device == device
+
+    quantized = ascend_quant_v2(query, torch.tensor(2.0, device=device))
+    assert quantized.device == device
+
+    scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+    encoded = (scale.view(torch.int32).to(torch.int64) & 0xFFFFFFFF).to(torch.uint64)
+    dequantized = ascend_dequant(
+        torch.ones(1, 4, dtype=torch.int32, device=device), encoded
+    )
+    assert dequantized.device == device
+
+    moe_output = moe_expert(
+        torch.ones(1, 2, dtype=torch.int8, device=device),
+        torch.tensor([[0, 1, 4]], dtype=torch.int16, device=device),
+        torch.tensor([[0.5, 0.5, 1.0]], dtype=torch.float16, device=device),
+        torch.ones(5 * 3 * 2 * 2, dtype=torch.int8, device=device),
+        torch.ones(21, dtype=torch.float32, device=device),
+        torch.zeros(21, dtype=torch.int32, device=device),
+    )
+    assert moe_output.device == device
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_dispatch_for_all_six_operators() -> None:
+    assert "CUDA" in registered_device_dispatches()
+    _device_smoke(torch.device("cuda"))
+
+
+def _npu_available() -> bool:
+    backend = getattr(torch, "npu", None)
+    return bool(backend is not None and backend.is_available())
+
+
+@pytest.mark.skipif(not _npu_available(), reason="NPU is unavailable")
+def test_npu_dispatch_for_all_six_operators() -> None:
+    assert "PrivateUse1" in registered_device_dispatches()
+    _device_smoke(torch.device("npu"))
+
+
+def test_cpu_and_meta_dispatch_are_always_registered() -> None:
+    assert {"CPU", "Meta"} <= set(registered_device_dispatches())

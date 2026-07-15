@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mdc-llm-deploy"
+version = "0.1.0"
+description = "Transformers-compatible LLM compression and MDC ONNX export library"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "MDC LLM Deploy contributors" }]
+dependencies = [
+  "numpy>=2.0,<3",
+  "onnx>=1.17,<2",
+  "torch>=2.6,<3",
+]
+
+[project.optional-dependencies]
+full = [
+  "accelerate>=1.2,<2",
+  "datasets>=3.2,<5",
+  "evaluate>=0.4,<1",
+  "onnxscript>=0.2,<1",
+  "transformers>=4.48,<5",
+  "triton>=3.2,<4; platform_system == 'Linux'",
+]
+dev = [
+  "build>=1.2,<2",
+  "mypy>=1.14,<2",
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<8",
+  "ruff>=0.9,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["mdc_llm_deploy"]
+
+[tool.hatch.build]
+include = [
+  "mdc_llm_deploy/**/*.py",
+  "mdc_llm_deploy/**/*.json",
+  "mdc_llm_deploy/py.typed",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["mdc_llm_deploy"]
+warn_unreachable = true
+
+[tool.coverage.run]
+source = ["mdc_llm_deploy"]
+branch = true

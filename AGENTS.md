@@ -4,8 +4,9 @@ A Transformers-compatible library for applying compression algorithms to LLMs fo
 
 ## Cursor Cloud specific instructions
 
-- This repository is currently a **skeleton**: it contains only `README.md`, `LICENSE`, and `.gitignore`. There is no source code, no dependency manifest (`requirements.txt` / `pyproject.toml` / `setup.py`), no tests, and no runnable application yet. There is nothing to build, lint, test, or run until code is added.
-- Runtime is **Python 3.12** with system `pip` (invoke as `python3` / `pip`; there is no bare `python` alias). `pip` has network access.
-- `python3 -m venv` **is** available if you want an isolated environment; otherwise system or `pip install --user` installs work fine.
-- The startup update script auto-installs dependencies **only if** a manifest exists: `requirements.txt`, `requirements-dev.txt`, or an installable `pyproject.toml`/`setup.py` (editable install). When you add the first dependency manifest it is picked up automatically on the next session — no update-script change is required for those common cases.
-- Once real code lands, add the standard lint/test/build/run commands here. The `.gitignore` follows the standard Python template (references `ruff`, `pytest`, `mypy`), so those are the expected tools; install them when a manifest declares them.
+- 工程使用 **Python 3.12**；Cloud 中通过 `python3` 调用解释器。
+- 依赖声明位于 `pyproject.toml`，带哈希锁位于 `requirements.lock`。优先创建 venv 后安装，避免污染系统环境。
+- 源码位于 `mdc_llm_deploy/`，测试位于 `tests/`；公开接口只有 Python API，`tools/` 仅供内部验收。
+- 标准门禁：`python3 -m pytest`、`python3 -m ruff check .`、`python3 -m mypy mdc_llm_deploy`、`python3 -m build`。
+- Python 3.12 依赖可用 `python3 -m pip install --require-hashes -r requirements.lock` 复现；更新依赖后运行 `python3 tools/generate_lock.py` 重建锁文件。
+- `tools/release_matrix.py` 是内部验收 runner，不属于公开产品 CLI。
