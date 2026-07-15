@@ -22,7 +22,7 @@
 必须分别生成并编译七个最小模型，不能把多个待测节点合并后只报告一次：
 
 1. `NPURmsNorm`：显式 `epsilon=1e-6`，确认映射到 GE `RmsNorm`。
-2. `ApplyRoPE`：`layout=1`、`rotary_mode="half"`、BSND，确认映射到 GE `ApplyRotaryPosEmb`。
+2. `ApplyRotaryPosEmb`：`layout=1`、`rotary_mode="half"`、BSND，确认映射到同名 GE 算子。
 3. `FusedInferAttentionScore`：BNSD、`num_heads=4`、`num_key_value_heads=2`、`scale=0.25`、`sparse_mode=0`，确认映射到同名 GE 算子。
 4. `NPUAscendQuantV2`：`axis=-1`、`dtype=2`，确认映射到 GE `AscendQuantV2`。
 5. `AscendDequant`：INT32 输入、UINT64 scale、显式 `dtype`，确认映射到同名 GE 算子。
@@ -64,7 +64,7 @@ code_changed_on_b: false
 ## 单项探针记录模板
 
 ```text
-probe: <NPURmsNorm|ApplyRoPE|FusedInferAttentionScore|NPUAscendQuantV2|AscendDequant|MoeExpert-required|MoeExpert-offset|MatMul-int8>
+probe: <NPURmsNorm|ApplyRotaryPosEmb|FusedInferAttentionScore|NPUAscendQuantV2|AscendDequant|MoeExpert-required|MoeExpert-offset|MatMul-int8>
 status: <PASS|BLOCKED>
 onnx_opset: 18
 onnx_domain: ai.onnx

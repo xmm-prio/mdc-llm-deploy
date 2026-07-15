@@ -61,7 +61,7 @@ def test_b_side_template_records_probe_without_claiming_execution() -> None:
     assert "timeout_seconds: 1800" in document
     for op_type in (
         "NPURmsNorm",
-        "ApplyRoPE",
+        "ApplyRotaryPosEmb",
         "FusedInferAttentionScore",
         "NPUAscendQuantV2",
         "AscendDequant",

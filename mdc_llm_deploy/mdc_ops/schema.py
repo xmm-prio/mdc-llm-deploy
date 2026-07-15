@@ -51,7 +51,7 @@ OPERATOR_SCHEMAS: dict[str, OperatorSchema] = {
     ),
     "ApplyRotaryPosEmb": OperatorSchema(
         ge_name="ApplyRotaryPosEmb",
-        onnx_name="ApplyRoPE",
+        onnx_name="ApplyRotaryPosEmb",
         torch_name="apply_rotary_pos_emb",
         torch_schema=(
             "apply_rotary_pos_emb(Tensor query, Tensor key, Tensor cos, Tensor sin, "

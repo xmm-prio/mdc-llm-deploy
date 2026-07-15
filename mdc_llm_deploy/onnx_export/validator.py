@@ -12,7 +12,7 @@ from ..errors import OnnxExportError
 
 CUSTOM_OPS = {
     "NPURmsNorm",
-    "ApplyRoPE",
+    "ApplyRotaryPosEmb",
     "FusedInferAttentionScore",
     "NPUAscendQuantV2",
     "AscendDequant",
@@ -57,14 +57,14 @@ def _validate_operator(node: onnx.NodeProto, mask_mode: str) -> None:
         epsilon = onnx.helper.get_attribute_value(_attributes(node)["epsilon"])
         if not math.isclose(float(epsilon), 1e-6, rel_tol=0.0, abs_tol=1e-12):
             raise OnnxExportError("NPURmsNorm epsilon must equal 1e-6")
-    elif node.op_type == "ApplyRoPE":
+    elif node.op_type == "ApplyRotaryPosEmb":
         if len(node.input) != 4 or len(node.output) != 2:
-            raise OnnxExportError("ApplyRoPE must use 4 inputs and 2 outputs")
+            raise OnnxExportError("ApplyRotaryPosEmb must use 4 inputs and 2 outputs")
         _require_attributes(node, {"layout", "rotary_mode"})
         layout = onnx.helper.get_attribute_value(_attributes(node)["layout"])
         rotary_mode = onnx.helper.get_attribute_value(_attributes(node)["rotary_mode"])
         if layout != 1 or rotary_mode != b"half":
-            raise OnnxExportError("ApplyRoPE must use BSND half rotation")
+            raise OnnxExportError("ApplyRotaryPosEmb must use BSND half rotation")
     elif node.op_type == "FusedInferAttentionScore":
         if len(node.input) != 29 or len(node.output) != 2:
             raise OnnxExportError(
@@ -154,7 +154,7 @@ def _validate_custom_node_reachability(
 
     reachable_ops = {
         "NPURmsNorm",
-        "ApplyRoPE",
+        "ApplyRotaryPosEmb",
         "FusedInferAttentionScore",
         "NPUAscendQuantV2",
         "AscendDequant",
@@ -367,7 +367,7 @@ def validate_mdc_model(model: onnx.ModelProto) -> None:
         raise OnnxExportError("Graph outputs must not be constant placeholders")
 
     counts = Counter(node.op_type for node in model.graph.node)
-    required = {"NPURmsNorm", "ApplyRoPE", "FusedInferAttentionScore"}
+    required = {"NPURmsNorm", "ApplyRotaryPosEmb", "FusedInferAttentionScore"}
     absent = required - counts.keys()
     if absent:
         raise OnnxExportError(f"Missing MDC operators: {sorted(absent)}")

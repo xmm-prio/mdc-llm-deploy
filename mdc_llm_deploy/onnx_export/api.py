@@ -984,7 +984,7 @@ def _append_rope_attention(
     lse = _unique(model, "mdc.attention.lse")
     attention_output = standard_attention.output[0]
     rope_node = helper.make_node(
-        "ApplyRoPE",
+        "ApplyRotaryPosEmb",
         [query, key, cos_name, sin_name],
         [query_rope, key_rope],
         name=f"mdc.rope.{rope_fqn}",

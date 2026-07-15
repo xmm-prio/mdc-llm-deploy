@@ -74,7 +74,7 @@ def test_mdc_onnx_custom_spine_reaches_outputs_in_both_mask_modes(
             node
             for node in model.graph.node
             if node.op_type
-            in {"NPURmsNorm", "ApplyRoPE", "FusedInferAttentionScore"}
+            in {"NPURmsNorm", "ApplyRotaryPosEmb", "FusedInferAttentionScore"}
         ]
 
         assert not initializer_names.intersection(
@@ -86,7 +86,7 @@ def test_mdc_onnx_custom_spine_reaches_outputs_in_both_mask_modes(
         )
         assert {node.op_type for node in custom_nodes} == {
             "NPURmsNorm",
-            "ApplyRoPE",
+            "ApplyRotaryPosEmb",
             "FusedInferAttentionScore",
         }
         assert all(
@@ -262,10 +262,12 @@ def test_validator_rejects_isolated_core_custom_node(
     exported_pair: tuple[onnx.ModelProto, onnx.ModelProto],
 ) -> None:
     masked, _ = exported_pair
-    rope = next(node for node in masked.graph.node if node.op_type == "ApplyRoPE")
+    rope = next(
+        node for node in masked.graph.node if node.op_type == "ApplyRotaryPosEmb"
+    )
     masked.graph.node.append(
         helper.make_node(
-            "ApplyRoPE",
+            "ApplyRotaryPosEmb",
             list(rope.input),
             ["mdc.rope.orphan.query", "mdc.rope.orphan.key"],
             name="mdc.rope.orphan",

@@ -55,7 +55,7 @@ def test_release_onnx_matrix_has_exactly_28_unique_entries() -> None:
 def test_each_matrix_entry_has_required_structural_contract(
     capability: Capability,
 ) -> None:
-    required = {"NPURmsNorm", "ApplyRoPE", "FusedInferAttentionScore"}
+    required = {"NPURmsNorm", "ApplyRotaryPosEmb", "FusedInferAttentionScore"}
     if capability.target is Target.LINEAR:
         required.update({"NPUAscendQuantV2", "MatMul", "AscendDequant"})
     elif capability.target is Target.ATTENTION:
@@ -63,6 +63,10 @@ def test_each_matrix_entry_has_required_structural_contract(
     elif capability.target is Target.MOE:
         required.update({"NPUAscendQuantV2", "MoeExpert"})
 
-    assert required >= {"NPURmsNorm", "ApplyRoPE", "FusedInferAttentionScore"}
+    assert required >= {
+        "NPURmsNorm",
+        "ApplyRotaryPosEmb",
+        "FusedInferAttentionScore",
+    }
     assert capability.model in {ModelKind.DENSE, ModelKind.MOE}
     assert capability.supports(Artifact.ATC)

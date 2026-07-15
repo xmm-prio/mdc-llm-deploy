@@ -3,8 +3,8 @@
 ## 名称
 
 - GE 原名：`ApplyRotaryPosEmb`
-- ONNX OP：`ApplyRoPE`
-- ONNX domain/opset：`ai.onnx::<opset>::ApplyRoPE`
+- ONNX OP：`ApplyRotaryPosEmb`
+- ONNX domain/opset：`ai.onnx::<opset>::ApplyRotaryPosEmb`
 
 ## 源码映射与验证状态
 
@@ -16,7 +16,7 @@
 ## ONNX OP 原型
 
 ```text
-ApplyRoPE(
+ApplyRotaryPosEmb(
     query: Tensor,
     key: Tensor,
     cos: Tensor,
