@@ -16,17 +16,23 @@ from mdc_llm_deploy.mdc_ops import (
 )
 
 
+def _assert_on_device(value: torch.Tensor, device: torch.device) -> None:
+    assert value.device.type == device.type
+    if device.index is not None:
+        assert value.device.index == device.index
+
+
 def _device_smoke(device: torch.device) -> None:
     normalized, _ = rms_norm(
         torch.ones(2, 4, device=device), torch.ones(4, device=device)
     )
-    assert normalized.device == device
+    _assert_on_device(normalized, device)
 
     query = torch.ones(1, 2, 2, 4, device=device)
     key = torch.ones(1, 2, 1, 4, device=device)
     cos = torch.ones(1, 2, 1, 4, device=device)
     rope_query, _ = apply_rotary_pos_emb(query, key, cos, torch.zeros_like(cos))
-    assert rope_query.device == device
+    _assert_on_device(rope_query, device)
 
     attention, _ = fused_infer_attention_score(
         query.transpose(1, 2),
@@ -34,17 +40,17 @@ def _device_smoke(device: torch.device) -> None:
         key.transpose(1, 2),
         scale=0.5,
     )
-    assert attention.device == device
+    _assert_on_device(attention, device)
 
     quantized = ascend_quant_v2(query, torch.tensor(2.0, device=device))
-    assert quantized.device == device
+    _assert_on_device(quantized, device)
 
     scale = torch.tensor([1.0], dtype=torch.float32, device=device)
     encoded = (scale.view(torch.int32).to(torch.int64) & 0xFFFFFFFF).to(torch.uint64)
     dequantized = ascend_dequant(
         torch.ones(1, 4, dtype=torch.int32, device=device), encoded
     )
-    assert dequantized.device == device
+    _assert_on_device(dequantized, device)
 
     moe_output = moe_expert(
         torch.ones(1, 2, dtype=torch.int8, device=device),
@@ -54,7 +60,7 @@ def _device_smoke(device: torch.device) -> None:
         torch.ones(21, dtype=torch.float32, device=device),
         torch.zeros(21, dtype=torch.int32, device=device),
     )
-    assert moe_output.device == device
+    _assert_on_device(moe_output, device)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

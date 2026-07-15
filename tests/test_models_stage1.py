@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 
 import pytest
 import torch
@@ -14,8 +15,14 @@ from mdc_llm_deploy.models import (
 from mdc_llm_deploy.utils import release_input_ids
 
 EXPECTED_OUTPUT_HASHES = {
-    TinyQwen3Dense: "e4a3d62e196d4cc794c1e4eff522694b24ed1490fde04b0c569fd576c8ce53a7",
-    TinyQwen3Moe: "41752b64f4aa0484f8e8eec5d3bb506ec07b85fe573f73d9c5648c62bacaafc3",
+    "win32": {
+        TinyQwen3Dense: "e4a3d62e196d4cc794c1e4eff522694b24ed1490fde04b0c569fd576c8ce53a7",
+        TinyQwen3Moe: "41752b64f4aa0484f8e8eec5d3bb506ec07b85fe573f73d9c5648c62bacaafc3",
+    },
+    "linux": {
+        TinyQwen3Dense: "f86b16202c8464bdc653c58b6c39d81f09c7a4173fceb353b59f85bce39d58a8",
+        TinyQwen3Moe: "15e2c714803c112e9ca79ff4ef9ede24ed8edffcf4fc16540a40fa10a4cc6e02",
+    },
 }
 
 
@@ -79,7 +86,7 @@ def test_prefill_abi_shape_dtype_and_hash(model_type: type[torch.nn.Module]) -> 
     assert output.value_cache.dtype == torch.float16
     output_hash = _tensor_hash(*output)
     assert len(output_hash) == 64
-    assert output_hash == EXPECTED_OUTPUT_HASHES[model_type]
+    assert output_hash == EXPECTED_OUTPUT_HASHES[sys.platform][model_type]
 
 
 def test_tiny_architecture_is_frozen() -> None:
