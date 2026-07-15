@@ -282,6 +282,134 @@ def _producer_map(model: onnx.ModelProto) -> dict[str, onnx.NodeProto]:
     return {output: node for node in model.graph.node for output in node.output}
 
 
+def _consumer_map(model: onnx.ModelProto) -> dict[str, list[onnx.NodeProto]]:
+    result: dict[str, list[onnx.NodeProto]] = {}
+    for node in model.graph.node:
+        for input_name in node.input:
+            if input_name:
+                result.setdefault(input_name, []).append(node)
+    return result
+
+
+def _single_consumer(
+    consumers: dict[str, list[onnx.NodeProto]],
+    value_name: str,
+    op_type: str,
+) -> onnx.NodeProto:
+    matches = [
+        node for node in consumers.get(value_name, []) if node.op_type == op_type
+    ]
+    if len(matches) != 1:
+        raise OnnxExportError(
+            f"Value {value_name!r} maps to {len(matches)} {op_type} consumers"
+        )
+    return matches[0]
+
+
+def _single_weighted_node(
+    model: onnx.ModelProto,
+    fqn: str,
+    op_types: set[str],
+) -> onnx.NodeProto:
+    weight_name = f"graph.{fqn}.weight"
+    matches: list[onnx.NodeProto] = [
+        node
+        for node in model.graph.node
+        if node.op_type in op_types
+        and len(node.input) >= 2
+        and node.input[1] == weight_name
+    ]
+    if len(matches) != 1:
+        raise OnnxExportError(
+            f"Boundary {fqn!r} maps to {len(matches)} standard ONNX nodes"
+        )
+    return matches[0]
+
+
+def _replace_nodes(
+    model: onnx.ModelProto,
+    removed: set[int],
+    replacement_by_index: dict[int, list[onnx.NodeProto]],
+) -> None:
+    nodes = list(model.graph.node)
+    result: list[onnx.NodeProto] = []
+    for index, node in enumerate(nodes):
+        result.extend(replacement_by_index.get(index, ()))
+        if index not in removed:
+            result.append(node)
+    del model.graph.node[:]
+    model.graph.node.extend(result)
+
+
+def _prune_unreachable(model: onnx.ModelProto) -> None:
+    """Remove standard lowering remnants that cannot affect graph outputs."""
+    producers = _producer_map(model)
+    required_values = [item.name for item in model.graph.output]
+    required_values.extend(
+        output
+        for node in model.graph.node
+        if node.op_type == "MoeExpert"
+        for output in node.output
+    )
+    required_outputs: set[str] = set()
+    while required_values:
+        value_name = required_values.pop()
+        producer = producers.get(value_name)
+        if producer is None or any(
+            output in required_outputs for output in producer.output
+        ):
+            continue
+        required_outputs.update(producer.output)
+        required_values.extend(name for name in producer.input if name)
+    retained = [
+        node
+        for node in model.graph.node
+        if any(output in required_outputs for output in node.output)
+    ]
+    del model.graph.node[:]
+    model.graph.node.extend(retained)
+    used_initializers = {
+        name for node in model.graph.node for name in node.input if name
+    }
+    retained_initializers = [
+        item for item in model.graph.initializer if item.name in used_initializers
+    ]
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(retained_initializers)
+
+
+def _topologically_sort(model: onnx.ModelProto) -> None:
+    """Restore topological order after inserting fused MDC nodes."""
+    known = {item.name for item in model.graph.input}
+    known.update(item.name for item in model.graph.initializer)
+    pending = list(model.graph.node)
+    ordered: list[onnx.NodeProto] = []
+    while pending:
+        ready = next(
+            (
+                node
+                for node in pending
+                if all(not name or name in known for name in node.input)
+            ),
+            None,
+        )
+        if ready is None:
+            blocked = {
+                node.name or node.op_type: [
+                    name for name in node.input if name and name not in known
+                ]
+                for node in pending
+            }
+            raise OnnxExportError(
+                f"Lowered ONNX graph cannot be topologically sorted: {blocked}"
+            )
+        pending.remove(ready)
+        ordered.append(ready)
+        known.update(ready.output)
+    del model.graph.node[:]
+    model.graph.node.extend(ordered)
+
+
 def _remove_dynamic_value_info(model: onnx.ModelProto) -> None:
     static_values = [
         item
@@ -373,41 +501,68 @@ def _as_bnsd(
     return output, result_shape
 
 
-def _append_rms_norm(model: onnx.ModelProto) -> None:
-    initializers = {item.name for item in model.graph.initializer}
-    gamma_candidates = [
-        (item.name, item.data_type, tuple(item.dims))
-        for item in model.graph.initializer
-        if len(item.dims) == 1 and item.data_type in _FLOAT_ONNX_DTYPES
-    ]
-    match = next(
-        (
-            (name, element_type, shape, gamma)
-            for name, (element_type, shape) in _types(model).items()
-            for gamma in gamma_candidates
-            if name not in initializers
-            and len(shape) == 3
-            and element_type == gamma[1]
-            and shape[-1] == gamma[2][-1]
-        ),
-        None,
-    )
-    if match is None:
-        raise OnnxExportError("Cannot locate RmsNorm input and gamma")
-    x, dtype, x_shape, (gamma, _, _) = match
-    output = _unique(model, "mdc.rms_norm.output")
-    rstd = _unique(model, "mdc.rms_norm.rstd")
-    model.graph.node.append(
-        helper.make_node(
+def _replace_rms_norms(model: onnx.ModelProto, value: GraphMetadata) -> None:
+    """Replace every FQN-owned Tiny RMSNorm terminal with NPURmsNorm."""
+    types = _types(model)
+    nodes = list(model.graph.node)
+    removed: set[int] = set()
+    replacements: dict[int, list[onnx.NodeProto]] = {}
+    boundaries = [item for item in value.boundaries if item.kind == "rms_norm"]
+    if not boundaries:
+        raise OnnxExportError("MDC ONNX lowering requires an RmsNorm boundary")
+    for boundary in boundaries:
+        gamma = f"graph.{boundary.fqn}.weight"
+        matches = [
+            node
+            for node in nodes
+            if node.op_type == "Mul" and gamma in node.input
+        ]
+        if len(matches) != 1:
+            raise OnnxExportError(
+                f"RmsNorm boundary {boundary.fqn!r} maps to {len(matches)} terminal nodes"
+            )
+        terminal = matches[0]
+        normalized_name = next(name for name in terminal.input if name != gamma)
+        normalized = _producer_map(model).get(normalized_name)
+        if normalized is None or normalized.op_type != "Mul" or len(normalized.input) != 2:
+            raise OnnxExportError(
+                f"RmsNorm boundary {boundary.fqn!r} lacks a standard normalization spine"
+            )
+        source = next(
+            (
+                name
+                for name in normalized.input
+                if types.get(name, (0, ()))[1] == types.get(terminal.output[0], (0, ()))[1]
+            ),
+            None,
+        )
+        if source is None or source not in types or terminal.output[0] not in types:
+            raise OnnxExportError(
+                f"RmsNorm boundary {boundary.fqn!r} lacks static type metadata"
+            )
+        dtype, source_shape = types[source]
+        output_dtype, output_shape = types[terminal.output[0]]
+        if (
+            dtype not in _FLOAT_ONNX_DTYPES
+            or output_dtype != dtype
+            or output_shape != source_shape
+        ):
+            raise OnnxExportError(
+                f"RmsNorm boundary {boundary.fqn!r} has an invalid tensor contract"
+            )
+        rstd = _unique(model, f"mdc.rms_norm.{boundary.fqn}.rstd")
+        replacement = helper.make_node(
             "NPURmsNorm",
-            [x, gamma],
-            [output, rstd],
-            name="mdc.rms_norm",
+            [source, gamma],
+            [terminal.output[0], rstd],
+            name=f"mdc.rms_norm.{boundary.fqn}",
             epsilon=1e-6,
         )
-    )
-    _append_value(model, output, dtype, x_shape)
-    _append_value(model, rstd, TensorProto.FLOAT, x_shape[:-1])
+        index = nodes.index(terminal)
+        removed.add(index)
+        replacements[index] = [replacement]
+        _append_value(model, rstd, TensorProto.FLOAT, source_shape[:-1])
+    _replace_nodes(model, removed, replacements)
 
 
 def _rope_tables(
@@ -579,16 +734,19 @@ def _quantize_graph_output(
         dtype=parameter_dtype,
     )
     axis = -2 if target.granularity == "per_token" else -1
-    model.graph.node.append(
-        helper.make_node(
-            "NPUAscendQuantV2",
-            [internal, scale, offset],
-            [original],
-            name=name,
-            axis=axis,
-            dtype=2,
-        )
+    quant = helper.make_node(
+        "NPUAscendQuantV2",
+        [internal, scale, offset],
+        [original],
+        name=name,
+        axis=axis,
+        dtype=2,
     )
+    nodes = list(model.graph.node)
+    producer_index = nodes.index(producer)
+    nodes.insert(producer_index + 1, quant)
+    del model.graph.node[:]
+    model.graph.node.extend(nodes)
     return original
 
 
@@ -597,63 +755,171 @@ def _append_rope_attention(
     value: GraphMetadata,
     mask_mode: MaskMode,
 ) -> None:
+    """Replace FQN-anchored Tiny RoPE and attention standard subgraphs."""
     heads = int(value.properties.get("num_attention_heads") or 4)
     kv_heads = int(value.properties.get("num_key_value_heads") or 2)
     head_dim = int(value.properties.get("head_dim") or 16)
     query_sequence = 1 if not value.stage.is_prefill else value.sequence_length
-    query, query_dtype, query_shape = _find_head_tensor(
-        model, heads, head_dim, query_sequence
+    attention_boundaries = [
+        item for item in value.boundaries if item.kind == "attention"
+    ]
+    rope_boundaries = [item for item in value.boundaries if item.kind == "rope"]
+    if len(attention_boundaries) != 1 or len(rope_boundaries) != 1:
+        raise OnnxExportError(
+            "Tiny lowering requires exactly one attention and one RoPE boundary"
+        )
+    attention_fqn = attention_boundaries[0].fqn
+    rope_fqn = rope_boundaries[0].fqn
+    if not rope_fqn.startswith(f"{attention_fqn}."):
+        raise OnnxExportError("RoPE boundary is not owned by the attention boundary")
+
+    types = _types(model)
+    producers = _producer_map(model)
+    consumers = _consumer_map(model)
+    query_projection = _single_weighted_node(
+        model, f"{attention_fqn}.q_proj", {"Gemm", "MatMul"}
     )
-    key, key_dtype, key_shape = _find_head_tensor(
-        model, kv_heads, head_dim, query_sequence
+    key_projection = _single_weighted_node(
+        model, f"{attention_fqn}.k_proj", {"Gemm", "MatMul"}
     )
-    query, query_bsnd_shape = _as_bsnd(model, query, query_dtype, query_shape, heads)
-    key_bsnd, key_bsnd_shape = _as_bsnd(model, key, key_dtype, key_shape, kv_heads)
+    value_projection = _single_weighted_node(
+        model, f"{attention_fqn}.v_proj", {"Gemm", "MatMul"}
+    )
+    output_projection = _single_weighted_node(
+        model, f"{attention_fqn}.o_proj", {"Gemm", "MatMul"}
+    )
+    query_reshape = _single_consumer(
+        consumers, query_projection.output[0], "Reshape"
+    )
+    key_reshape = _single_consumer(consumers, key_projection.output[0], "Reshape")
+    value_reshape = _single_consumer(
+        consumers, value_projection.output[0], "Reshape"
+    )
+    query = query_reshape.output[0]
+    key = key_reshape.output[0]
+    if query not in types or key not in types:
+        raise OnnxExportError("RoPE projection boundaries lack static type metadata")
+    query_dtype, query_shape = types[query]
+    key_dtype, key_shape = types[key]
+    query_bsnd_shape = (1, query_sequence, heads, head_dim)
+    key_bsnd_shape = (1, query_sequence, kv_heads, head_dim)
+    if query_shape != query_bsnd_shape or key_shape != key_bsnd_shape:
+        raise OnnxExportError("RoPE projection boundaries have invalid BSND shapes")
     if query_dtype not in {TensorProto.FLOAT16, TensorProto.FLOAT}:
         raise OnnxExportError("MDC RoPE supports FP16/FP32 lowering inputs")
-    np_dtype: np.dtype[Any] = np.dtype(np.float16 if query_dtype == TensorProto.FLOAT16 else np.float32)
-    positions = (
-        np.asarray([value.absolute_position], dtype=np.int64)
-        if not value.stage.is_prefill
-        else np.arange(value.sequence_length, dtype=np.int64)
-    )
-    cos, sin = _rope_tables(
-        query_sequence,
-        head_dim,
-        float(value.properties.get("rope_theta") or 1_000_000.0),
-        positions,
-        np_dtype,
-    )
-    cos_name = _unique(model, "mdc.rope.cos")
-    sin_name = _unique(model, "mdc.rope.sin")
-    model.graph.initializer.extend([_initializer(cos_name, cos), _initializer(sin_name, sin)])
-    query_rope = _unique(model, "mdc.rope.query")
-    key_rope = _unique(model, "mdc.rope.key")
-    model.graph.node.append(
-        helper.make_node(
-            "ApplyRoPE",
-            [query, key_bsnd, cos_name, sin_name],
-            [query_rope, key_rope],
-            name="mdc.rope",
-            layout=1,
-            rotary_mode="half",
-        )
-    )
-    _append_value(model, query_rope, query_dtype, query_bsnd_shape)
-    _append_value(model, key_rope, key_dtype, key_bsnd_shape)
-    query_bnsd, query_bnsd_shape = _as_bnsd(
-        model, query_rope, query_dtype, query_bsnd_shape, heads
-    )
+    if key_dtype != query_dtype:
+        raise OnnxExportError("RoPE query and key dtypes must match")
 
-    output_by_name = {item.name: item for item in model.graph.output}
-    key_output = output_by_name.get("present.0.key")
-    value_output = output_by_name.get("present.0.value")
+    def rope_terminal(source: str) -> tuple[onnx.NodeProto, str, str]:
+        direct = [
+            node
+            for node in consumers.get(source, [])
+            if node.op_type == "Mul" and len(node.output) == 1
+        ]
+        matches: list[tuple[onnx.NodeProto, onnx.NodeProto]] = []
+        for direct_node in direct:
+            for terminal in consumers.get(direct_node.output[0], []):
+                if terminal.op_type == "Add" and len(terminal.input) == 2:
+                    matches.append((terminal, direct_node))
+        if len(matches) != 1:
+            raise OnnxExportError(
+                f"RoPE source {source!r} maps to {len(matches)} standard terminals"
+            )
+        terminal, direct_node = matches[0]
+        cos_name = next(name for name in direct_node.input if name != source)
+        rotated_name = next(
+            name for name in terminal.input if name != direct_node.output[0]
+        )
+        rotated = producers.get(rotated_name)
+        if rotated is None or rotated.op_type != "Mul":
+            raise OnnxExportError("RoPE rotation branch is incomplete")
+        cos_shape = types.get(cos_name, (0, ()))[1]
+        sin_candidates = [
+            name
+            for name in rotated.input
+            if name in types and types[name][1] == cos_shape
+        ]
+        if len(sin_candidates) != 1:
+            raise OnnxExportError("RoPE sine table mapping is ambiguous")
+        return terminal, cos_name, sin_candidates[0]
+
+    query_terminal, cos_name, sin_name = rope_terminal(query)
+    key_terminal, key_cos_name, key_sin_name = rope_terminal(key)
+    if (key_cos_name, key_sin_name) != (cos_name, sin_name):
+        raise OnnxExportError("RoPE query and key do not share position tables")
+    query_rope = query_terminal.output[0]
+    key_rope = key_terminal.output[0]
+    query_transpose = _single_consumer(consumers, query_rope, "Transpose")
+    key_output = next(
+        (item for item in model.graph.output if item.name == "present.0.key"),
+        None,
+    )
+    value_output = next(
+        (item for item in model.graph.output if item.name == "present.0.value"),
+        None,
+    )
     if key_output is None or value_output is None:
         raise OnnxExportError("Attention lowering requires key/value graph outputs")
+    key_cache = producers.get(key_output.name)
+    value_cache = producers.get(value_output.name)
+    current_key = _single_consumer(consumers, key_rope, "Transpose")
+    current_value = _single_consumer(
+        consumers, value_reshape.output[0], "Transpose"
+    )
+
+    def matches_cache(
+        cache: onnx.NodeProto | None,
+        current: onnx.NodeProto,
+        past_name: str,
+    ) -> bool:
+        if cache is not None and tuple(cache.output) == tuple(current.output):
+            return True
+        return (
+            cache is not None
+            and cache.op_type == "Concat"
+            and current.output[0] in cache.input
+            and past_name in cache.input
+        )
+
+    if value.stage.is_prefill and (
+        not matches_cache(
+            key_cache,
+            current_key,
+            "past_key_values.0.key",
+        )
+        or not matches_cache(
+            value_cache,
+            current_value,
+            "past_key_values.0.value",
+        )
+    ):
+        raise OnnxExportError("Attention cache outputs do not match FQN projections")
+
+    if len(output_projection.input) < 1:
+        raise OnnxExportError("Attention output projection has an invalid ABI")
+    output_reshape = producers.get(output_projection.input[0])
+    output_transpose = (
+        producers.get(output_reshape.input[0])
+        if output_reshape is not None and output_reshape.op_type == "Reshape"
+        else None
+    )
+    standard_attention = (
+        producers.get(output_transpose.input[0])
+        if output_transpose is not None and output_transpose.op_type == "Transpose"
+        else None
+    )
+    if standard_attention is None or standard_attention.op_type != "MatMul":
+        raise OnnxExportError(
+            "Attention output projection lacks a standard attention spine"
+        )
+    query_bnsd = query_transpose.output[0]
+    query_bnsd_shape = (1, heads, query_sequence, head_dim)
+    if query_bnsd not in types:
+        _append_value(model, query_bnsd, query_dtype, query_bnsd_shape)
     key_shape_full = _shape(key_output)
     value_shape_full = _shape(value_output)
     if key_shape_full is None or value_shape_full is None:
-        raise OnnxExportError("Cache outputs must have static shapes")
+        raise OnnxExportError("Attention cache outputs lack static type metadata")
     key_input = key_output.name
     value_input = value_output.name
     key_target = _target(value, "key")
@@ -715,31 +981,50 @@ def _append_rope_attention(
         inputs[27] = _scale_initializer(
             model, "mdc.attention.dequant_scale_query", query_target, inverse=False
         )
-    attention_output = _unique(model, "mdc.attention.output")
     lse = _unique(model, "mdc.attention.lse")
-    model.graph.node.append(
-        helper.make_node(
-            "FusedInferAttentionScore",
-            inputs,
-            [attention_output, lse],
-            name="mdc.attention",
-            num_heads=heads,
-            num_key_value_heads=kv_heads,
-            scale=float(1.0 / math.sqrt(head_dim)),
-            input_layout="BNSD",
-            sparse_mode=0,
-            pre_tokens=2147483647,
-            next_tokens=2147483647,
-            inner_precise=0,
-            block_size=0,
-            antiquant_mode=0,
-            softmax_lse_flag=0,
-            key_antiquant_mode=0,
-            value_antiquant_mode=0,
-            query_quant_mode=0,
-        )
+    attention_output = standard_attention.output[0]
+    rope_node = helper.make_node(
+        "ApplyRoPE",
+        [query, key, cos_name, sin_name],
+        [query_rope, key_rope],
+        name=f"mdc.rope.{rope_fqn}",
+        layout=1,
+        rotary_mode="half",
     )
-    _append_value(model, attention_output, query_dtype, query_bnsd_shape)
+    attention_node = helper.make_node(
+        "FusedInferAttentionScore",
+        inputs,
+        [attention_output, lse],
+        name=f"mdc.attention.{attention_fqn}",
+        num_heads=heads,
+        num_key_value_heads=kv_heads,
+        scale=float(1.0 / math.sqrt(head_dim)),
+        input_layout="BNSD",
+        sparse_mode=0,
+        pre_tokens=2147483647,
+        next_tokens=2147483647,
+        inner_precise=0,
+        block_size=0,
+        antiquant_mode=0,
+        softmax_lse_flag=0,
+        key_antiquant_mode=0,
+        value_antiquant_mode=0,
+        query_quant_mode=0,
+    )
+    nodes = list(model.graph.node)
+    query_index = nodes.index(query_terminal)
+    key_index = nodes.index(key_terminal)
+    attention_index = nodes.index(standard_attention)
+    _replace_nodes(
+        model,
+        {query_index, key_index, attention_index},
+        {
+            min(query_index, key_index): [rope_node],
+            attention_index: [attention_node],
+        },
+    )
+    if attention_output not in types:
+        _append_value(model, attention_output, query_dtype, query_bnsd_shape)
     _append_value(model, lse, TensorProto.FLOAT, (1,))
 
 
@@ -768,90 +1053,188 @@ def _activation_target(
     )
 
 
-def _append_linear(model: onnx.ModelProto, value: GraphMetadata) -> None:
-    targets = [item for item in value.quantized_targets if item.target_type == "linear"]
-    if not targets:
-        return
-    initializers = {
-        item.name: item
-        for item in model.graph.initializer
-        if len(item.dims) == 2 and item.data_type in _FLOAT_ONNX_DTYPES
-    }
-    target, weight = next(
-        (
-            (target, item)
-            for target in targets
-            for name, item in initializers.items()
-            if (
-                target.fqn in name
-                or (
-                    "embed" not in name
-                    and len(target.scale) in {1, int(item.dims[1])}
-                )
-            )
-        ),
-        (targets[0], next(item for name, item in initializers.items() if "embed" not in name)),
-    )
-    weight_name = weight.name
-    weight_shape = tuple(weight.dims)
-    source, source_dtype, source_shape = _pick_rank(
-        model,
-        3,
-        shape_filter=lambda shape: shape[-1] == weight_shape[0],
-    )
-    activation_target = _activation_target(value, target)
-    if len(activation_target.scale) != 1:
-        activation_target = replace(
-            activation_target,
-            granularity="per_tensor",
-            scale=(max(activation_target.scale),),
-            zero_point=(0,),
-        )
-    quantized = _append_quant(
-        model,
-        source,
-        source_shape,
-        activation_target,
-        "mdc.linear.quant",
-    )
-    weight = next(item for item in model.graph.initializer if item.name == weight_name)
+def _linear_weight_array(node: onnx.NodeProto, weight: onnx.TensorProto) -> np.ndarray:
+    """Return a standard linear weight in MatMul [input, output] layout."""
     array = numpy_helper.to_array(weight).astype(np.float32)
+    if node.op_type == "MatMul":
+        return array
+    attributes = _attributes(node)
+    alpha = float(attributes.get("alpha", 1.0))
+    beta = float(attributes.get("beta", 1.0))
+    trans_a = int(attributes.get("transA", 0))
+    trans_b = int(attributes.get("transB", 0))
+    if alpha != 1.0 or beta != 1.0 or trans_a != 0:
+        raise OnnxExportError(f"Linear node {node.name!r} uses unsupported Gemm attributes")
+    return array.T if trans_b == 1 else array
+
+
+def _attributes(node: onnx.NodeProto) -> dict[str, Any]:
+    return {
+        item.name: helper.get_attribute_value(item)
+        for item in node.attribute
+    }
+
+
+def _replace_linear(
+    model: onnx.ModelProto,
+    value: GraphMetadata,
+    target: QuantizedTarget,
+) -> None:
+    """Replace one FQN-matched standard linear node with the MDC W8A8 chain."""
+    weight_name = f"graph.{target.fqn}.weight"
+    weight = next(
+        (item for item in model.graph.initializer if item.name == weight_name),
+        None,
+    )
+    if weight is None:
+        raise OnnxExportError(f"Cannot locate ONNX weight for linear target {target.fqn!r}")
+    matches = [
+        node
+        for node in model.graph.node
+        if node.op_type in {"Gemm", "MatMul"}
+        and len(node.input) >= 2
+        and node.input[1] == weight_name
+    ]
+    if len(matches) != 1:
+        raise OnnxExportError(
+            f"Linear target {target.fqn!r} maps to {len(matches)} standard ONNX nodes"
+        )
+    node = matches[0]
+    if len(node.output) != 1 or not node.input[0]:
+        raise OnnxExportError(f"Linear node for {target.fqn!r} has an invalid ABI")
+    types = _types(model)
+    source = node.input[0]
+    if node.output[0] not in types:
+        raise OnnxExportError(f"Linear target {target.fqn!r} lacks static ONNX type metadata")
+    output_dtype, output_shape = types[node.output[0]]
+    array = _linear_weight_array(node, weight)
+    source_dtype = types.get(source, (output_dtype, ()))[0]
+    source_shape = types.get(
+        source,
+        (source_dtype, (*output_shape[:-1], array.shape[0])),
+    )[1]
+    if source_dtype not in _FLOAT_ONNX_DTYPES or output_dtype != source_dtype:
+        raise OnnxExportError(f"Linear target {target.fqn!r} has unsupported dtypes")
+
+    activation = _activation_target(value, target)
+    if (
+        activation.granularity != "per_tensor"
+        or len(activation.scale) != 1
+        or any(activation.zero_point)
+    ):
+        raise OnnxExportError(
+            f"Linear activation for {target.fqn!r} must be symmetric per-tensor"
+        )
+    if not target.symmetric or any(target.zero_point):
+        raise OnnxExportError(f"Linear weight for {target.fqn!r} must be symmetric")
+
     weight_scales = np.asarray(target.scale, dtype=np.float32)
-    weight_offsets = np.asarray(target.zero_point, dtype=np.float32)
     if weight_scales.size not in {1, array.shape[1]}:
         raise OnnxExportError(f"Linear weight scale for {target.fqn!r} has invalid shape")
     packed = np.clip(
-        np.rint(array / weight_scales.reshape(1, -1))
-        + weight_offsets.reshape(1, -1),
+        np.rint(array / weight_scales.reshape(1, -1)),
         -128,
         127,
     ).astype(np.int8)
-    packed_name = _unique(model, "mdc.linear.weight")
-    model.graph.initializer.append(_initializer(packed_name, packed))
-    accumulator = _unique(model, "mdc.linear.accumulator")
-    model.graph.node.append(
-        helper.make_node("MatMul", [quantized, packed_name], [accumulator], name="mdc.linear.matmul")
+    if output_shape != (*source_shape[:-1], packed.shape[1]):
+        raise OnnxExportError(f"Linear target {target.fqn!r} has inconsistent output shape")
+
+    prefix = f"mdc.linear.{target.fqn}"
+    parameter_dtype: np.dtype[Any] = np.dtype(
+        np.float16 if source_dtype == TensorProto.FLOAT16 else np.float32
     )
-    accumulator_shape = (*source_shape[:-1], weight_shape[1])
-    _append_value(model, accumulator, TensorProto.INT32, accumulator_shape)
-    activation_scale = float(activation_target.scale[0])
-    combined = (weight_scales * activation_scale).astype(np.float32)
+    quant_scale = _scale_initializer(
+        model,
+        f"{prefix}.quant_scale",
+        activation,
+        inverse=True,
+        dtype=parameter_dtype,
+    )
+    quant_offset = _offset_initializer(
+        model,
+        f"{prefix}.quant_offset",
+        activation,
+        dtype=parameter_dtype,
+    )
+    packed_name = _unique(model, f"{prefix}.weight")
+    model.graph.initializer.append(_initializer(packed_name, packed))
+    combined = (weight_scales * float(activation.scale[0])).astype(np.float32)
     dequant_scale = combined.view(np.uint32).astype(np.uint64)
-    dequant_name = _unique(model, "mdc.linear.dequant_scale")
-    model.graph.initializer.append(_initializer(dequant_name, dequant_scale))
-    output = _unique(model, "mdc.linear.output")
-    model.graph.node.append(
+    dequant_scale_name = _unique(model, f"{prefix}.dequant_scale")
+    model.graph.initializer.append(_initializer(dequant_scale_name, dequant_scale))
+
+    quantized = _unique(model, f"{prefix}.quantized")
+    accumulator = _unique(model, f"{prefix}.accumulator")
+    original_output = node.output[0]
+    has_bias = node.op_type == "Gemm" and len(node.input) == 3 and bool(node.input[2])
+    dequantized = (
+        _unique(model, f"{prefix}.dequantized")
+        if has_bias
+        else original_output
+    )
+    replacement = [
+        helper.make_node(
+            "NPUAscendQuantV2",
+            [source, quant_scale, quant_offset],
+            [quantized],
+            name=f"{prefix}.quant",
+            axis=-1,
+            dtype=2,
+        ),
+        helper.make_node(
+            "MatMul",
+            [quantized, packed_name],
+            [accumulator],
+            name=f"{prefix}.matmul",
+        ),
         helper.make_node(
             "AscendDequant",
-            [accumulator, dequant_name],
-            [output],
-            name="mdc.linear.dequant",
+            [accumulator, dequant_scale_name],
+            [dequantized],
+            name=f"{prefix}.dequant",
             sqrt_mode=0,
             relu_flag=0,
             dtype=1 if source_dtype == TensorProto.FLOAT16 else 0,
+        ),
+    ]
+    if has_bias:
+        replacement.append(
+            helper.make_node(
+                "Add",
+                [dequantized, node.input[2]],
+                [original_output],
+                name=f"{prefix}.bias",
+            )
         )
-    )
-    _append_value(model, output, source_dtype, accumulator_shape)
+    _append_value(model, quantized, TensorProto.INT8, source_shape)
+    _append_value(model, accumulator, TensorProto.INT32, output_shape)
+    if has_bias:
+        _append_value(model, dequantized, output_dtype, output_shape)
+
+    nodes = list(model.graph.node)
+    index = nodes.index(node)
+    nodes[index : index + 1] = replacement
+    del model.graph.node[:]
+    model.graph.node.extend(nodes)
+
+
+def _append_linear(model: onnx.ModelProto, value: GraphMetadata) -> None:
+    targets = [item for item in value.quantized_targets if item.target_type == "linear"]
+    for target in targets:
+        _replace_linear(model, value, target)
+    used_inputs = {
+        name
+        for node in model.graph.node
+        for name in node.input
+        if name
+    }
+    retained = [
+        item
+        for item in model.graph.initializer
+        if item.name in used_inputs or not item.name.startswith("graph.")
+    ]
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(retained)
 
 
 def _append_moe(model: onnx.ModelProto, value: GraphMetadata) -> None:
@@ -1041,10 +1424,12 @@ def _lower(
     model.opset_import.append(helper.make_opsetid("", 18))
     if mask_mode == "maskless":
         _make_maskless_non_causal(model)
-    _append_rms_norm(model)
+    _replace_rms_norms(model, value)
     _append_rope_attention(model, value, mask_mode)
     _append_linear(model, value)
     _append_moe(model, value)
+    _prune_unreachable(model)
+    _topologically_sort(model)
     algorithms = sorted({item.algorithm for item in value.quantized_targets}) or ["fp16"]
     targets = sorted({item.target_type for item in value.quantized_targets}) or ["fp16"]
     properties = {
@@ -1062,6 +1447,11 @@ def _lower(
         "mdc.numeric_spine": "validated-standard-aten",
         "mdc.lowering_source": "fx-boundaries-and-graph-metadata",
     }
+    linear_target_count = sum(
+        item.target_type == "linear" for item in value.quantized_targets
+    )
+    if linear_target_count:
+        properties["mdc.linear.target_count"] = str(linear_target_count)
     if "moe" in targets:
         hidden_size = int(value.properties.get("hidden_size") or 64)
         intermediate_size = int(value.properties.get("moe_intermediate_size") or 64)

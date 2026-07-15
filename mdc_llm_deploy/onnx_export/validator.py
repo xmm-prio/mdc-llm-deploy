@@ -130,6 +130,72 @@ def _validate_dequant_initializers(model: onnx.ModelProto) -> None:
             raise OnnxExportError("AscendDequant scale must decode to finite positives")
 
 
+def _validate_custom_node_reachability(
+    model: onnx.ModelProto,
+    properties: dict[str, str],
+) -> None:
+    """Require every MDC custom node to contribute to graph outputs."""
+    producers = {
+        output: node
+        for node in model.graph.node
+        for output in node.output
+    }
+    pending = [item.name for item in model.graph.output]
+    visited_values: set[str] = set()
+    while pending:
+        value = pending.pop()
+        if value in visited_values:
+            continue
+        visited_values.add(value)
+        producer = producers.get(value)
+        if producer is None:
+            continue
+        pending.extend(name for name in producer.input if name)
+
+    reachable_ops = {
+        "NPURmsNorm",
+        "ApplyRoPE",
+        "FusedInferAttentionScore",
+        "NPUAscendQuantV2",
+        "AscendDequant",
+    }
+    custom_nodes = [
+        node
+        for node in model.graph.node
+        if node.op_type in reachable_ops
+        and not node.name.startswith("mdc.moe.")
+    ]
+    isolated = [
+        node.name or node.op_type
+        for node in custom_nodes
+        if not any(output in visited_values for output in node.output)
+    ]
+    if isolated:
+        raise OnnxExportError(
+            f"MDC custom nodes do not reach graph outputs: {isolated}"
+        )
+
+    quantized_nodes = [
+        node
+        for node in custom_nodes
+        if node.op_type in {"NPUAscendQuantV2", "AscendDequant"}
+    ]
+    targets = set(properties["mdc.target"].split(","))
+    if targets == {"linear"}:
+        raw_count = properties.get("mdc.linear.target_count")
+        try:
+            target_count = int(raw_count or "")
+        except ValueError as error:
+            raise OnnxExportError("Linear target count metadata is invalid") from error
+        counts = Counter(node.op_type for node in quantized_nodes)
+        if (
+            target_count <= 0
+            or counts["NPUAscendQuantV2"] != target_count
+            or counts["AscendDequant"] != target_count
+        ):
+            raise OnnxExportError("Linear quantization target coverage is incomplete")
+
+
 def _validate_io_abi(model: onnx.ModelProto, stage: str) -> None:
     inputs = list(model.graph.input)
     outputs = list(model.graph.output)
@@ -319,6 +385,7 @@ def validate_mdc_model(model: onnx.ModelProto) -> None:
     if "moe" in properties["mdc.target"]:
         _validate_moe_contract(model, properties)
     _validate_dequant_initializers(model)
+    _validate_custom_node_reachability(model, properties)
 
 
 def validate_serialized_model(path: str) -> onnx.ModelProto:

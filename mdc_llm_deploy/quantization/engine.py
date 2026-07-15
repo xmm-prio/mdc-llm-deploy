@@ -14,7 +14,13 @@ from torch.fx import GraphModule, Interpreter, Node
 from ..config import QuantizationConfig
 from ..errors import GraphStateError, QuantizationConfigError
 from ..graph import GraphStage, QuantizedTarget, metadata, set_metadata, transactional_update
-from .math import QuantizedTensor, calculate_qparams, gptq_weight_quantize, quantize
+from .math import (
+    GptqFallbackError,
+    QuantizedTensor,
+    calculate_qparams,
+    gptq_weight_quantize,
+    quantize,
+)
 from .planner import TargetPlan, plan_quantization
 
 
@@ -172,14 +178,14 @@ def _materialize_target(
                     block_size=target.block_size,
                     per_channel=target.weight.granularity == "per_channel",
                 )
-            except (RuntimeError, ValueError) as error:
+            except GptqFallbackError as error:
                 result = quantize(
                     parameter,
                     bits=target.weight.bits,
                     symmetric=True,
                     axis=axis,
                 )
-                fallback_reason = f"cholesky_failed:{type(error).__name__}"
+                fallback_reason = error.reason
         else:
             result = quantize(
                 parameter,

@@ -7,6 +7,22 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+GPTQ_FALLBACK_NON_FINITE_HESSIAN = "non_finite_hessian"
+GPTQ_FALLBACK_CHOLESKY_FAILED = "cholesky_failed"
+
+
+class GptqFallbackError(RuntimeError):
+    """Signal a PRD-approved GPTQ fallback condition."""
+
+    def __init__(self, reason: str) -> None:
+        if reason not in {
+            GPTQ_FALLBACK_NON_FINITE_HESSIAN,
+            GPTQ_FALLBACK_CHOLESKY_FAILED,
+        }:
+            raise ValueError(f"Unsupported GPTQ fallback reason: {reason}")
+        super().__init__(reason)
+        self.reason = reason
+
 
 @dataclass(frozen=True, slots=True)
 class QuantizedTensor:
@@ -116,6 +132,47 @@ def decode_dequant_scale(encoded: Tensor) -> Tensor:
     return decoded
 
 
+def _gptq_clip_scales(
+    source: Tensor,
+    *,
+    bits: int,
+    per_channel: bool,
+) -> Tensor:
+    """Select scales by deterministic 20-point clipping error search."""
+    _, qmax = integer_range(bits)
+    base_bounds = (
+        source.abs().amax(dim=1, keepdim=True)
+        if per_channel
+        else source.abs().amax().reshape(1, 1)
+    )
+    ratios = torch.tensor(
+        [0.5 + index * 0.5 / 19 for index in range(20)],
+        dtype=torch.float32,
+        device=source.device,
+    )
+    best_error = torch.full_like(base_bounds, torch.inf)
+    best_scale = torch.ones_like(base_bounds)
+    qmin, qmax = integer_range(bits)
+    for ratio in ratios:
+        bounds = base_bounds * ratio
+        scales = torch.where(bounds == 0, torch.ones_like(bounds), bounds / qmax)
+        restored = (
+            torch.round(source / scales)
+            .clamp(qmin, qmax)
+            .mul(scales)
+        )
+        squared_error = (source - restored).square()
+        error = (
+            squared_error.mean(dim=1, keepdim=True)
+            if per_channel
+            else squared_error.mean().reshape(1, 1)
+        )
+        improved = error < best_error
+        best_error = torch.where(improved, error, best_error)
+        best_scale = torch.where(improved, scales, best_scale)
+    return best_scale
+
+
 def gptq_weight_quantize(
     weight: Tensor,
     activations: Tensor,
@@ -143,7 +200,11 @@ def gptq_weight_quantize(
     hessian = hessian + torch.eye(
         hessian.shape[0], device=hessian.device, dtype=hessian.dtype
     ) * damp
-    chol = torch.linalg.cholesky(hessian)
+    if not torch.isfinite(hessian).all():
+        raise GptqFallbackError(GPTQ_FALLBACK_NON_FINITE_HESSIAN)
+    chol, cholesky_info = torch.linalg.cholesky_ex(hessian, check_errors=False)
+    if (cholesky_info != 0).any():
+        raise GptqFallbackError(GPTQ_FALLBACK_CHOLESKY_FAILED)
     inverse = torch.cholesky_inverse(chol)
     order = (
         torch.argsort(diagonal, descending=True)
@@ -154,15 +215,10 @@ def gptq_weight_quantize(
     work = source[:, order].clone()
     quantized = torch.empty_like(work, dtype=torch.int8)
     parameter_shape = (source.shape[0], 1) if per_channel else (1, 1)
-    scales = torch.empty(parameter_shape, dtype=torch.float32, device=source.device)
+    scales = _gptq_clip_scales(source, bits=bits, per_channel=per_channel)
+    if scales.shape != parameter_shape:
+        raise RuntimeError("GPTQ clipping produced an invalid scale shape")
     zero_points = torch.zeros(parameter_shape, dtype=torch.int32, device=source.device)
-    _, qmax = integer_range(bits)
-    bounds = (
-        work.abs().amax(dim=1, keepdim=True)
-        if per_channel
-        else work.abs().amax().reshape(1, 1)
-    )
-    scales.copy_(torch.where(bounds == 0, torch.ones_like(bounds), bounds / qmax))
     qmin, qmax = integer_range(bits)
     for start in range(0, work.shape[1], block_size):
         end = min(start + block_size, work.shape[1])
