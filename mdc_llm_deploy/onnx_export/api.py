@@ -29,6 +29,7 @@ from .graph_cleanup import (
     topologically_sort,
 )
 from .linear_lowering import append_quantized_linears
+from .moe_lowering import adapt_quantized_moe
 from .standard_export import export_standard_onnx
 from .validator import validate_mdc_model
 
@@ -76,6 +77,7 @@ def _lower(
             layer_id=layer_id,
         )
     append_quantized_linears(model, value)
+    adapt_quantized_moe(model, value)
     prune_unreachable(model)
     topologically_sort(model)
     algorithms = sorted({item.algorithm for item in value.quantized_targets}) or ["fp16"]

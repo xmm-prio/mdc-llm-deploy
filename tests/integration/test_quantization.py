@@ -167,6 +167,10 @@ def test_attention_and_moe_materialization_contracts() -> None:
     block = moe.get_submodule("model.layers.0.mlp")
     assert block.expert_weights.dtype is torch.int8
     assert block.quant_scales.shape == (4, 3)
+    qparams = moe_value.properties["activation_qparams"][
+        moe_value.quantized_targets[0].fqn
+    ]
+    assert len(qparams["intermediate_scale"]) == 4
     assert "moe_quant_parameter_order" not in moe_value.properties
 
 

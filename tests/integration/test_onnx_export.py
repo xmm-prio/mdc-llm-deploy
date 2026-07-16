@@ -183,9 +183,17 @@ def test_oneshot_moe_exports_int8_packed_weights(
         item for item in exported.graph.node if item.op_type == "MoeExpert"
     )
     initializers = {item.name: item for item in exported.graph.initializer}
+    producers = {
+        output: item
+        for item in exported.graph.node
+        for output in item.output
+    }
 
     assert initializers[node.input[3]].data_type == onnx.TensorProto.INT8
-    assert tuple(initializers[node.input[4]].dims) == (3, 3)
+    assert len(initializers[node.input[3]].dims) == 1
+    assert tuple(initializers[node.input[4]].dims) == (13,)
+    assert producers[node.input[0]].op_type == "NPUAscendQuantV2"
+    assert producers[node.input[1]].op_type == "Cast"
 
 
 def test_two_layer_decode_preserves_every_cache_name(

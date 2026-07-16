@@ -77,7 +77,7 @@ def _materialize_weight(
     parameter: Tensor,
     target: TargetPlan,
     calibration: Mapping[str, Tensor],
-) -> tuple[QuantizedTensor, str | None]:
+) -> tuple[QuantizedTensor, str | None, tuple[float, ...] | None]:
     if target.weight is None:
         raise QuantizationConfigError(
             f"Target {target.fqn!r} has no weight spec"
@@ -125,6 +125,7 @@ def _materialize_weight(
             symmetric=target.weight.symmetric,
             axis=axis,
         )
+    intermediate_scales: tuple[float, ...] | None = None
     if (
         target.target_type == "moe"
         and target.parameter_name is not None
@@ -133,6 +134,28 @@ def _materialize_weight(
         module_name = target.parameter_name.rsplit(".", 1)[0]
         module = candidate.get_submodule(module_name)
         expert_count = int(parameter.shape[0])
+        samples = _required_sample(calibration, target.fqn).float()
+        hidden_size = int(samples.shape[-1])
+        intermediate_size = int(
+            parameter.shape[1] // (3 * hidden_size)
+        )
+        projection_size = hidden_size * intermediate_size
+        calculated_scales: list[float] = []
+        for expert_id in range(expert_count):
+            packed = parameter[expert_id].float()
+            gate = packed[:projection_size].reshape(
+                intermediate_size,
+                hidden_size,
+            )
+            up = packed[
+                projection_size : 2 * projection_size
+            ].reshape(intermediate_size, hidden_size)
+            intermediate = torch.nn.functional.silu(
+                samples @ gate.t()
+            ) * (samples @ up.t())
+            maximum = float(intermediate.abs().amax().cpu())
+            calculated_scales.append(max(maximum / 127.0, 1e-12))
+        intermediate_scales = tuple(calculated_scales)
         scales = result.scale.reshape(-1)
         if scales.numel() == 1:
             scales = scales.repeat(expert_count * 3)
@@ -184,7 +207,7 @@ def _materialize_weight(
     else:
         with torch.no_grad():
             parameter.copy_(result.dequantized)
-    return result, fallback_reason
+    return result, fallback_reason, intermediate_scales
 
 
 def _activation_metadata(
@@ -236,8 +259,9 @@ def materialize_target(
         )
     fallback_reason: str | None = None
     result: QuantizedTensor | None = None
+    intermediate_scales: tuple[float, ...] | None = None
     if parameter is not None and target.weight is not None:
-        result, fallback_reason = _materialize_weight(
+        result, fallback_reason, intermediate_scales = _materialize_weight(
             candidate,
             parameter,
             target,
@@ -254,6 +278,14 @@ def materialize_target(
         target,
         calibration,
     )
+    if intermediate_scales is not None:
+        if activation_qparams is None:
+            raise QuantizationConfigError(
+                "Packed MoeExpert requires activation quantization"
+            )
+        activation_qparams["intermediate_scale"] = list(
+            intermediate_scales
+        )
     integer_hash = _integer_sha256(result)
     materialized = QuantizedTarget(
         fqn=target.fqn,
