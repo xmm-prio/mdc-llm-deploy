@@ -57,7 +57,7 @@ def _linear_parameters(graph: GraphModule) -> tuple[str, ...]:
     linear_weights = _linear_weight_names(graph)
     return tuple(
         name
-        for name, parameter in graph.named_parameters()
+        for name, parameter in graph.named_parameters(remove_duplicate=False)
         if name in linear_weights and parameter.ndim == 2 and not _is_moe_parameter(name)
     )
 
@@ -66,7 +66,7 @@ def _moe_parameters(graph: GraphModule) -> tuple[str, ...]:
     linear_weights = _linear_weight_names(graph)
     return tuple(
         name
-        for name, parameter in graph.named_parameters()
+        for name, parameter in graph.named_parameters(remove_duplicate=False)
         if parameter.ndim == 2
         and _is_moe_parameter(name)
         and (

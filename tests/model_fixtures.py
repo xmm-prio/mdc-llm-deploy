@@ -15,7 +15,11 @@ from mdc_llm_deploy.models import (
 )
 
 
-def dense_config(*, layers: int = 1) -> Qwen3Config:
+def dense_config(
+    *,
+    layers: int = 1,
+    tie_word_embeddings: bool = False,
+) -> Qwen3Config:
     """Return a compact Qwen3 Dense configuration."""
     return Qwen3Config(
         vocab_size=128,
@@ -26,6 +30,7 @@ def dense_config(*, layers: int = 1) -> Qwen3Config:
         num_key_value_heads=2,
         head_dim=16,
         max_position_embeddings=32,
+        tie_word_embeddings=tie_word_embeddings,
     )
 
 

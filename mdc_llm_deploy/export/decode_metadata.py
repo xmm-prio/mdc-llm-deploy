@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from torch import Tensor
 from torch.fx import GraphModule
 
 from ..errors import GraphStateError
@@ -97,11 +98,31 @@ def build_decode_metadata(
         for item in value.output_abi
     )
     properties = dict(value.properties)
+    cache_devices: dict[str, str] = {}
+    for layer_id in range(len(cache_outputs) // 2):
+        for edge in ("key", "value"):
+            node = next(
+                (
+                    item
+                    for item in candidate.graph.nodes
+                    if item.op == "placeholder"
+                    and item.name == f"past_{layer_id}_{edge}"
+                ),
+                None,
+            )
+            tensor = node.meta.get("val") if node is not None else None
+            if not isinstance(tensor, Tensor):
+                raise GraphStateError(
+                    f"Decode cache device is unavailable for layer "
+                    f"{layer_id} {edge}"
+                )
+            cache_devices[f"past.{layer_id}.{edge}"] = str(tensor.device)
     properties.update(
         {
             "decode_rewrite": True,
             "cache_layout": "BNSD",
             "cache_length": value.sequence_length - 1,
+            "cache_devices": cache_devices,
             "query_length": 1,
             "position_ids": (value.sequence_length - 1,),
             "mask_semantics": (

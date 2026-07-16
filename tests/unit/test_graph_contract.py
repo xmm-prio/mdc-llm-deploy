@@ -466,7 +466,10 @@ def test_transaction_recompiles_structural_graph_changes() -> None:
 
 def test_transaction_failure_leaves_graph_parameters_and_metadata_unchanged() -> None:
     graph = _graph()
+    graph.register_parameter("tied_weight", graph.weight)
     original_code = graph.code
+    original_identity = id(graph.weight)
+    original_device = graph.weight.device
     original_weight = graph.weight.detach().clone()
     original_metadata = metadata(graph)
 
@@ -482,6 +485,35 @@ def test_transaction_failure_leaves_graph_parameters_and_metadata_unchanged() ->
         transactional_update(graph, mutate)
 
     assert graph.code == original_code
+    assert id(graph.weight) == original_identity
+    assert graph.tied_weight is graph.weight
+    assert graph.weight.device == original_device
     assert torch.equal(graph.weight, original_weight)
-    assert metadata(graph) == original_metadata
+    assert metadata(graph) is original_metadata
     assert graph(torch.ones(1)).item() == pytest.approx(2.0)
+
+
+def test_transaction_does_not_deepcopy_unchanged_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _graph()
+    original_weight = graph.weight
+
+    def reject_deepcopy(
+        parameter: nn.Parameter,
+        memo: dict[int, object],
+    ) -> nn.Parameter:
+        raise AssertionError("parameter data must not be deep-copied")
+
+    monkeypatch.setattr(nn.Parameter, "__deepcopy__", reject_deepcopy)
+
+    transactional_update(
+        graph,
+        lambda candidate: set_metadata(
+            candidate,
+            replace(metadata(candidate), properties={"opset": 18, "revision": 3}),
+        ),
+    )
+
+    assert graph.weight is original_weight
+    assert metadata(graph).properties["revision"] == 3

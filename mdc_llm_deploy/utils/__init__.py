@@ -1,3 +1,5 @@
-"""Internal utility namespace."""
+"""Shared utility API."""
 
-__all__: list[str] = []
+from .device import move_to_device
+
+__all__ = ["move_to_device"]

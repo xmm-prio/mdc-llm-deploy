@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 from torch.fx import GraphModule, Node
 
+from ..errors import UnsupportedPatternError
 from ..fx_inspection import node_target
 
 
@@ -88,9 +89,14 @@ def rewrite_position_nodes(
         ):
             continue
         tensor = node.meta.get("val")
-        kwargs: dict[str, Any] = {"dtype": torch.int64}
-        if isinstance(tensor, Tensor):
-            kwargs["device"] = tensor.device
+        if not isinstance(tensor, Tensor):
+            raise UnsupportedPatternError(
+                f"Decode position node {node.name!r} has no tensor device metadata"
+            )
+        kwargs: dict[str, Any] = {
+            "dtype": torch.int64,
+            "device": tensor.device,
+        }
         with candidate.graph.inserting_before(node):
             position = candidate.graph.call_function(
                 torch.ops.aten.full.default,

@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable
-from typing import TYPE_CHECKING, TypeVar
+from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
+from typing import TYPE_CHECKING, Any, TypeVar, cast
+
+import torch
+from torch import Tensor, nn
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from .errors import GraphStateError
 from .graph_contract import (
@@ -39,7 +44,6 @@ from .graph_types import (
 )
 
 if TYPE_CHECKING:
-    from torch import nn
     from torch.fx import GraphModule
 
 
@@ -84,11 +88,126 @@ def validate_graph(graph: GraphModule) -> GraphMetadata:
 T = TypeVar("T", bound="GraphModule")
 
 
+def _collect_tensors(value: object, tensors: dict[int, Tensor]) -> None:
+    if isinstance(value, Tensor):
+        tensors[id(value)] = value
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _collect_tensors(key, tensors)
+            _collect_tensors(item, tensors)
+        return
+    if isinstance(value, (tuple, list, set, frozenset)):
+        for item in value:
+            _collect_tensors(item, tensors)
+
+
+def _graph_tensors(graph: GraphModule) -> dict[int, Tensor]:
+    tensors = {
+        id(tensor): tensor
+        for tensor in (
+            *graph.parameters(),
+            *graph.buffers(),
+        )
+    }
+    for module in graph.modules():
+        _collect_tensors(module.__dict__, tensors)
+    _collect_tensors(graph.meta, tensors)
+    for node in graph.graph.nodes:
+        _collect_tensors(node.meta, tensors)
+    return tensors
+
+
+def _written_tensors(
+    function: object,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> tuple[Tensor, ...]:
+    schema = getattr(function, "_schema", None)
+    arguments = getattr(schema, "arguments", ())
+    written: list[Tensor] = []
+    for index, argument in enumerate(arguments):
+        alias_info = getattr(argument, "alias_info", None)
+        if alias_info is None or not alias_info.is_write:
+            continue
+        value = args[index] if index < len(args) else kwargs.get(argument.name)
+        values: dict[int, Tensor] = {}
+        _collect_tensors(value, values)
+        written.extend(values.values())
+    return tuple(written)
+
+
+class _TensorMutationJournal(TorchDispatchMode, AbstractContextManager[None]):
+    def __init__(self, shared_tensors: dict[int, Tensor]) -> None:
+        super().__init__()  # type: ignore[no-untyped-call]
+        self._shared_tensors = shared_tensors
+        self._snapshots: dict[int, Tensor] = {}
+
+    def __torch_dispatch__(
+        self,
+        function: object,
+        types: tuple[type[Any], ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        call_kwargs = kwargs or {}
+        for tensor in _written_tensors(function, args, call_kwargs):
+            identity = id(tensor)
+            if identity in self._shared_tensors and identity not in self._snapshots:
+                self._snapshots[identity] = tensor.detach().clone(
+                    memory_format=torch.preserve_format
+                )
+        return function(*args, **call_kwargs)  # type: ignore[operator]
+
+    def restore(self) -> None:
+        with torch.no_grad():
+            for identity, snapshot in self._snapshots.items():
+                original = self._shared_tensors[identity]
+                if (
+                    original.shape == snapshot.shape
+                    and original.stride() == snapshot.stride()
+                ):
+                    original.copy_(snapshot)
+                else:
+                    original.data = snapshot
+
+    def detach_candidate(self, candidate: GraphModule) -> None:
+        replacements: dict[int, Tensor] = {}
+        for identity, original in self._shared_tensors.items():
+            if identity not in self._snapshots:
+                continue
+            value = original.detach().clone(memory_format=torch.preserve_format)
+            replacements[identity] = (
+                nn.Parameter(value, requires_grad=original.requires_grad)
+                if isinstance(original, nn.Parameter)
+                else value
+            )
+        self.restore()
+        for module in candidate.modules():
+            for name, parameter in module._parameters.items():
+                if parameter is not None and id(parameter) in replacements:
+                    module._parameters[name] = cast(
+                        nn.Parameter,
+                        replacements[id(parameter)],
+                    )
+            for name, buffer in module._buffers.items():
+                if buffer is not None and id(buffer) in replacements:
+                    module._buffers[name] = replacements[id(buffer)]
+
+
 def transactional_update(graph: T, mutator: Callable[[T], None]) -> T:
-    """Validate a candidate then atomically replace state, preserving identity."""
+    """Validate and atomically commit a copy-on-write graph candidate."""
     validate_graph(graph)
-    candidate = copy.deepcopy(graph)
-    mutator(candidate)
+    tensors = _graph_tensors(graph)
+    candidate = copy.deepcopy(graph, memo=tensors.copy())
+    journal = _TensorMutationJournal(tensors)
+    try:
+        with journal:
+            mutator(candidate)
+    except BaseException:
+        journal.restore()
+        raise
+    journal.detach_candidate(candidate)
     candidate.graph.lint()  # type: ignore[no-untyped-call]
     candidate.recompile()
     validate_graph(candidate)

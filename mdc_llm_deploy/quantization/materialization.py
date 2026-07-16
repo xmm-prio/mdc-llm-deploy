@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -38,7 +38,7 @@ def _parameter(
 ) -> Tensor | None:
     if target.parameter_name is None:
         return None
-    parameters = dict(candidate.named_parameters())
+    parameters = dict(candidate.named_parameters(remove_duplicate=False))
     try:
         return parameters[target.parameter_name]
     except KeyError as error:
@@ -57,6 +57,20 @@ def _required_sample(
         raise QuantizationConfigError(
             f"No activation calibration captured for {fqn!r}"
         ) from error
+
+
+def _require_same_device(
+    parameter: Tensor,
+    sample: Tensor,
+    *,
+    algorithm: str,
+    fqn: str,
+) -> None:
+    if sample.device != parameter.device:
+        raise QuantizationConfigError(
+            f"{algorithm} device mismatch for {fqn!r}: parameter is on "
+            f"{parameter.device}, calibration is on {sample.device}"
+        )
 
 
 def _activation_parameters(
@@ -98,10 +112,16 @@ def _materialize_weight(
                 "GPTQ does not support packed MoeExpert weights"
             )
         samples = _required_sample(calibration, target.fqn)
+        _require_same_device(
+            parameter,
+            samples,
+            algorithm="GPTQ",
+            fqn=target.fqn,
+        )
         try:
             result = gptq_weight_quantize(
                 parameter,
-                samples.to(parameter.device),
+                samples,
                 bits=target.weight.bits,
                 percdamp=target.percdamp,
                 actorder=target.actorder,
@@ -134,7 +154,14 @@ def _materialize_weight(
         module_name = target.parameter_name.rsplit(".", 1)[0]
         module = candidate.get_submodule(module_name)
         expert_count = int(parameter.shape[0])
-        samples = _required_sample(calibration, target.fqn).float()
+        samples = _required_sample(calibration, target.fqn)
+        _require_same_device(
+            parameter,
+            samples,
+            algorithm="MoeExpert",
+            fqn=target.fqn,
+        )
+        samples = samples.float()
         hidden_size = int(samples.shape[-1])
         intermediate_size = int(
             parameter.shape[1] // (3 * hidden_size)
@@ -305,3 +332,60 @@ def materialize_target(
         activation_qparams=activation_qparams,
         integer_sha256=integer_hash,
     )
+
+
+def materialize_alias_group(
+    candidate: GraphModule,
+    targets: tuple[TargetPlan, ...],
+    calibration: Mapping[str, Tensor],
+) -> tuple[MaterializationResult, ...]:
+    """Materialize one shared parameter once and describe every selected alias."""
+    if not targets:
+        return ()
+    representative = targets[0]
+    group_calibration = dict(calibration)
+    if (
+        len(targets) > 1
+        and representative.parameter_name is not None
+        and (
+            representative.algorithm == "gptq"
+            or representative.target_type == "moe"
+        )
+    ):
+        samples = tuple(
+            _required_sample(calibration, target.fqn) for target in targets
+        )
+        devices = {sample.device for sample in samples}
+        if len(devices) != 1:
+            raise QuantizationConfigError(
+                "Aliased calibration targets span devices: "
+                f"{sorted(str(device) for device in devices)}"
+            )
+        group_calibration[representative.fqn] = torch.cat(samples)
+    first = materialize_target(
+        candidate,
+        representative,
+        group_calibration,
+    )
+    results = [first]
+    for target in targets[1:]:
+        activation_qparams = _activation_metadata(
+            target,
+            calibration,
+        )
+        if (
+            activation_qparams is not None
+            and first.activation_qparams is not None
+            and "intermediate_scale" in first.activation_qparams
+        ):
+            activation_qparams["intermediate_scale"] = (
+                first.activation_qparams["intermediate_scale"]
+            )
+        results.append(
+            MaterializationResult(
+                target=replace(first.target, fqn=target.fqn),
+                activation_qparams=activation_qparams,
+                integer_sha256=first.integer_sha256,
+            )
+        )
+    return tuple(results)

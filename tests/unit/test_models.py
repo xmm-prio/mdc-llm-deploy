@@ -37,6 +37,46 @@ def test_dense_model_returns_logits_and_every_layer_cache() -> None:
     assert all(not parameter.requires_grad for parameter in model.parameters())
 
 
+def test_top_level_transformers_device_and_dtype_properties() -> None:
+    model = dense_model(4)
+
+    assert model.device == next(model.parameters()).device
+    assert model.dtype is torch.float32
+
+    model.to(dtype=torch.bfloat16)
+
+    assert model.dtype is torch.bfloat16
+    with pytest.raises(AttributeError):
+        model.device = torch.device("cpu")  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        model.dtype = torch.float16  # type: ignore[misc]
+
+
+def test_tied_embeddings_are_one_parameter_and_storage() -> None:
+    config = dense_config(tie_word_embeddings=True)
+    model = Qwen3ForCausalLM(
+        config,
+        ExportModelConfig(4),
+        dtype=torch.float32,
+    )
+
+    assert model.lm_head.weight is model.model.embed_tokens.weight
+    assert (
+        model.lm_head.weight.untyped_storage().data_ptr()
+        == model.model.embed_tokens.weight.untyped_storage().data_ptr()
+    )
+    unique_names = dict(model.named_parameters())
+    all_names = dict(model.named_parameters(remove_duplicate=False))
+    assert "model.embed_tokens.weight" in unique_names
+    assert "lm_head.weight" not in unique_names
+    assert all_names["lm_head.weight"] is all_names["model.embed_tokens.weight"]
+
+    model.to(dtype=torch.bfloat16)
+
+    assert model.lm_head.weight is model.model.embed_tokens.weight
+    assert model.dtype is torch.bfloat16
+
+
 def test_dense_model_supports_attention_width_different_from_hidden_size() -> None:
     config = replace(dense_config(), hidden_size=32)
     model = Qwen3ForCausalLM(
@@ -137,6 +177,56 @@ def test_auto_model_loads_single_safetensors_checkpoint(tmp_path: Path) -> None:
     assert isinstance(loaded, Qwen3ForCausalLM)
     for name, value in source.state_dict().items():
         torch.testing.assert_close(loaded.state_dict()[name], value)
+
+
+def test_auto_model_restores_tied_parameter_after_safetensors_load(
+    tmp_path: Path,
+) -> None:
+    config = dense_config(tie_word_embeddings=True)
+    source = Qwen3ForCausalLM(
+        config,
+        ExportModelConfig(4),
+        dtype=torch.float32,
+    )
+    with torch.no_grad():
+        source.model.embed_tokens.weight.fill_(0.25)
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                name: getattr(config, name)
+                for name in config.__dataclass_fields__
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = {
+        name: value.detach().clone()
+        for name, value in source.state_dict().items()
+        if name
+        not in {
+            "cos_cache",
+            "sin_cache",
+            "causal_mask",
+            "lm_head.weight",
+        }
+    }
+    save_file(state, tmp_path / "model.safetensors")
+
+    loaded = AutoExportModel.from_pretrained(
+        tmp_path,
+        ExportModelConfig(4),
+        dtype=torch.float32,
+    )
+
+    assert loaded.lm_head.weight is loaded.model.embed_tokens.weight
+    assert (
+        loaded.lm_head.weight.untyped_storage().data_ptr()
+        == loaded.model.embed_tokens.weight.untyped_storage().data_ptr()
+    )
+    torch.testing.assert_close(
+        loaded.model.embed_tokens.weight,
+        torch.full_like(loaded.model.embed_tokens.weight, 0.25),
+    )
 
 
 def test_auto_model_tolerates_checkpoint_state_mismatches(tmp_path: Path) -> None:

@@ -19,6 +19,7 @@ from mdc_llm_deploy.quantization import (
     plan_quantization,
     quantize,
 )
+from mdc_llm_deploy.quantization.calibration import collect_calibration_samples
 from mdc_llm_deploy.quantization.math import (
     GPTQ_FALLBACK_CHOLESKY_FAILED,
     GPTQ_FALLBACK_NON_FINITE_HESSIAN,
@@ -413,3 +414,80 @@ def test_overlapping_modifiers_are_rejected_before_mutation() -> None:
         oneshot(graph, config, [_inputs()])
 
     assert metadata(graph).stage is GraphStage.FLOAT_PREFILL
+
+
+def _tied_minmax_config() -> dict[str, object]:
+    return {
+        "modifiers": [
+            {
+                "type": "minmax",
+                "include": ["first", "second"],
+                "linear": {
+                    "weight": {
+                        "bits": 8,
+                        "granularity": "per_channel",
+                        "symmetric": True,
+                    }
+                },
+            }
+        ]
+    }
+
+
+def test_oneshot_materializes_tied_parameter_once_and_preserves_aliases() -> None:
+    class TiedLinearModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first = torch.nn.Linear(4, 4, bias=False)
+            self.second = torch.nn.Linear(4, 4, bias=False)
+            self.second.weight = self.first.weight
+
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            values = input_ids.float()
+            return self.first(values) + self.second(values)
+
+    inputs = {"input_ids": torch.arange(4).reshape(1, 4)}
+    graph = export(TiedLinearModel().eval(), inputs)
+    before_device = graph.first.weight.device
+
+    oneshot(graph, _tied_minmax_config(), [inputs])
+
+    assert graph.first.weight is graph.second.weight
+    assert graph.first.weight.device == before_device
+    assert {target.fqn for target in metadata(graph).quantized_targets} == {
+        "second"
+    }
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="requires two CUDA devices",
+)
+def test_oneshot_aggregates_each_target_on_its_resident_device() -> None:
+    class ResidentLinearModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first = torch.nn.Linear(4, 4, bias=False).to("cuda:0")
+            self.second = torch.nn.Linear(4, 4, bias=False).to("cuda:1")
+            self.hf_device_map = {
+                "first": "cuda:0",
+                "second": "cuda:1",
+            }
+
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            hidden = self.first(input_ids.float().to("cuda:0"))
+            return self.second(hidden.to("cuda:1"))
+
+    inputs = {
+        "input_ids": torch.arange(4, device="cuda:0").reshape(1, 4)
+    }
+    graph = export(ResidentLinearModel().eval(), inputs)
+    samples = collect_calibration_samples(graph, [inputs, inputs])
+
+    assert samples["first"].device == torch.device("cuda:0")
+    assert samples["second"].device == torch.device("cuda:1")
+
+    oneshot(graph, _tied_minmax_config(), [inputs])
+
+    assert graph.first.weight.device == torch.device("cuda:0")
+    assert graph.second.weight.device == torch.device("cuda:1")

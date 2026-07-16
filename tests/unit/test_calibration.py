@@ -16,6 +16,7 @@ from mdc_llm_deploy.quantization.calibration import (
     _CalibrationInterpreter,
     collect_calibration_samples,
 )
+from mdc_llm_deploy.quantization.materialization import _require_same_device
 
 
 def _graph() -> GraphModule:
@@ -146,3 +147,19 @@ def test_collect_calibration_samples_rejects_invalid_batches(
 ) -> None:
     with pytest.raises(QuantizationConfigError, match=message):
         collect_calibration_samples(_graph(), [batch])
+
+
+@pytest.mark.parametrize("algorithm", ["GPTQ", "MoeExpert"])
+def test_materialization_rejects_calibration_device_mismatch(
+    algorithm: str,
+) -> None:
+    with pytest.raises(
+        QuantizationConfigError,
+        match=rf"{algorithm} device mismatch",
+    ):
+        _require_same_device(
+            torch.ones(2),
+            torch.ones(2, device="meta"),
+            algorithm=algorithm,
+            fqn="target",
+        )

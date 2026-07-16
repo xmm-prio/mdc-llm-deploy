@@ -49,24 +49,50 @@ def _qparam_tensor(
     *,
     current: bool,
     zero_point: bool,
+    device: torch.device,
 ) -> Tensor:
     raw = target.zero_point if zero_point else target.scale
     dtype = torch.float32
     if len(raw) == 1:
-        return torch.tensor(raw[0], dtype=dtype)
+        return torch.tensor(raw[0], dtype=dtype, device=device)
     if len(raw) != sequence:
         raise UnsupportedPatternError(
             f"Decode {target.fqn} parameters must be scalar "
             f"or have {sequence} positions"
         )
     if current:
-        return torch.tensor(raw[-1], dtype=dtype)
-    return torch.tensor(raw, dtype=dtype).reshape(
+        return torch.tensor(raw[-1], dtype=dtype, device=device)
+    return torch.tensor(raw, dtype=dtype, device=device).reshape(
         1,
         1,
         sequence,
         1,
     )
+
+
+def _node_tensor(node: Node, edge: str) -> Tensor:
+    value = node.meta.get("val")
+    if not isinstance(value, Tensor):
+        raise UnsupportedPatternError(
+            f"Decode cache cannot infer device for {edge!r}"
+        )
+    return value
+
+
+def _set_cache_placeholder_metadata(
+    past: Node,
+    current: Tensor,
+    target: QuantizedTarget | None,
+    sequence: int,
+) -> None:
+    if current.ndim < 3:
+        raise UnsupportedPatternError(
+            "Decode cache source must have at least three dimensions"
+        )
+    shape = list(current.shape)
+    shape[2] = sequence - 1
+    dtype = torch.int8 if target is not None else current.dtype
+    past.meta["val"] = current.new_empty(shape, dtype=dtype)
 
 
 def insert_cache_quantization(
@@ -79,6 +105,8 @@ def insert_cache_quantization(
 ) -> tuple[Node, Node]:
     """Append current KV state and return stored and attention values."""
     graph = candidate.graph
+    source_value = _node_tensor(current, edge)
+    _set_cache_placeholder_metadata(past, source_value, target, sequence)
     if target is None:
         present = graph.call_function(
             torch.ops.aten.cat.default,
@@ -97,6 +125,7 @@ def insert_cache_quantization(
             sequence,
             current=True,
             zero_point=False,
+            device=source_value.device,
         ),
     )
     zero_name = _register_tensor(
@@ -107,6 +136,7 @@ def insert_cache_quantization(
             sequence,
             current=True,
             zero_point=True,
+            device=source_value.device,
         ),
     )
     full_scale_name = _register_tensor(
@@ -117,6 +147,7 @@ def insert_cache_quantization(
             sequence,
             current=False,
             zero_point=False,
+            device=source_value.device,
         ),
     )
     full_zero_name = _register_tensor(
@@ -127,6 +158,7 @@ def insert_cache_quantization(
             sequence,
             current=False,
             zero_point=True,
+            device=source_value.device,
         ),
     )
     scale = graph.get_attr(scale_name)
@@ -173,8 +205,7 @@ def insert_cache_quantization(
         torch.ops.aten.mul.Tensor,
         args=(centered, full_scale),
     )
-    source_value = current.meta.get("val")
-    if isinstance(source_value, Tensor) and source_value.dtype != torch.float32:
+    if source_value.dtype != torch.float32:
         dequantized = graph.call_function(
             torch.ops.aten.to.dtype,
             args=(dequantized, source_value.dtype),

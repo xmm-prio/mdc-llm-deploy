@@ -13,6 +13,20 @@ from ..mdc_ops import moe_expert
 from .configuration import ExportModelConfig, Qwen3Config, Qwen3MoeConfig
 
 
+class _TransformersModelAdapter:
+    """Expose the top-level device and dtype semantics used by Transformers."""
+
+    @property
+    def device(self) -> torch.device:
+        """Return the device of the first model parameter."""
+        return next(cast(nn.Module, self).parameters()).device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Return the dtype of the first model parameter."""
+        return next(cast(nn.Module, self).parameters()).dtype
+
+
 class Qwen3RMSNorm(nn.Module):
     """Qwen3 RMS normalization with FP32 accumulation."""
 
@@ -302,7 +316,7 @@ class Qwen3Model(nn.Module):
         self.norm = Qwen3RMSNorm(config.hidden_size, config.rms_norm_eps)
 
 
-class _Qwen3ForCausalLM(nn.Module):
+class _Qwen3ForCausalLM(_TransformersModelAdapter, nn.Module):
     model_kind = "dense"
 
     def __init__(
@@ -377,11 +391,15 @@ class _Qwen3ForCausalLM(nn.Module):
                         std=config.initializer_range,
                         generator=generator,
                     )
-            if config.tie_word_embeddings:
-                self.lm_head.weight.copy_(self.model.embed_tokens.weight)
+        self.tie_weights()
         self.to(dtype=dtype)
         self.requires_grad_(False)
         self.eval()
+
+    def tie_weights(self) -> None:
+        """Restore configured input/output embedding parameter aliases."""
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(self, input_ids: Tensor) -> tuple[Tensor, ...]:
         """Run a fixed-length prefill and return logits plus per-layer KV."""

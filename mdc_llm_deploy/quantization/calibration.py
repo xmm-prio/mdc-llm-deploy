@@ -31,7 +31,7 @@ class _CalibrationInterpreter(Interpreter):
 
     def _record(self, name: str, value: Any) -> None:
         if isinstance(value, Tensor) and value.is_floating_point():
-            self.samples.setdefault(name, []).append(value.detach().cpu())
+            self.samples.setdefault(name, []).append(value.detach())
 
     def _attention_fqn(self, node: Node) -> str | None:
         return next(
@@ -99,16 +99,6 @@ def collect_calibration_samples(
     expected_abi = {
         item.name: item for item in graph_metadata.input_abi
     }
-    graph_devices = {
-        tensor.device
-        for tensor in (*tuple(graph.parameters()), *tuple(graph.buffers()))
-    }
-    if len(graph_devices) > 1:
-        raise QuantizationConfigError(
-            "Calibration graph parameters and buffers must use one device"
-        )
-    expected_device = next(iter(graph_devices), None)
-    observed_device = expected_device
     attention_fqns = tuple(
         boundary.fqn
         for boundary in graph_metadata.boundaries
@@ -142,11 +132,10 @@ def collect_calibration_samples(
                 raise QuantizationConfigError(
                     f"Calibration dtype for {name!r} must be {abi.dtype}"
                 )
-            if observed_device is None:
-                observed_device = tensor.device
-            if tensor.device != observed_device:
+            if tensor.device.type not in {"cpu", "cuda", "npu"}:
                 raise QuantizationConfigError(
-                    f"Calibration device for {name!r} must be {observed_device}"
+                    f"Calibration device for {name!r} is unsupported: "
+                    f"{tensor.device}"
                 )
             if not torch.isfinite(tensor).all():
                 raise QuantizationConfigError(
@@ -172,12 +161,20 @@ def collect_calibration_samples(
             "Calibration dataloader must yield at least one batch"
         )
     try:
-        return {
-            fqn: torch.cat(
+        aggregated: dict[str, Tensor] = {}
+        for fqn, values in captured.items():
+            devices = {value.device for value in values}
+            if len(devices) != 1:
+                raise QuantizationConfigError(
+                    f"Calibration samples for {fqn!r} span devices "
+                    f"{sorted(str(device) for device in devices)}"
+                )
+            aggregated[fqn] = torch.cat(
                 tuple(value.reshape(-1, value.shape[-1]) for value in values)
             )
-            for fqn, values in captured.items()
-        }
+        return aggregated
+    except QuantizationConfigError:
+        raise
     except Exception as error:
         raise QuantizationConfigError(
             f"Calibration sample aggregation failed: {error}"

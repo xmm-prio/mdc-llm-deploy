@@ -233,14 +233,8 @@ def load_model_state(model: ExportModel, directory: Path) -> None:
     """Load official Qwen3 tensors and pack MoE expert projections."""
     state = load_safetensors(directory)
     _pack_moe_experts(state, model)
-    config = model.config
-    if (
-        config.tie_word_embeddings
-        and "lm_head.weight" not in state
-        and "model.embed_tokens.weight" in state
-    ):
-        state["lm_head.weight"] = state["model.embed_tokens.weight"].clone()
     model.load_state_dict(_compatible_tensors(model, state), strict=False)
+    model.tie_weights()
     model.requires_grad_(False)
     model.eval()
 
