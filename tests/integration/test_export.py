@@ -11,6 +11,7 @@ import torch
 
 from mdc_llm_deploy.errors import GraphStateError, UnsupportedPatternError
 from mdc_llm_deploy.export import convert_to_decode, export
+from mdc_llm_deploy.export.discovery import DiscoveryResult, discover_metadata
 from mdc_llm_deploy.graph import (
     GRAPH_SCHEMA_VERSION,
     GraphStage,
@@ -18,7 +19,7 @@ from mdc_llm_deploy.graph import (
     metadata,
     set_metadata,
 )
-from mdc_llm_deploy.models.tiny import TinyAttention, TinyQwen3Dense
+from mdc_llm_deploy.models.tiny import TinyAttention, TinyQwen3Dense, TinyQwen3Moe
 
 InputFactory = Callable[[int], dict[str, torch.Tensor]]
 GraphFactory = Callable[[torch.nn.Module | None, int], torch.fx.GraphModule]
@@ -62,6 +63,117 @@ def test_boundary_discovery_uses_structure_not_class_name(input_factory: InputFa
     graph = export(model, input_factory(8))
 
     assert any(item.kind == "attention" for item in metadata(graph).boundaries)
+
+
+def test_discover_metadata_returns_complete_result(input_factory: InputFactory) -> None:
+    model = TinyQwen3Dense().eval()
+    inputs = input_factory(2)
+    graph = torch.export.export(
+        model,
+        args=(),
+        kwargs=inputs,
+        strict=False,
+    ).module()
+
+    result = discover_metadata(model, graph, inputs)
+
+    assert isinstance(result, DiscoveryResult)
+    assert tuple(item.name for item in result.input_abi) == ("input_ids",)
+    assert tuple(item.name for item in result.output_abi) == (
+        "logits",
+        "present.0.key",
+        "present.0.value",
+    )
+    assert any(item.kind == "attention" for item in result.boundaries)
+    assert result.properties["source"] == "torch.export"
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected"),
+    [
+        (
+            TinyQwen3Dense,
+            {
+                ("attention", "self_attn"),
+                ("rms_norm", "final_norm"),
+                ("rms_norm", "input_norm"),
+                ("rms_norm", "post_attention_norm"),
+                ("rope", "self_attn.rotary"),
+            },
+        ),
+        (
+            TinyQwen3Moe,
+            {
+                ("attention", "self_attn"),
+                ("moe", "moe"),
+                ("rms_norm", "final_norm"),
+                ("rms_norm", "input_norm"),
+                ("rms_norm", "post_attention_norm"),
+                ("rope", "self_attn.rotary"),
+            },
+        ),
+    ],
+)
+def test_tiny_boundary_sets_are_stable_and_non_overlapping(
+    model_type: type[torch.nn.Module],
+    expected: set[tuple[str, str]],
+    input_factory: InputFactory,
+) -> None:
+    graph = export(model_type().eval(), input_factory(8))
+    boundaries = metadata(graph).boundaries
+    nodes = [node for boundary in boundaries for node in boundary.nodes]
+
+    assert {(boundary.kind, boundary.fqn) for boundary in boundaries} == expected
+    assert len(nodes) == len(set(nodes))
+
+
+def test_discovery_fails_closed_without_owner_metadata(
+    input_factory: InputFactory,
+) -> None:
+    model = TinyQwen3Moe().eval()
+    inputs = input_factory(2)
+    graph = torch.export.export(
+        model,
+        args=(),
+        kwargs=inputs,
+        strict=False,
+    ).module()
+    for node in graph.graph.nodes:
+        node.meta.pop("nn_module_stack", None)
+
+    result = discover_metadata(model, graph, inputs)
+
+    assert result.boundaries == ()
+    assert all(not boundary.fqn.startswith("<graph:") for boundary in result.boundaries)
+
+
+def test_discovery_rejects_unrelated_overlapping_boundaries() -> None:
+    class Attention(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.q_proj = torch.nn.Linear(2, 2)
+            self.k_proj = torch.nn.Linear(2, 2)
+            self.v_proj = torch.nn.Linear(2, 2)
+            self.o_proj = torch.nn.Linear(2, 2)
+
+    model = torch.nn.Module()
+    model.add_module("left", Attention())
+    model.add_module("right", Attention())
+    fx_graph = torch.fx.Graph()
+    value = fx_graph.placeholder("x")
+    value.meta["val"] = torch.ones(1, 2)
+    value.meta["nn_module_stack"] = {
+        "left": ("left", Attention),
+        "right": ("right", Attention),
+    }
+    fx_graph.output(value)
+    graph = torch.fx.GraphModule(torch.nn.Module(), fx_graph)
+
+    with pytest.raises(
+        UnsupportedPatternError,
+        match="strict FQN parent-child relationship",
+    ):
+        discover_metadata(model, graph, {"x": torch.ones(1, 2)})
 
 
 def test_decode_rewrites_attention_position_and_cache(input_factory: InputFactory) -> None:
@@ -236,6 +348,38 @@ def test_decode_rejects_repeated_conversion(graph_factory: GraphFactory) -> None
 def test_export_rejects_training_model(input_factory: InputFactory) -> None:
     with pytest.raises(ValueError, match="eval"):
         export(TinyQwen3Dense().train(), input_factory(8))
+
+
+def test_export_rejects_invalid_input_ids_before_forward() -> None:
+    class ForwardCounter(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.forward_calls = 0
+
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            self.forward_calls += 1
+            return input_ids
+
+    model = ForwardCounter().eval()
+
+    with pytest.raises(
+        UnsupportedPatternError,
+        match="Static export requires rank-2 input_ids",
+    ):
+        export(model, {"input_ids": torch.ones(4, dtype=torch.int64)})
+
+    assert model.forward_calls == 0
+
+
+def test_export_infers_moe_kind_from_original_model_without_declared_kind(
+    input_factory: InputFactory,
+) -> None:
+    class UndeclaredMoe(TinyQwen3Moe):
+        model_kind = None
+
+    graph = export(UndeclaredMoe().eval(), input_factory(2))
+
+    assert metadata(graph).model_kind == "moe"
 
 
 def test_decode_rejects_graph_without_attention(input_factory: InputFactory) -> None:

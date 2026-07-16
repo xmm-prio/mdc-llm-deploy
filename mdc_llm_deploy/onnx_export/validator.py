@@ -2,386 +2,26 @@
 
 from __future__ import annotations
 
-import math
-from collections import Counter
-
 import onnx
-from onnx import TensorProto, numpy_helper
 
 from ..errors import OnnxExportError
-
-CUSTOM_OPS = {
-    "NPURmsNorm",
-    "ApplyRotaryPosEmb",
-    "FusedInferAttentionScore",
-    "NPUAscendQuantV2",
-    "AscendDequant",
-    "MoeExpert",
-}
-_STANDARD_DOMAINS = {"", "ai.onnx"}
-
-
-def _shape(value: onnx.ValueInfoProto) -> tuple[int, ...]:
-    tensor_type = value.type.tensor_type
-    if not tensor_type.HasField("shape"):
-        raise OnnxExportError(f"Value {value.name!r} has no shape")
-    result: list[int] = []
-    for dimension in tensor_type.shape.dim:
-        if not dimension.HasField("dim_value") or dimension.dim_value <= 0:
-            raise OnnxExportError(f"Value {value.name!r} has a dynamic shape")
-        result.append(dimension.dim_value)
-    return tuple(result)
-
-
-def _properties(model: onnx.ModelProto) -> dict[str, str]:
-    return {item.key: item.value for item in model.metadata_props}
-
-
-def _attributes(node: onnx.NodeProto) -> dict[str, onnx.AttributeProto]:
-    return {item.name: item for item in node.attribute}
-
-
-def _require_attributes(node: onnx.NodeProto, required: set[str]) -> None:
-    missing = required - _attributes(node).keys()
-    if missing:
-        raise OnnxExportError(
-            f"{node.op_type} attributes are incomplete: {sorted(missing)}"
-        )
-
-
-def _validate_operator(node: onnx.NodeProto, mask_mode: str) -> None:
-    if node.op_type == "NPURmsNorm":
-        if len(node.input) != 2 or len(node.output) != 2:
-            raise OnnxExportError("NPURmsNorm must use 2 inputs and 2 outputs")
-        _require_attributes(node, {"epsilon"})
-        epsilon = onnx.helper.get_attribute_value(_attributes(node)["epsilon"])
-        if not math.isclose(float(epsilon), 1e-6, rel_tol=0.0, abs_tol=1e-12):
-            raise OnnxExportError("NPURmsNorm epsilon must equal 1e-6")
-    elif node.op_type == "ApplyRotaryPosEmb":
-        if len(node.input) != 4 or len(node.output) != 2:
-            raise OnnxExportError("ApplyRotaryPosEmb must use 4 inputs and 2 outputs")
-        _require_attributes(node, {"layout", "rotary_mode"})
-        layout = onnx.helper.get_attribute_value(_attributes(node)["layout"])
-        rotary_mode = onnx.helper.get_attribute_value(_attributes(node)["rotary_mode"])
-        if layout != 1 or rotary_mode != b"half":
-            raise OnnxExportError("ApplyRotaryPosEmb must use BSND half rotation")
-    elif node.op_type == "FusedInferAttentionScore":
-        if len(node.input) != 29 or len(node.output) != 2:
-            raise OnnxExportError(
-                "FusedInferAttentionScore must use the complete 29-slot ABI"
-            )
-        _require_attributes(
-            node,
-            {
-                "num_heads",
-                "num_key_value_heads",
-                "scale",
-                "input_layout",
-                "sparse_mode",
-                "pre_tokens",
-                "next_tokens",
-                "softmax_lse_flag",
-            },
-        )
-        attributes = _attributes(node)
-        if onnx.helper.get_attribute_value(attributes["input_layout"]) != b"BNSD":
-            raise OnnxExportError("FusedInferAttentionScore layout must be BNSD")
-        if onnx.helper.get_attribute_value(attributes["sparse_mode"]) != 0:
-            raise OnnxExportError("FusedInferAttentionScore sparse_mode must be 0")
-        if mask_mode == "masked" and not node.input[4]:
-            raise OnnxExportError("Masked attention requires atten_mask")
-        if mask_mode == "maskless" and node.input[4]:
-            raise OnnxExportError("Maskless attention must omit atten_mask")
-    elif node.op_type == "NPUAscendQuantV2":
-        if len(node.input) not in {2, 3} or len(node.output) != 1:
-            raise OnnxExportError("NPUAscendQuantV2 ABI is invalid")
-        _require_attributes(node, {"axis", "dtype"})
-        if onnx.helper.get_attribute_value(_attributes(node)["dtype"]) != 2:
-            raise OnnxExportError("Release quantization must use INT8 dtype=2")
-    elif node.op_type == "AscendDequant":
-        if len(node.input) != 2 or len(node.output) != 1:
-            raise OnnxExportError("AscendDequant ABI is invalid")
-        _require_attributes(node, {"sqrt_mode", "relu_flag", "dtype"})
-        attributes = _attributes(node)
-        if onnx.helper.get_attribute_value(attributes["sqrt_mode"]) != 0:
-            raise OnnxExportError("AscendDequant sqrt_mode must be false")
-        if onnx.helper.get_attribute_value(attributes["relu_flag"]) != 0:
-            raise OnnxExportError("AscendDequant relu_flag must be false")
-        if onnx.helper.get_attribute_value(attributes["dtype"]) not in {0, 1}:
-            raise OnnxExportError("AscendDequant dtype must be 0 or 1")
-    elif node.op_type == "MoeExpert":
-        if len(node.input) not in {5, 6} or len(node.output) != 1:
-            raise OnnxExportError("MoeExpert ABI is invalid")
-
-
-def _validate_dequant_initializers(model: onnx.ModelProto) -> None:
-    initializers = {item.name: item for item in model.graph.initializer}
-    for node in model.graph.node:
-        if node.op_type != "AscendDequant":
-            continue
-        scale = initializers.get(node.input[1])
-        if scale is None or scale.data_type != TensorProto.UINT64:
-            raise OnnxExportError("AscendDequant scale must be a UINT64 initializer")
-        values = numpy_helper.to_array(scale).astype("uint64", copy=False)
-        if ((values >> 32) != 0).any():
-            raise OnnxExportError("AscendDequant scale high 32 bits must be zero")
-        decoded = (values & 0xFFFFFFFF).astype("uint32").view("float32")
-        if not ((decoded > 0) & (decoded < float("inf"))).all():
-            raise OnnxExportError("AscendDequant scale must decode to finite positives")
-
-
-def _validate_custom_node_reachability(
-    model: onnx.ModelProto,
-    properties: dict[str, str],
-) -> None:
-    """Require every MDC custom node to contribute to graph outputs."""
-    producers = {
-        output: node
-        for node in model.graph.node
-        for output in node.output
-    }
-    pending = [item.name for item in model.graph.output]
-    visited_values: set[str] = set()
-    while pending:
-        value = pending.pop()
-        if value in visited_values:
-            continue
-        visited_values.add(value)
-        producer = producers.get(value)
-        if producer is None:
-            continue
-        pending.extend(name for name in producer.input if name)
-
-    custom_nodes = [
-        node
-        for node in model.graph.node
-        if node.op_type in CUSTOM_OPS
-    ]
-    isolated = [
-        node.name or node.op_type
-        for node in custom_nodes
-        if not any(output in visited_values for output in node.output)
-    ]
-    if isolated:
-        raise OnnxExportError(
-            f"MDC custom nodes do not reach graph outputs: {isolated}"
-        )
-
-    quantized_nodes = [
-        node
-        for node in custom_nodes
-        if node.op_type in {"NPUAscendQuantV2", "AscendDequant"}
-    ]
-    targets = set(properties["mdc.target"].split(","))
-    if targets == {"linear"}:
-        raw_count = properties.get("mdc.linear.target_count")
-        try:
-            target_count = int(raw_count or "")
-        except ValueError as error:
-            raise OnnxExportError("Linear target count metadata is invalid") from error
-        counts = Counter(node.op_type for node in quantized_nodes)
-        if (
-            target_count <= 0
-            or counts["NPUAscendQuantV2"] != target_count
-            or counts["AscendDequant"] != target_count
-        ):
-            raise OnnxExportError("Linear quantization target coverage is incomplete")
-
-
-def _validate_io_abi(model: onnx.ModelProto, stage: str) -> None:
-    inputs = list(model.graph.input)
-    outputs = list(model.graph.output)
-    expected_inputs = (
-        ["input_ids"]
-        if stage.endswith("PREFILL")
-        else [
-            "input_ids",
-            "past_key_values.0.key",
-            "past_key_values.0.value",
-        ]
-    )
-    if [item.name for item in inputs] != expected_inputs:
-        raise OnnxExportError("MDC runtime input ABI is invalid")
-    if [item.name for item in outputs] != [
-        "logits",
-        "present.0.key",
-        "present.0.value",
-    ]:
-        raise OnnxExportError("MDC runtime output ABI is invalid")
-    input_ids = inputs[0]
-    if input_ids.type.tensor_type.elem_type != TensorProto.INT64:
-        raise OnnxExportError("input_ids must use INT64")
-    logits_shape = _shape(outputs[0])
-    key_shape = _shape(outputs[1])
-    value_shape = _shape(outputs[2])
-    if len(logits_shape) != 3 or logits_shape[0] != 1:
-        raise OnnxExportError("logits ABI shape is invalid")
-    if len(key_shape) != 4 or key_shape != value_shape or key_shape[0] != 1:
-        raise OnnxExportError("KV output ABI shape is invalid")
-    if stage.endswith("PREFILL"):
-        if _shape(input_ids) != (1, logits_shape[1]) or key_shape[2] != logits_shape[1]:
-            raise OnnxExportError("Prefill sequence ABI is inconsistent")
-    else:
-        if _shape(input_ids) != (1, 1) or logits_shape[1] != 1:
-            raise OnnxExportError("Decode query ABI must use one token")
-        if _shape(inputs[1]) != (key_shape[0], key_shape[1], key_shape[2] - 1, key_shape[3]):
-            raise OnnxExportError("Decode key cache must omit the current token")
-        if _shape(inputs[2]) != (value_shape[0], value_shape[1], value_shape[2] - 1, value_shape[3]):
-            raise OnnxExportError("Decode value cache must omit the current token")
-
-
-def _validate_mask_initializer(
-    model: onnx.ModelProto,
-    attention: onnx.NodeProto,
-    stage: str,
-) -> None:
-    initializers = {item.name: item for item in model.graph.initializer}
-    mask = initializers.get(attention.input[4])
-    if mask is None or mask.data_type != TensorProto.BOOL:
-        raise OnnxExportError("Attention mask must be a BOOL initializer")
-    cache_shape = _shape(model.graph.output[1])
-    query_length = _shape(model.graph.output[0])[1]
-    expected = (1, 1, query_length, cache_shape[2])
-    if tuple(mask.dims) != expected:
-        raise OnnxExportError(
-            f"{stage} attention mask shape must be {expected}"
-        )
-
-
-def _validate_attention_quantization_contract(
-    model: onnx.ModelProto,
-    attention: onnx.NodeProto,
-) -> None:
-    types = {
-        item.name: item.type.tensor_type.elem_type
-        for item in (*model.graph.input, *model.graph.output, *model.graph.value_info)
-    }
-    types.update(
-        (item.name, item.data_type)
-        for item in model.graph.initializer
-    )
-    if not all(types.get(attention.input[index]) == TensorProto.INT8 for index in range(3)):
-        return
-
-    required = {
-        7: "dequant_scale1",
-        8: "quant_scale1",
-        9: "dequant_scale2",
-        17: "key_antiquant_scale",
-        19: "value_antiquant_scale",
-        27: "dequant_scale_query",
-    }
-    initializers = {item.name: item for item in model.graph.initializer}
-    for index, slot_name in required.items():
-        input_name = attention.input[index]
-        initializer = initializers.get(input_name)
-        if not input_name or initializer is None:
-            raise OnnxExportError(
-                f"INT8 per-tensor attention requires {slot_name}"
-            )
-        if (
-            initializer.data_type != TensorProto.FLOAT
-            or tuple(initializer.dims) not in {(), (1,)}
-        ):
-            raise OnnxExportError(
-                f"Attention {slot_name} must be a one-element FLOAT32 initializer"
-            )
-        value = float(numpy_helper.to_array(initializer).reshape(-1)[0])
-        if not math.isfinite(value) or value <= 0:
-            raise OnnxExportError(
-                f"Attention {slot_name} must be finite and positive"
-            )
-
-
-def _validate_moe_contract(model: onnx.ModelProto, properties: dict[str, str]) -> None:
-    node = next(item for item in model.graph.node if item.op_type == "MoeExpert")
-    initializers = {item.name: item for item in model.graph.initializer}
-    specs = {
-        item.name: (item.type.tensor_type.elem_type, _shape(item))
-        for item in (*model.graph.input, *model.graph.output, *model.graph.value_info)
-    }
-    specs.update(
-        (item.name, (item.data_type, tuple(item.dims)))
-        for item in model.graph.initializer
-    )
-    expected_types = (
-        TensorProto.INT8,
-        TensorProto.INT16,
-        TensorProto.FLOAT16,
-        TensorProto.INT8,
-        TensorProto.FLOAT,
-        TensorProto.INT32,
-    )
-    if len(node.input) != 6 or any(
-        specs.get(name, (None, ()))[0] != expected
-        for name, expected in zip(node.input, expected_types, strict=True)
-    ):
-        raise OnnxExportError("MoeExpert input dtypes must match the six-input ATC ABI")
-    x_shape = specs[node.input[0]][1]
-    ids_shape = specs[node.input[1]][1]
-    weights_shape = specs[node.input[2]][1]
-    output_shape = specs.get(node.output[0])
-    if len(x_shape) != 2 or x_shape[1] % 256 != 0:
-        raise OnnxExportError(
-            "MoeExpert hidden_size must use the ATC-verified 256-element alignment"
-        )
-    token_count, hidden_size = x_shape
-    if ids_shape != (token_count, 3) or weights_shape != ids_shape:
-        raise OnnxExportError("MoeExpert routing inputs must use matching [tokenNum, 3] shapes")
-    if output_shape != (TensorProto.FLOAT16, x_shape):
-        raise OnnxExportError("MoeExpert output must use FLOAT16[tokenNum, hiddenSize]")
-
-    packed = initializers.get(node.input[3])
-    scales = initializers.get(node.input[4])
-    offsets = initializers.get(node.input[5])
-    if packed is None or len(packed.dims) != 1:
-        raise OnnxExportError("MoeExpert expert_weights must be a one-dimensional initializer")
-    denominator = 5 * 3 * hidden_size
-    if packed.dims[0] % denominator:
-        raise OnnxExportError("MoeExpert expert_weights packed length is invalid")
-    intermediate_size = packed.dims[0] // denominator
-    if intermediate_size <= 0 or intermediate_size % 128 != 0:
-        raise OnnxExportError(
-            "MoeExpert intermediate_size must use the ATC-verified 128-element alignment"
-        )
-    if scales is None or scales.data_type != TensorProto.FLOAT or tuple(scales.dims) != (21,):
-        raise OnnxExportError("MoeExpert quant_scales must be FLOAT32[21]")
-    if (
-        offsets is None
-        or offsets.data_type != TensorProto.INT32
-        or tuple(offsets.dims) != (21,)
-    ):
-        raise OnnxExportError("MoeExpert quant_offsets must be INT32[21]")
-    required = {
-        "mdc.moe.expert_order",
-        "mdc.moe.weight_projection_order",
-        "mdc.moe.weight_offsets",
-        "mdc.moe.weight_lengths",
-        "mdc.moe.hidden_size",
-        "mdc.moe.intermediate_size",
-        "mdc.moe.quant_parameter_count",
-    }
-    if required - properties.keys() or properties["mdc.moe.quant_parameter_count"] != "21":
-        raise OnnxExportError("MoE packing metadata is incomplete")
-    try:
-        metadata_offsets = tuple(
-            int(item) for item in properties["mdc.moe.weight_offsets"].split(",")
-        )
-        metadata_lengths = tuple(
-            int(item) for item in properties["mdc.moe.weight_lengths"].split(",")
-        )
-        metadata_hidden = int(properties["mdc.moe.hidden_size"])
-        metadata_intermediate = int(properties["mdc.moe.intermediate_size"])
-    except ValueError as error:
-        raise OnnxExportError("MoE packing metadata is invalid") from error
-    segment = hidden_size * intermediate_size
-    if (
-        metadata_offsets != tuple(index * segment for index in range(15))
-        or metadata_lengths != (segment,) * 15
-        or metadata_hidden != hidden_size
-        or metadata_intermediate != intermediate_size
-    ):
-        raise OnnxExportError("MoE packing metadata does not match tensor shapes")
+from ..onnx_protocol import MDC_ONNX_DOMAIN, MDC_ONNX_OPSET
+from .attention_validation import (
+    validate_attention_contract,
+)
+from .io_validation import validate_io_abi
+from .metadata_validation import validate_metadata
+from .model_inspection import static_shape as _shape
+from .moe_validation import validate_moe_contract
+from .operator_validation import (
+    validate_dequant_initializers,
+)
+from .topology_validation import (
+    STANDARD_DOMAINS,
+    quantized_target_families,
+    validate_custom_node_reachability,
+    validate_graph_topology,
+)
 
 
 def validate_mdc_model(model: onnx.ModelProto) -> None:
@@ -391,107 +31,63 @@ def validate_mdc_model(model: onnx.ModelProto) -> None:
     if model.ir_version <= 0:
         raise OnnxExportError("ONNX IR version must be positive")
     opsets = {item.domain: item.version for item in model.opset_import}
-    if opsets.get("", opsets.get("ai.onnx")) != 18:
-        raise OnnxExportError("MDC ONNX must use opset 18")
-    if set(opsets) - _STANDARD_DOMAINS:
+    if (
+        opsets.get("", opsets.get(MDC_ONNX_DOMAIN))
+        != MDC_ONNX_OPSET
+    ):
+        raise OnnxExportError(
+            f"MDC ONNX must use opset {MDC_ONNX_OPSET}"
+        )
+    if set(opsets) - STANDARD_DOMAINS:
         raise OnnxExportError("MDC ONNX imports a forbidden operator domain")
-    properties = _properties(model)
-    required_properties = {
-        "mdc.graph_schema_version",
-        "mdc.stage",
-        "mdc.mask_mode",
-        "mdc.mask_semantics",
-        "mdc.model_kind",
-        "mdc.algorithm",
-        "mdc.target",
-        "mdc.dialect",
-        "mdc.numeric_spine",
-        "mdc.lowering_source",
-    }
-    if required_properties - properties.keys():
-        raise OnnxExportError("MDC metadata properties are incomplete")
-    if properties["mdc.dialect"] != "MDC ONNX":
-        raise OnnxExportError("Invalid MDC dialect marker")
-    if properties["mdc.numeric_spine"] != "validated-standard-aten":
-        raise OnnxExportError("MDC model lacks a validated numerical spine")
-    mask_mode = properties["mdc.mask_mode"]
-    if mask_mode not in {"masked", "maskless"}:
-        raise OnnxExportError("Invalid MDC mask mode")
-    expected_semantics = (
-        "explicit-causal" if mask_mode == "masked" else "all-visible-non-causal"
-    )
-    if properties["mdc.mask_semantics"] != expected_semantics:
-        raise OnnxExportError("Mask semantics metadata is inconsistent")
+    validated_metadata = validate_metadata(model)
+    properties = validated_metadata.properties
+    mask_mode = validated_metadata.mask_mode
+    targets = validated_metadata.targets
 
     for value in (*model.graph.input, *model.graph.output, *model.graph.value_info):
         _shape(value)
-    stage = properties["mdc.stage"]
-    if stage not in {
-        "FLOAT_PREFILL",
-        "QUANTIZED_PREFILL",
-        "FLOAT_DECODE",
-        "QUANTIZED_DECODE",
-    }:
-        raise OnnxExportError("Invalid MDC graph stage")
-    _validate_io_abi(model, stage)
-    input_names = [item.name for item in model.graph.input]
-    output_names = [item.name for item in model.graph.output]
-    if len(input_names) != len(set(input_names)) or len(output_names) != len(set(output_names)):
-        raise OnnxExportError("ONNX graph I/O names must be unique")
-    initializer_names = {item.name for item in model.graph.initializer}
-    if initializer_names.intersection(output_names):
-        raise OnnxExportError("Graph outputs must not be initializer placeholders")
-
-    known = set(input_names) | initializer_names
-    produced: set[str] = set()
-    output_producers: dict[str, str] = {}
-    for node in model.graph.node:
-        if node.domain not in _STANDARD_DOMAINS:
-            raise OnnxExportError(f"Node {node.name!r} uses forbidden domain")
-        if node.op_type in {"QuantizeLinear", "DequantizeLinear"}:
-            raise OnnxExportError("MDC ONNX must not contain QDQ nodes")
-        missing = [name for name in node.input if name and name not in known]
-        if missing:
-            raise OnnxExportError(
-                f"Node {node.name!r} is not topologically sorted: {missing}"
-            )
-        for name in node.output:
-            if not name or name in known or name in produced:
-                raise OnnxExportError(f"ONNX SSA violation at output {name!r}")
-            produced.add(name)
-            known.add(name)
-            output_producers[name] = node.op_type
-        if node.op_type in CUSTOM_OPS:
-            _validate_operator(node, mask_mode)
-    missing_outputs = [name for name in output_names if name not in produced]
-    if missing_outputs:
+    stage = validated_metadata.stage
+    validate_io_abi(model, stage)
+    counts = validate_graph_topology(model, mask_mode)
+    actual_targets = quantized_target_families(model)
+    declared_targets = targets - {"fp16"}
+    if actual_targets != declared_targets:
         raise OnnxExportError(
-            f"Graph outputs lack numerical producers: {missing_outputs}"
+            "MDC target metadata does not match quantized topology"
         )
-    if any(output_producers[name] in {"Constant", "ConstantOfShape"} for name in output_names):
-        raise OnnxExportError("Graph outputs must not be constant placeholders")
-
-    counts = Counter(node.op_type for node in model.graph.node)
     required = {"NPURmsNorm", "ApplyRotaryPosEmb", "FusedInferAttentionScore"}
     absent = required - counts.keys()
     if absent:
         raise OnnxExportError(f"Missing MDC operators: {sorted(absent)}")
-    if "linear" in properties["mdc.target"]:
+    if counts["FusedInferAttentionScore"] != 1:
+        raise OnnxExportError(
+            "Release lowering requires exactly one FusedInferAttentionScore"
+        )
+    if "linear" in targets:
         required_linear = {"NPUAscendQuantV2", "MatMul", "AscendDequant"}
         if required_linear - counts.keys():
             raise OnnxExportError("Linear quantization lowering is incomplete")
-    if "moe" in properties["mdc.target"] and counts["MoeExpert"] == 0:
-        raise OnnxExportError("MoE quantization lowering is incomplete")
+    if (
+        "moe" in targets
+        and counts["MoeExpert"] != 1
+    ):
+        raise OnnxExportError(
+            "MoE quantization lowering requires exactly one MoeExpert"
+        )
     attention = next(
         node for node in model.graph.node if node.op_type == "FusedInferAttentionScore"
     )
-    _validate_attention_quantization_contract(model, attention)
-    if mask_mode == "masked":
-        _validate_mask_initializer(model, attention, stage)
-    if "moe" in properties["mdc.target"]:
-        _validate_moe_contract(model, properties)
-    _validate_dequant_initializers(model)
-    _validate_custom_node_reachability(model, properties)
+    validate_attention_contract(
+        model,
+        attention,
+        mask_mode=mask_mode,
+        stage=stage,
+    )
+    if "moe" in targets:
+        validate_moe_contract(model, properties)
+    validate_dequant_initializers(model)
+    validate_custom_node_reachability(model, properties)
 
 
 def validate_serialized_model(path: str) -> onnx.ModelProto:

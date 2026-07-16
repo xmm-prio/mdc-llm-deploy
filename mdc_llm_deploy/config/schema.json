@@ -35,6 +35,48 @@
     },
     "attention": {
       "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "query": {
+              "$ref": "#/$defs/activation"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        },
+        {
+          "properties": {
+            "key": {
+              "$ref": "#/$defs/activation"
+            }
+          },
+          "required": [
+            "key"
+          ]
+        },
+        {
+          "properties": {
+            "value": {
+              "$ref": "#/$defs/activation"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        },
+        {
+          "properties": {
+            "score": {
+              "$ref": "#/$defs/activation"
+            }
+          },
+          "required": [
+            "score"
+          ]
+        }
+      ],
       "properties": {
         "key": {
           "anyOf": [
@@ -194,10 +236,7 @@
       "additionalProperties": false,
       "properties": {
         "bits": {
-          "enum": [
-            4,
-            8
-          ]
+          "const": 4
         },
         "granularity": {
           "const": "per_channel"
@@ -239,10 +278,7 @@
       "additionalProperties": false,
       "properties": {
         "bits": {
-          "enum": [
-            4,
-            8
-          ]
+          "const": 8
         },
         "granularity": {
           "const": "per_tensor"
@@ -260,6 +296,28 @@
     },
     "linear": {
       "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "weight": {
+              "$ref": "#/$defs/weight"
+            }
+          },
+          "required": [
+            "weight"
+          ]
+        },
+        {
+          "properties": {
+            "activation": {
+              "$ref": "#/$defs/activation"
+            }
+          },
+          "required": [
+            "activation"
+          ]
+        }
+      ],
       "properties": {
         "activation": {
           "anyOf": [
@@ -286,6 +344,38 @@
     },
     "minmax": {
       "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "linear": {
+              "$ref": "#/$defs/linear"
+            }
+          },
+          "required": [
+            "linear"
+          ]
+        },
+        {
+          "properties": {
+            "attention": {
+              "$ref": "#/$defs/attention"
+            }
+          },
+          "required": [
+            "attention"
+          ]
+        },
+        {
+          "properties": {
+            "moe": {
+              "$ref": "#/$defs/moe"
+            }
+          },
+          "required": [
+            "moe"
+          ]
+        }
+      ],
       "properties": {
         "attention": {
           "anyOf": [
@@ -346,6 +436,28 @@
     },
     "moe": {
       "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "weight": {
+              "$ref": "#/$defs/weight"
+            }
+          },
+          "required": [
+            "weight"
+          ]
+        },
+        {
+          "properties": {
+            "activation": {
+              "$ref": "#/$defs/activation"
+            }
+          },
+          "required": [
+            "activation"
+          ]
+        }
+      ],
       "properties": {
         "activation": {
           "anyOf": [

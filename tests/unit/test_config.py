@@ -104,6 +104,10 @@ def test_fingerprint_ignores_order_whitespace_and_implicit_defaults(tmp_path: Pa
                 {"type": "minmax", "linear": {"weight": {"bits": 8, "granularity": "x"}}}
             ]
         },
+        {"modifiers": [{"type": "minmax"}]},
+        {"modifiers": [{"type": "minmax", "linear": {}}]},
+        {"modifiers": [{"type": "minmax", "attention": {}}]},
+        {"modifiers": [{"type": "minmax", "moe": {}}]},
         {
             "modifiers": [
                 {
@@ -121,6 +125,32 @@ def test_fingerprint_ignores_order_whitespace_and_implicit_defaults(tmp_path: Pa
                 }
             ]
         },
+        {
+            "modifiers": [
+                {
+                    "type": "gptq",
+                    "linear": {
+                        "weight": {
+                            "bits": 8,
+                            "granularity": "per_channel",
+                        }
+                    },
+                }
+            ]
+        },
+        {
+            "modifiers": [
+                {
+                    "type": "gptq",
+                    "moe": {
+                        "weight": {
+                            "bits": 4,
+                            "granularity": "per_tensor",
+                        }
+                    },
+                }
+            ]
+        },
         {"modifiers": [{"type": "gptq", "percdamp": float("nan")}]},
         {"modifiers": [{"type": "gptq", "linear": None}]},
         {"modifiers": "minmax"},
@@ -130,8 +160,14 @@ def test_fingerprint_ignores_order_whitespace_and_implicit_defaults(tmp_path: Pa
         "unknown-root-field",
         "unknown-modifier-field",
         "invalid-granularity",
+        "minmax-without-target",
+        "minmax-empty-linear",
+        "minmax-empty-attention",
+        "minmax-empty-moe",
         "gptq-attention-target",
         "gptq-per-tensor-linear",
+        "gptq-w8-linear",
+        "gptq-w4-moe",
         "non-finite-percdamp",
         "gptq-without-linear-target",
         "modifiers-not-list",

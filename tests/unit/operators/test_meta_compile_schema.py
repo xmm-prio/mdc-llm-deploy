@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import operator
+
+import pytest
 import torch
 from torch import nn
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from mdc_llm_deploy.attention_layout import (
+    RELEASE_ATTENTION_ATTRIBUTES,
+    AttentionInput,
+)
 from mdc_llm_deploy.mdc_ops import (
     MDC_ONNX_DOMAIN,
     MDC_ONNX_OPSET,
@@ -17,9 +24,24 @@ from mdc_llm_deploy.mdc_ops import (
     moe_expert,
     rms_norm,
 )
+from mdc_llm_deploy.mdc_ops.schema import (
+    OPERATOR_SCHEMAS as LEGACY_OPERATOR_SCHEMAS,
+)
+from mdc_llm_deploy.operator_schema import (
+    OPERATOR_SCHEMAS as PROTOCOL_OPERATOR_SCHEMAS,
+)
+from mdc_llm_deploy.operator_schema import (
+    schema_for_onnx_name,
+    schema_for_torch_name,
+)
 
 
 def test_schema_is_single_opset_18_source() -> None:
+    assert (
+        OPERATOR_SCHEMAS
+        is LEGACY_OPERATOR_SCHEMAS
+        is PROTOCOL_OPERATOR_SCHEMAS
+    )
     assert set(OPERATOR_SCHEMAS) == {
         "RmsNorm",
         "ApplyRotaryPosEmb",
@@ -33,9 +55,44 @@ def test_schema_is_single_opset_18_source() -> None:
     assert MDC_ONNX_OPSET == 18
     assert MDC_ONNX_DOMAIN == "ai.onnx"
     assert OPERATOR_SCHEMAS["AscendQuantV2"].attributes["axis"] == -1
+    assert (
+        schema_for_onnx_name("NPUAscendQuantV2")
+        is schema_for_torch_name("ascend_quant_v2")
+        is OPERATOR_SCHEMAS["AscendQuantV2"]
+    )
+    attention_schema = OPERATOR_SCHEMAS[
+        "FusedInferAttentionScore"
+    ]
+    assert attention_schema.inputs == tuple(
+        slot.name.lower() for slot in AttentionInput
+    )
+    assert all(
+        attention_schema.attributes[name] == value
+        for name, value in RELEASE_ATTENTION_ATTRIBUTES.items()
+    )
     assert len(
         {schema.qualified_torch_name for schema in OPERATOR_SCHEMAS.values()}
     ) == 6
+    assert len(
+        {schema.onnx_name for schema in OPERATOR_SCHEMAS.values()}
+    ) == 6
+    with pytest.raises(KeyError):
+        schema_for_onnx_name("Unknown")
+    with pytest.raises(KeyError):
+        schema_for_torch_name("unknown")
+
+
+def test_operator_schema_registry_is_deeply_immutable() -> None:
+    schema = OPERATOR_SCHEMAS["RmsNorm"]
+
+    with pytest.raises(TypeError):
+        operator.setitem(OPERATOR_SCHEMAS, "future", schema)
+    with pytest.raises(TypeError):
+        operator.setitem(schema.attributes, "epsilon", 0.0)
+
+    copy = schema.attribute_defaults
+    copy["epsilon"] = 0.0
+    assert schema.attributes["epsilon"] == 1e-6
 
 
 def test_meta_outputs_cover_all_operators() -> None:

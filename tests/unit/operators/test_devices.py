@@ -6,11 +6,13 @@ import pytest
 import torch
 
 from mdc_llm_deploy.mdc_ops import (
+    OPERATOR_SCHEMAS,
     apply_rotary_pos_emb,
     ascend_dequant,
     ascend_quant_v2,
     fused_infer_attention_score,
     moe_expert,
+    operator_backend_status,
     registered_device_dispatches,
     rms_norm,
 )
@@ -82,3 +84,24 @@ def test_npu_dispatch_for_all_six_operators() -> None:
 
 def test_cpu_and_meta_dispatch_are_always_registered() -> None:
     assert {"CPU", "Meta"} <= set(registered_device_dispatches())
+
+
+def test_backend_status_never_mislabels_reference_as_accelerated() -> None:
+    registered = set(registered_device_dispatches())
+    for schema in OPERATOR_SCHEMAS.values():
+        statuses = operator_backend_status(schema.torch_name)
+        assert [item.dispatch_key for item in statuses] == [
+            "CPU",
+            "CUDA",
+            "PrivateUse1",
+        ]
+        assert all(item.operator == schema.torch_name for item in statuses)
+        for item in statuses:
+            assert item.registered == (item.dispatch_key in registered)
+            expected = "reference" if item.registered else "unavailable"
+            assert item.implementation == expected
+
+
+def test_backend_status_rejects_unknown_operator() -> None:
+    with pytest.raises(KeyError, match="Unknown MDC Torch operator"):
+        operator_backend_status("FusedInferAttentionScore")

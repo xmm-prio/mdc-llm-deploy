@@ -69,6 +69,22 @@ class Capability:
         return Artifact(artifact) in self.artifacts
 
 
+def gptq_bits_for(target: Target | str) -> int:
+    """Return the fixed GPTQ bit width for one target family."""
+    return {
+        Target.LINEAR: 4,
+        Target.MOE: 8,
+    }[Target(target)]
+
+
+def gptq_granularity_for(target: Target | str) -> str:
+    """Return the fixed GPTQ granularity for one target family."""
+    return {
+        Target.LINEAR: "per_channel",
+        Target.MOE: "per_tensor",
+    }[Target(target)]
+
+
 _FULL_ARTIFACTS = frozenset({Artifact.FX, Artifact.ONNX, Artifact.ATC})
 _FX_ONLY = frozenset({Artifact.FX})
 
@@ -128,6 +144,32 @@ def _build_matrix() -> tuple[Capability, ...]:
 
 
 CAPABILITY_MATRIX = _build_matrix()
+CapabilityKey = tuple[
+    ModelKind,
+    Algorithm,
+    Target | None,
+    Phase,
+    MaskMode,
+]
+
+
+def _capability_key(item: Capability) -> CapabilityKey:
+    return (
+        item.model,
+        item.algorithm,
+        item.target,
+        item.phase,
+        item.mask_mode,
+    )
+
+
+_CAPABILITY_INDEX = {
+    _capability_key(item): item for item in CAPABILITY_MATRIX
+}
+if len(_CAPABILITY_INDEX) != len(CAPABILITY_MATRIX):
+    raise RuntimeError(
+        "Capability matrix contains duplicate combinations"
+    )
 
 
 def capability_for(
@@ -139,7 +181,7 @@ def capability_for(
 ) -> Capability | None:
     """Return the exact matrix entry, or None when unsupported."""
     try:
-        requested = (
+        requested: CapabilityKey = (
             ModelKind(model),
             Algorithm(algorithm),
             None if target is None else Target(target),
@@ -148,21 +190,7 @@ def capability_for(
         )
     except (TypeError, ValueError):
         return None
-    return next(
-        (
-            item
-            for item in CAPABILITY_MATRIX
-            if (
-                item.model,
-                item.algorithm,
-                item.target,
-                item.phase,
-                item.mask_mode,
-            )
-            == requested
-        ),
-        None,
-    )
+    return _CAPABILITY_INDEX.get(requested)
 
 
 def require_capability(

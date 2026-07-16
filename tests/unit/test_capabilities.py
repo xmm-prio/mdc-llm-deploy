@@ -11,6 +11,8 @@ from mdc_llm_deploy.capabilities import (
     Phase,
     Target,
     capability_for,
+    gptq_bits_for,
+    gptq_granularity_for,
     require_capability,
 )
 from mdc_llm_deploy.errors import UnsupportedPatternError
@@ -24,6 +26,29 @@ def test_release_matrix_has_8_fp16_and_20_minmax_combinations() -> None:
     assert len(minmax) == 20
     assert all(item.artifacts == {Artifact.FX, Artifact.ONNX, Artifact.ATC} for item in fp16)
     assert all(item.artifacts == {Artifact.FX, Artifact.ONNX, Artifact.ATC} for item in minmax)
+
+
+def test_gptq_target_contract_is_centralized() -> None:
+    assert gptq_bits_for(Target.LINEAR) == 4
+    assert gptq_bits_for(Target.MOE) == 8
+    assert gptq_granularity_for(Target.LINEAR) == "per_channel"
+    assert gptq_granularity_for(Target.MOE) == "per_tensor"
+    with pytest.raises(KeyError):
+        gptq_bits_for(Target.ATTENTION)
+
+
+def test_every_matrix_entry_has_one_canonical_lookup() -> None:
+    for item in CAPABILITY_MATRIX:
+        assert (
+            capability_for(
+                item.model,
+                item.algorithm,
+                item.target,
+                item.phase,
+                item.mask_mode,
+            )
+            is item
+        )
 
 
 def test_dense_rejects_moe_target() -> None:

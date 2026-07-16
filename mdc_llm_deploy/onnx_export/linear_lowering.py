@@ -1,0 +1,235 @@
+"""Quantized linear lowering into the MDC W8A8 ONNX chain."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import onnx
+from onnx import TensorProto, helper, numpy_helper
+
+from ..errors import OnnxExportError
+from ..graph_types import GraphMetadata, QuantizedTarget
+from .lowering_support import (
+    FLOAT_ONNX_DTYPES,
+    activation_target,
+    append_value,
+    initializer,
+    model_types,
+    offset_initializer,
+    scale_initializer,
+    unique_name,
+)
+from .model_inspection import decoded_node_attributes
+
+
+def _linear_weight_array(
+    node: onnx.NodeProto,
+    weight: onnx.TensorProto,
+) -> np.ndarray:
+    array = numpy_helper.to_array(weight).astype(np.float32)
+    if node.op_type == "MatMul":
+        return array
+    attributes = decoded_node_attributes(node)
+    alpha = float(attributes.get("alpha", 1.0))
+    beta = float(attributes.get("beta", 1.0))
+    trans_a = int(attributes.get("transA", 0))
+    trans_b = int(attributes.get("transB", 0))
+    if alpha != 1.0 or beta != 1.0 or trans_a != 0:
+        raise OnnxExportError(
+            f"Linear node {node.name!r} uses unsupported Gemm attributes"
+        )
+    return array.T if trans_b == 1 else array
+
+
+def _replace_linear(
+    model: onnx.ModelProto,
+    value: GraphMetadata,
+    target: QuantizedTarget,
+) -> None:
+    weight_name = f"graph.{target.fqn}.weight"
+    weight = next(
+        (item for item in model.graph.initializer if item.name == weight_name),
+        None,
+    )
+    if weight is None:
+        raise OnnxExportError(
+            f"Cannot locate ONNX weight for linear target {target.fqn!r}"
+        )
+    matches = [
+        node
+        for node in model.graph.node
+        if node.op_type in {"Gemm", "MatMul"}
+        and len(node.input) >= 2
+        and node.input[1] == weight_name
+    ]
+    if len(matches) != 1:
+        raise OnnxExportError(
+            f"Linear target {target.fqn!r} maps to "
+            f"{len(matches)} standard ONNX nodes"
+        )
+    node = matches[0]
+    if len(node.output) != 1 or not node.input[0]:
+        raise OnnxExportError(
+            f"Linear node for {target.fqn!r} has an invalid ABI"
+        )
+    types = model_types(model)
+    source = node.input[0]
+    if node.output[0] not in types:
+        raise OnnxExportError(
+            f"Linear target {target.fqn!r} lacks static ONNX type metadata"
+        )
+    output_dtype, output_shape = types[node.output[0]]
+    array = _linear_weight_array(node, weight)
+    source_dtype = types.get(source, (output_dtype, ()))[0]
+    source_shape = types.get(
+        source,
+        (source_dtype, (*output_shape[:-1], array.shape[0])),
+    )[1]
+    if source_dtype not in FLOAT_ONNX_DTYPES or output_dtype != source_dtype:
+        raise OnnxExportError(
+            f"Linear target {target.fqn!r} has unsupported dtypes"
+        )
+
+    activation = activation_target(value, target)
+    if (
+        activation.granularity != "per_tensor"
+        or len(activation.scale) != 1
+        or any(activation.zero_point)
+    ):
+        raise OnnxExportError(
+            f"Linear activation for {target.fqn!r} "
+            "must be symmetric per-tensor"
+        )
+    if not target.symmetric or any(target.zero_point):
+        raise OnnxExportError(
+            f"Linear weight for {target.fqn!r} must be symmetric"
+        )
+
+    weight_scales = np.asarray(target.scale, dtype=np.float32)
+    if weight_scales.size not in {1, array.shape[1]}:
+        raise OnnxExportError(
+            f"Linear weight scale for {target.fqn!r} has invalid shape"
+        )
+    packed = np.clip(
+        np.rint(array / weight_scales.reshape(1, -1)),
+        -128,
+        127,
+    ).astype(np.int8)
+    if output_shape != (*source_shape[:-1], packed.shape[1]):
+        raise OnnxExportError(
+            f"Linear target {target.fqn!r} has inconsistent output shape"
+        )
+
+    prefix = f"mdc.linear.{target.fqn}"
+    parameter_dtype: np.dtype[Any] = np.dtype(
+        np.float16 if source_dtype == TensorProto.FLOAT16 else np.float32
+    )
+    quant_scale = scale_initializer(
+        model,
+        f"{prefix}.quant_scale",
+        activation,
+        inverse=True,
+        dtype=parameter_dtype,
+    )
+    quant_offset = offset_initializer(
+        model,
+        f"{prefix}.quant_offset",
+        activation,
+        dtype=parameter_dtype,
+    )
+    packed_name = unique_name(model, f"{prefix}.weight")
+    model.graph.initializer.append(initializer(packed_name, packed))
+    combined = (
+        weight_scales * float(activation.scale[0])
+    ).astype(np.float32)
+    dequant_scale = combined.view(np.uint32).astype(np.uint64)
+    dequant_scale_name = unique_name(model, f"{prefix}.dequant_scale")
+    model.graph.initializer.append(
+        initializer(dequant_scale_name, dequant_scale)
+    )
+
+    quantized = unique_name(model, f"{prefix}.quantized")
+    accumulator = unique_name(model, f"{prefix}.accumulator")
+    original_output = node.output[0]
+    has_bias = (
+        node.op_type == "Gemm"
+        and len(node.input) == 3
+        and bool(node.input[2])
+    )
+    dequantized = (
+        unique_name(model, f"{prefix}.dequantized")
+        if has_bias
+        else original_output
+    )
+    replacement = [
+        helper.make_node(
+            "NPUAscendQuantV2",
+            [source, quant_scale, quant_offset],
+            [quantized],
+            name=f"{prefix}.quant",
+            axis=-1,
+            dtype=2,
+        ),
+        helper.make_node(
+            "MatMul",
+            [quantized, packed_name],
+            [accumulator],
+            name=f"{prefix}.matmul",
+        ),
+        helper.make_node(
+            "AscendDequant",
+            [accumulator, dequant_scale_name],
+            [dequantized],
+            name=f"{prefix}.dequant",
+            sqrt_mode=0,
+            relu_flag=0,
+            dtype=1 if source_dtype == TensorProto.FLOAT16 else 0,
+        ),
+    ]
+    if has_bias:
+        replacement.append(
+            helper.make_node(
+                "Add",
+                [dequantized, node.input[2]],
+                [original_output],
+                name=f"{prefix}.bias",
+            )
+        )
+    append_value(model, quantized, TensorProto.INT8, source_shape)
+    append_value(model, accumulator, TensorProto.INT32, output_shape)
+    if has_bias:
+        append_value(model, dequantized, output_dtype, output_shape)
+
+    nodes = list(model.graph.node)
+    index = nodes.index(node)
+    nodes[index : index + 1] = replacement
+    del model.graph.node[:]
+    model.graph.node.extend(nodes)
+
+
+def append_quantized_linears(
+    model: onnx.ModelProto,
+    value: GraphMetadata,
+) -> None:
+    """Replace all FQN-matched linear targets with MDC W8A8 chains."""
+    targets = [
+        item
+        for item in value.quantized_targets
+        if item.target_type == "linear"
+    ]
+    for target in targets:
+        _replace_linear(model, value, target)
+    used_inputs = {
+        name
+        for node in model.graph.node
+        for name in node.input
+        if name
+    }
+    retained = [
+        item
+        for item in model.graph.initializer
+        if item.name in used_inputs or not item.name.startswith("graph.")
+    ]
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(retained)

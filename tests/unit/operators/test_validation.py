@@ -126,6 +126,7 @@ def test_dequant_rejects_high_bits_nonfinite_and_shape() -> None:
 @pytest.mark.parametrize(
     ("argument_index", "replacement", "message"),
     [
+        (0, torch.empty(0, 2, dtype=torch.int8), "non-empty rank-2"),
         (4, torch.ones(20), "21 ordered scales"),
         (1, torch.tensor([[1, 1, 4]], dtype=torch.int16), "unique"),
         (1, torch.tensor([[0, 1, 3]], dtype=torch.int16), "shared id 4"),
@@ -137,6 +138,7 @@ def test_dequant_rejects_high_bits_nonfinite_and_shape() -> None:
         (5, torch.zeros(20, dtype=torch.int32), "21-scale order"),
     ],
     ids=(
+        "empty-token-count",
         "scale-count",
         "duplicate-expert-ids",
         "shared-expert-id",
@@ -154,3 +156,15 @@ def test_moe_rejects_wrong_contract_and_route_values(
 
     with pytest.raises(ValueError, match=message):
         moe_expert(*valid)
+
+
+def test_moe_accepts_fp16_rounded_routed_weight_sum() -> None:
+    valid = list(_valid_moe_inputs())
+    valid[2] = torch.tensor(
+        [[0.3333, 0.6667, 1.0]],
+        dtype=torch.float16,
+    )
+
+    result = moe_expert(*valid)
+
+    assert result.shape == (1, 2)

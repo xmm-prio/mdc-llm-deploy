@@ -4,12 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import torch
-from torch.fx import GraphModule, Node
+from torch.fx import GraphModule
 
 from ..config import ActivationSpec, QuantizationConfig, WeightSpec
-from ..config.modifiers import Modifier
+from ..config.modifiers import (
+    GPTQ_ACTORDER_DEFAULT,
+    GPTQ_BLOCK_SIZE_DEFAULT,
+    GPTQ_PERCDAMP_DEFAULT,
+    Modifier,
+)
 from ..errors import QuantizationConfigError
+from ..fx_inspection import linear_weight_name
 from ..graph import metadata
 from .selectors import effective_selector, selected
 
@@ -25,9 +30,9 @@ class TargetPlan:
     parameter_name: str | None
     weight: WeightSpec | None
     activation: ActivationSpec | None
-    percdamp: float = 0.01
-    actorder: bool = True
-    block_size: int = 128
+    percdamp: float = GPTQ_PERCDAMP_DEFAULT
+    actorder: bool = GPTQ_ACTORDER_DEFAULT
+    block_size: int = GPTQ_BLOCK_SIZE_DEFAULT
 
 
 def _is_moe_parameter(name: str) -> bool:
@@ -38,13 +43,9 @@ def _is_moe_parameter(name: str) -> bool:
 def _linear_weight_names(graph: GraphModule) -> frozenset[str]:
     """Return parameters consumed by ATen linear nodes."""
     return frozenset(
-        str(weight.target)
+        weight_name
         for node in graph.graph.nodes
-        if node.op == "call_function"
-        and node.target == torch.ops.aten.linear.default
-        and len(node.args) >= 2
-        and isinstance((weight := node.args[1]), Node)
-        and weight.op == "get_attr"
+        if (weight_name := linear_weight_name(node)) is not None
     )
 
 
@@ -95,9 +96,21 @@ def _append_parameter_targets(
                     parameter_name=parameter_name,
                     weight=target.weight,
                     activation=target.activation,
-                    percdamp=getattr(modifier, "percdamp", 0.01),
-                    actorder=getattr(modifier, "actorder", True),
-                    block_size=getattr(modifier, "block_size", 128),
+                    percdamp=getattr(
+                        modifier,
+                        "percdamp",
+                        GPTQ_PERCDAMP_DEFAULT,
+                    ),
+                    actorder=getattr(
+                        modifier,
+                        "actorder",
+                        GPTQ_ACTORDER_DEFAULT,
+                    ),
+                    block_size=getattr(
+                        modifier,
+                        "block_size",
+                        GPTQ_BLOCK_SIZE_DEFAULT,
+                    ),
                 )
             )
 
@@ -137,9 +150,21 @@ def _append_attention_targets(
                         parameter_name=None,
                         weight=None,
                         activation=activation,
-                        percdamp=getattr(modifier, "percdamp", 0.01),
-                        actorder=getattr(modifier, "actorder", True),
-                        block_size=getattr(modifier, "block_size", 128),
+                        percdamp=getattr(
+                            modifier,
+                            "percdamp",
+                            GPTQ_PERCDAMP_DEFAULT,
+                        ),
+                        actorder=getattr(
+                            modifier,
+                            "actorder",
+                            GPTQ_ACTORDER_DEFAULT,
+                        ),
+                        block_size=getattr(
+                            modifier,
+                            "block_size",
+                            GPTQ_BLOCK_SIZE_DEFAULT,
+                        ),
                     )
                 )
 

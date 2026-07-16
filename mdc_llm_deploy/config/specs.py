@@ -11,6 +11,11 @@ from ..errors import QuantizationConfigError
 WeightGranularity = Literal["per_tensor", "per_channel"]
 ActivationGranularity = Literal["per_tensor", "per_token"]
 ActivationMode = Literal["static", "dynamic"]
+QUANTIZATION_BITS = (4, 8)
+WEIGHT_GRANULARITIES = ("per_tensor", "per_channel")
+ACTIVATION_GRANULARITIES = ("per_tensor", "per_token")
+ACTIVATION_MODES = ("static", "dynamic")
+ATTENTION_EDGES = ("query", "key", "value", "score")
 
 
 def _strict_fields(value: Mapping[str, Any], allowed: set[str], context: str) -> None:
@@ -55,9 +60,9 @@ class WeightSpec:
         bits = _plain_int(value["bits"], f"{context}.bits")
         granularity = value["granularity"]
         symmetric = _plain_bool(value.get("symmetric", True), f"{context}.symmetric")
-        if bits not in {4, 8}:
+        if bits not in QUANTIZATION_BITS:
             raise QuantizationConfigError(f"{context}.bits must be 4 or 8")
-        if granularity not in {"per_tensor", "per_channel"}:
+        if granularity not in WEIGHT_GRANULARITIES:
             raise QuantizationConfigError(
                 f"{context}.granularity must be per_tensor or per_channel"
             )
@@ -96,13 +101,13 @@ class ActivationSpec:
         granularity = value["granularity"]
         mode = value["mode"]
         symmetric = _plain_bool(value.get("symmetric", True), f"{context}.symmetric")
-        if bits not in {4, 8}:
+        if bits not in QUANTIZATION_BITS:
             raise QuantizationConfigError(f"{context}.bits must be 4 or 8")
-        if granularity not in {"per_tensor", "per_token"}:
+        if granularity not in ACTIVATION_GRANULARITIES:
             raise QuantizationConfigError(
                 f"{context}.granularity must be per_tensor or per_token"
             )
-        if mode not in {"static", "dynamic"}:
+        if mode not in ACTIVATION_MODES:
             raise QuantizationConfigError(f"{context}.mode must be static or dynamic")
         return cls(
             bits=cast(Literal[4, 8], bits),
@@ -177,7 +182,7 @@ class AttentionSpec:
         cls, value: Mapping[str, Any], context: str = "attention"
     ) -> AttentionSpec:
         """Parse a strict mapping."""
-        keys = {"query", "key", "value", "score"}
+        keys = set(ATTENTION_EDGES)
         _strict_fields(value, keys, context)
         return cls(
             **{

@@ -8,7 +8,7 @@ import hashlib
 import pytest
 import torch
 
-import mdc_llm_deploy.quantization.engine as quantization_engine
+import mdc_llm_deploy.quantization.materialization as quantization_materialization
 from mdc_llm_deploy.config import QuantizationConfig
 from mdc_llm_deploy.errors import QuantizationConfigError
 from mdc_llm_deploy.export import export
@@ -138,6 +138,8 @@ def test_minmax_linear_materializes_independent_reference() -> None:
     assert target.scale == tuple(float(item) for item in expected.scale.reshape(-1))
     assert target.zero_point == tuple(int(item) for item in expected.zero_point.reshape(-1))
     assert value.properties["fake_quant"] is True
+    assert "algorithms" not in value.properties
+    assert "gptq" not in value.properties
     assert value.properties["activation_qparams"]["lm_head"]["bits"] == 8
     assert len(value.properties["quantized_integer_sha256"]["lm_head"]) == 64
 
@@ -161,8 +163,7 @@ def test_attention_and_moe_materialization_contracts() -> None:
 
     assert len(moe_value.quantized_targets) == 15
     assert all(item.target_type == "moe" for item in moe_value.quantized_targets)
-    assert len(moe_value.properties["moe_quant_parameter_order"]) == 21
-    assert moe_value.properties["moe_quant_parameter_order"][0] == "input"
+    assert "moe_quant_parameter_order" not in moe_value.properties
 
 
 @pytest.mark.parametrize(("bits", "per_channel"), [(4, True), (8, False)])
@@ -364,7 +365,11 @@ def test_gptq_does_not_swallow_unexpected_errors(
     def fail(*args: object, **kwargs: object) -> None:
         raise error
 
-    monkeypatch.setattr(quantization_engine, "gptq_weight_quantize", fail)
+    monkeypatch.setattr(
+        quantization_materialization,
+        "gptq_weight_quantize",
+        fail,
+    )
     with pytest.raises(type(error), match="unexpected"):
         oneshot(graph, config, [_inputs()])
 

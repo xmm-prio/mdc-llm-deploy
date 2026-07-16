@@ -1,7 +1,8 @@
 """Torch-free quantization configuration API."""
 
-from .config import QuantizationConfig, generate_schema, schema_json
+from .config import QuantizationConfig
 from .modifiers import GptqModifier, MinMaxModifier
+from .schema import generate_schema, schema_json
 from .specs import ActivationSpec, AttentionSpec, LinearSpec, MoeSpec, WeightSpec
 
 __all__ = [

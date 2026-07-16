@@ -1,15 +1,23 @@
 """Opset 18 ONNX symbolics sourced from MDC operator schemas."""
-# mypy: disable-error-code="no-any-return"
+# mypy: disable-error-code="no-any-return,no-untyped-call"
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from types import MappingProxyType
 from typing import Any
 
 import torch
-from torch.onnx.symbolic_helper import parse_args
+from torch.onnx.symbolic_helper import (
+    _optional_input_placeholder_tensor,
+    parse_args,
+)
 
-from .schema import OPERATOR_SCHEMAS
+from ..attention_layout import (
+    ATTENTION_INPUT_COUNT,
+    AttentionInput,
+)
+from ..operator_schema import OPERATOR_SCHEMAS
 
 Symbolic = Callable[..., Any]
 
@@ -86,40 +94,51 @@ def _attention_symbolic(
     quant_scale1: Any,
     softmax_lse_flag: bool,
 ) -> tuple[Any, Any]:
-    del dequant_scale_query
-    inputs = [
-        query,
-        key,
-        value,
-        None,
-        atten_mask,
-        None,
-        None,
-        None,
-        quant_scale1,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        key_antiquant_scale,
-        key_antiquant_offset,
-        value_antiquant_scale,
-        value_antiquant_offset,
-    ]
-    return graph.op(
-        _schema("FusedInferAttentionScore").onnx_name,
-        *inputs,
-        num_heads_i=1 if num_heads is None else num_heads,
-        scale_f=scale,
-        input_layout_s="BNSD",
-        num_key_value_heads_i=0
+    resolved_num_heads = 1 if num_heads is None else num_heads
+    resolved_kv_heads = (
+        resolved_num_heads
         if num_key_value_heads is None
-        else num_key_value_heads,
-        sparse_mode_i=0,
+        else num_key_value_heads
+    )
+    inputs = [
+        _optional_input_placeholder_tensor(graph)
+        for _ in range(ATTENTION_INPUT_COUNT)
+    ]
+    inputs[AttentionInput.QUERY] = query
+    inputs[AttentionInput.KEY] = key
+    inputs[AttentionInput.VALUE] = value
+    for slot, value in (
+        (AttentionInput.ATTEN_MASK, atten_mask),
+        (AttentionInput.QUANT_SCALE1, quant_scale1),
+        (AttentionInput.KEY_ANTIQUANT_SCALE, key_antiquant_scale),
+        (AttentionInput.KEY_ANTIQUANT_OFFSET, key_antiquant_offset),
+        (AttentionInput.VALUE_ANTIQUANT_SCALE, value_antiquant_scale),
+        (AttentionInput.VALUE_ANTIQUANT_OFFSET, value_antiquant_offset),
+        (AttentionInput.DEQUANT_SCALE_QUERY, dequant_scale_query),
+    ):
+        if value is not None:
+            inputs[slot] = value
+    schema = _schema("FusedInferAttentionScore")
+    attributes = schema.attributes
+    return graph.op(
+        schema.onnx_name,
+        *inputs,
+        num_heads_i=resolved_num_heads,
+        scale_f=scale,
+        input_layout_s=attributes["input_layout"],
+        num_key_value_heads_i=resolved_kv_heads,
+        sparse_mode_i=attributes["sparse_mode"],
+        pre_tokens_i=attributes["pre_tokens"],
+        next_tokens_i=attributes["next_tokens"],
+        inner_precise_i=attributes["inner_precise"],
+        block_size_i=attributes["block_size"],
+        antiquant_mode_i=attributes["antiquant_mode"],
         softmax_lse_flag_i=int(softmax_lse_flag),
+        key_antiquant_mode_i=attributes["key_antiquant_mode"],
+        value_antiquant_mode_i=attributes[
+            "value_antiquant_mode"
+        ],
+        query_quant_mode_i=attributes["query_quant_mode"],
         outputs=2,
     )
 
@@ -177,14 +196,18 @@ def _moe_symbolic(
     return graph.op(_schema("MoeExpert").onnx_name, *inputs)
 
 
-_SYMBOLICS: dict[str, Symbolic] = {
+_SYMBOLICS: Mapping[str, Symbolic] = MappingProxyType({
     "RmsNorm": _rms_norm_symbolic,
     "ApplyRotaryPosEmb": _rope_symbolic,
     "FusedInferAttentionScore": _attention_symbolic,
     "AscendQuantV2": _quant_symbolic,
     "AscendDequant": _dequant_symbolic,
     "MoeExpert": _moe_symbolic,
-}
+})
+if set(_SYMBOLICS) != set(OPERATOR_SCHEMAS):
+    raise RuntimeError(
+        "Every MDC operator schema requires one ONNX symbolic"
+    )
 
 
 def register_onnx_symbolics() -> None:

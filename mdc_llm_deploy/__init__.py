@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 from .config import QuantizationConfig
@@ -42,8 +44,7 @@ _LAZY_EXPORTS = {
 }
 
 
-def __getattr__(name: str) -> Any:
-    """Load torch-dependent public APIs on first access."""
+def _load_lazy_export(name: str) -> Any:
     try:
         module_name, attribute = _LAZY_EXPORTS[name]
     except KeyError as error:
@@ -55,6 +56,27 @@ def __getattr__(name: str) -> Any:
     return value
 
 
+def __getattr__(name: str) -> Any:
+    """Load torch-dependent public APIs on first access."""
+    return _load_lazy_export(name)
+
+
+class _PublicApiModule(ModuleType):
+    """Preserve lazy callables that share names with subpackages."""
+
+    def __getattribute__(self, name: str) -> Any:
+        value = super().__getattribute__(name)
+        if (
+            name in _LAZY_EXPORTS
+            and isinstance(value, ModuleType)
+        ):
+            return _load_lazy_export(name)
+        return value
+
+
 def __dir__() -> list[str]:
     """Return public and initialized module names."""
     return sorted(set(globals()) | set(__all__))
+
+
+sys.modules[__name__].__class__ = _PublicApiModule
