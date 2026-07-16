@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -34,6 +35,21 @@ def test_dense_model_returns_logits_and_every_layer_cache() -> None:
     assert all(item.shape == (1, 2, 8, 16) for item in output[1:])
     assert not model.training
     assert all(not parameter.requires_grad for parameter in model.parameters())
+
+
+def test_dense_model_supports_attention_width_different_from_hidden_size() -> None:
+    config = replace(dense_config(), hidden_size=32)
+    model = Qwen3ForCausalLM(
+        config,
+        ExportModelConfig(sequence_length=8),
+        dtype=torch.float32,
+    )
+
+    output = model(torch.arange(8).reshape(1, 8))
+
+    assert output[0].shape == (1, 8, 128)
+    assert model.model.layers[0].self_attn.q_proj.out_features == 64
+    assert model.model.layers[0].self_attn.o_proj.in_features == 64
 
 
 def test_mask_semantics_are_frozen_at_construction() -> None:
