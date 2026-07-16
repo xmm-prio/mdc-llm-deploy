@@ -7,12 +7,12 @@ from dataclasses import replace
 from torch import Tensor
 from torch.fx import GraphModule
 
-from ..errors import GraphStateError
-from ..fx_inspection import node_target
-from ..graph_types import GraphMetadata, GraphStage, TensorAbi
-from ..input_placement import INPUT_DEVICES_PROPERTY, resolve_input_devices
-from ..model_properties import AttentionDimensions
-from .decode_cache import cache_target
+from ...errors import GraphStateError
+from ...graph.fx.inspection import node_target
+from ...graph.metadata import GraphMetadata, GraphStage, TensorAbi
+from ...graph.metadata.model import AttentionDimensions
+from ...placement.inputs import INPUT_DEVICES_PROPERTY, resolve_input_devices
+from .cache import cache_target
 
 
 def build_decode_metadata(

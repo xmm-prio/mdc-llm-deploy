@@ -10,9 +10,9 @@ from torch import Tensor
 from torch.fx import GraphModule, Interpreter, Node
 
 from ..errors import QuantizationConfigError
-from ..fx_inspection import linear_weight_name
-from ..fx_ownership import node_belongs_to
-from ..graph import metadata
+from ..graph.fx.inspection import linear_weight_name
+from ..graph.fx.ownership import node_belongs_to
+from ..graph.lifecycle import metadata
 
 
 class _CalibrationInterpreter(Interpreter):

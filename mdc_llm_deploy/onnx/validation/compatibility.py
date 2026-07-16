@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from ...errors import OnnxExportError, UnsupportedPatternError
-from ...graph import validate_capability_request
-from ...graph_types import GraphMetadata
+from ...graph.contract import validate_capability_request
+from ...graph.metadata import GraphMetadata
 
 
 def validate_onnx_compatibility(

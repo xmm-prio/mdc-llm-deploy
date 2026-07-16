@@ -9,8 +9,9 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional
 
-from ..mdc_ops import moe_expert
-from .configuration import ExportModelConfig, Qwen3Config, Qwen3MoeConfig
+from ...operators import moe_expert
+from ..export_config import ExportModelConfig
+from .config import Qwen3Config, Qwen3MoeConfig
 
 
 class _TransformersModelAdapter:

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from mdc_llm_deploy.export import export
-from tests.model_fixtures import dense_model
+from tests.support.models.qwen3 import dense_model
 
 InputFactory = Callable[[int], dict[str, torch.Tensor]]
 GraphFactory = Callable[[torch.nn.Module | None, int], torch.fx.GraphModule]

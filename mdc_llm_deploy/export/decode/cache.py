@@ -6,9 +6,9 @@ import torch
 from torch import Tensor
 from torch.fx import GraphModule, Node
 
-from ..errors import UnsupportedPatternError
-from ..fx_inspection import node_target
-from ..graph_types import GraphMetadata, QuantizedTarget
+from ...errors import UnsupportedPatternError
+from ...graph.fx.inspection import node_target
+from ...graph.metadata import GraphMetadata, QuantizedTarget
 
 
 def cache_target(

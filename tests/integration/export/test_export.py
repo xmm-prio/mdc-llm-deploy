@@ -8,11 +8,11 @@ from torch.fx import Graph, GraphModule
 
 from mdc_llm_deploy.errors import UnsupportedPatternError
 from mdc_llm_deploy.export import convert_to_decode, export
-from mdc_llm_deploy.export.decode_cache import insert_cache_quantization
-from mdc_llm_deploy.fx_inspection import flatten_nodes
-from mdc_llm_deploy.graph import GraphStage, metadata
-from mdc_llm_deploy.graph_types import QuantizedTarget
-from tests.model_fixtures import dense_model, moe_model
+from mdc_llm_deploy.export.decode.cache import insert_cache_quantization
+from mdc_llm_deploy.graph.fx.inspection import flatten_nodes
+from mdc_llm_deploy.graph.lifecycle import GraphStage, metadata
+from mdc_llm_deploy.graph.metadata import QuantizedTarget
+from tests.support.models.qwen3 import dense_model, moe_model
 
 pytestmark = pytest.mark.integration
 

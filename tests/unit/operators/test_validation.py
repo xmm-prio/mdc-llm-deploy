@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mdc_llm_deploy.mdc_ops import (
+from mdc_llm_deploy.operators import (
     apply_rotary_pos_emb,
     ascend_dequant,
     ascend_quant_v2,

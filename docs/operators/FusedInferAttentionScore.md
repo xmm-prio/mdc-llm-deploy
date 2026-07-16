@@ -9,7 +9,7 @@
 
 ## 源码映射与验证状态
 
-- Python reference：`mdc_llm_deploy.mdc_ops.operators.fused_infer_attention_score`
+- Python reference：`mdc_llm_deploy.operators.fused_infer_attention_score`
 - 集中 schema 键：`OPERATOR_SCHEMAS["FusedInferAttentionScore"]`
 - `OperatorSchema.inputs` 记录当前源码胶囊的三个必选张量；下方 parser 原型定义完整可选槽位及固定顺序。导出器不得压缩中间空槽位。
 - 本文定义待验收契约，不代表 GPU、NPU、parser、ATC 或真机已验证。B 端 parser/ATC 状态以 `docs/validation/b-side.md` 文本记录为准。

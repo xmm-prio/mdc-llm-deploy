@@ -29,11 +29,11 @@ from mdc_llm_deploy.models import (
     Qwen3MoeConfig,
     Qwen3MoeForCausalLM,
 )
-from mdc_llm_deploy.onnx_export import onnx_export
+from mdc_llm_deploy.onnx import onnx_export
 from mdc_llm_deploy.quantization import oneshot
-from tools.release_validation import validate_release_artifact
+from tools.release.validation import validate_release_artifact
 
-ROOT = Path(__file__).parents[1]
+ROOT = Path(__file__).parents[2]
 RELEASE_SEQUENCE_LENGTH = 3072
 ATC_DENSE_CONFIG = Qwen3Config(
     vocab_size=128,
@@ -64,9 +64,9 @@ FP16_CONFIGURATION = {
     "schema_version": 1,
 }
 CONFIG_BY_TARGET = {
-    Target.LINEAR: ROOT / "configs" / "minmax-linear-w8a8.json",
-    Target.ATTENTION: ROOT / "configs" / "minmax-attention-a8.json",
-    Target.MOE: ROOT / "configs" / "minmax-moe-w8a8.json",
+    Target.LINEAR: ROOT / "configs" / "quantization" / "minmax-linear-w8a8.json",
+    Target.ATTENTION: ROOT / "configs" / "quantization" / "minmax-attention-a8.json",
+    Target.MOE: ROOT / "configs" / "quantization" / "minmax-moe-w8a8.json",
 }
 LOCAL_ONNX_MATRIX = tuple(
     item

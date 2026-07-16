@@ -8,7 +8,7 @@
 
 ## 源码映射与验证状态
 
-- Python reference：`mdc_llm_deploy.mdc_ops.operators.ascend_dequant`
+- Python reference：`mdc_llm_deploy.operators.ascend_dequant`
 - 集中 schema 键：`OPERATOR_SCHEMAS["AscendDequant"]`
 - 源码函数使用 snake_case，GE 名称和 ONNX `op_type` 使用上方固定名称。
 - 本文定义待验收契约，不代表 GPU、NPU、parser、ATC 或真机已验证。B 端 parser/ATC 状态以 `docs/validation/b-side.md` 文本记录为准。

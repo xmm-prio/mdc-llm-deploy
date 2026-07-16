@@ -10,27 +10,27 @@ from onnx import helper
 from torch.fx import GraphModule
 
 from ..errors import OnnxExportError
-from ..graph import metadata
-from ..graph_types import GraphMetadata
-from ..onnx_protocol import MDC_ONNX_OPSET
-from .artifact_io import commit_validated_onnx
-from .lowering.attention import (
+from ..graph.lifecycle import metadata
+from ..graph.metadata import GraphMetadata
+from ..operators.contracts.onnx import MDC_ONNX_OPSET
+from .export.artifacts import commit_validated_onnx
+from .export.standard import export_standard_onnx
+from .transform.attention import (
     MaskMode as MaskMode,
 )
-from .lowering.attention import (
+from .transform.attention import (
     lower_maskless_attention,
     lower_rms_norms,
     lower_rope_attention,
 )
-from .lowering.cleanup import (
+from .transform.cleanup import (
     prune_unreachable,
     remove_dynamic_value_info,
     topologically_sort,
 )
-from .lowering.linear import append_quantized_linears
-from .lowering.moe import adapt_quantized_moe
-from .lowering.output import retain_logits_output
-from .standard_export import export_standard_onnx
+from .transform.linear import append_quantized_linears
+from .transform.moe import adapt_quantized_moe
+from .transform.output import retain_logits_output
 from .validation.compatibility import validate_onnx_compatibility
 from .validation.model import validate_mdc_model
 

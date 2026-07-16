@@ -9,24 +9,24 @@ import pytest
 import torch
 
 import mdc_llm_deploy.quantization.materialization as quantization_materialization
-from mdc_llm_deploy.config import QuantizationConfig
 from mdc_llm_deploy.errors import QuantizationConfigError
 from mdc_llm_deploy.export import export
-from mdc_llm_deploy.graph import GraphStage, metadata
+from mdc_llm_deploy.graph.lifecycle import GraphStage, metadata
 from mdc_llm_deploy.quantization import (
     calculate_qparams,
     oneshot,
     plan_quantization,
     quantize,
 )
-from mdc_llm_deploy.quantization.calibration import collect_calibration_samples
-from mdc_llm_deploy.quantization.math import (
+from mdc_llm_deploy.quantization.algorithms.math import (
     GPTQ_FALLBACK_CHOLESKY_FAILED,
     GPTQ_FALLBACK_NON_FINITE_HESSIAN,
     GptqFallbackError,
     gptq_weight_quantize,
 )
-from tests.model_fixtures import dense_model, moe_model
+from mdc_llm_deploy.quantization.calibration import collect_calibration_samples
+from mdc_llm_deploy.quantization.config import QuantizationConfig
+from tests.support.models.qwen3 import dense_model, moe_model
 
 pytestmark = pytest.mark.integration
 
@@ -109,7 +109,7 @@ def test_minmax_zero_rule_and_ties_to_even() -> None:
 
 def test_planner_selects_only_aten_linear_parameters() -> None:
     graph = _graph()
-    config = QuantizationConfig.load("configs/minmax-linear-w8a8.json")
+    config = QuantizationConfig.load("configs/quantization/minmax-linear-w8a8.json")
 
     plan = plan_quantization(graph, config)
 
@@ -126,7 +126,7 @@ def test_minmax_linear_materializes_independent_reference() -> None:
 
     same = oneshot(
         graph,
-        "configs/minmax-linear-w8a8.json",
+        "configs/quantization/minmax-linear-w8a8.json",
         [_inputs()],
     )
 
@@ -147,7 +147,7 @@ def test_minmax_linear_materializes_independent_reference() -> None:
 
 def test_attention_and_moe_materialization_contracts() -> None:
     attention = _graph()
-    oneshot(attention, "configs/minmax-attention-a8.json", [_inputs()])
+    oneshot(attention, "configs/quantization/minmax-attention-a8.json", [_inputs()])
     attention_value = metadata(attention)
 
     assert {item.fqn.rsplit(".", 1)[-1] for item in attention_value.quantized_targets} == {
@@ -159,7 +159,7 @@ def test_attention_and_moe_materialization_contracts() -> None:
     assert len(attention_value.properties["activation_qparams"]) == 4
 
     moe = _graph(moe_model(8))
-    oneshot(moe, "configs/minmax-moe-w8a8.json", [_inputs()])
+    oneshot(moe, "configs/quantization/minmax-moe-w8a8.json", [_inputs()])
     moe_value = metadata(moe)
 
     assert len(moe_value.quantized_targets) == 1
@@ -217,7 +217,7 @@ def test_gptq_clip_search_matches_independent_20_ratio_reference(
 def test_dense_gptq_json_fx_path_materializes_w4a8() -> None:
     graph = _graph()
 
-    same = oneshot(graph, "configs/gptq-linear-w4a8.json", [_inputs()])
+    same = oneshot(graph, "configs/quantization/gptq-linear-w4a8.json", [_inputs()])
 
     value = metadata(graph)
     targets = value.quantized_targets
@@ -265,7 +265,7 @@ def test_moe_gptq_rejects_packed_expert_weights() -> None:
         QuantizationConfigError,
         match="does not support packed MoeExpert",
     ):
-        oneshot(graph, "configs/gptq-moe-w8a8.json", [_inputs()])
+        oneshot(graph, "configs/quantization/gptq-moe-w8a8.json", [_inputs()])
 
 
 def test_gptq_is_deterministic_and_records_limited_fallback() -> None:
@@ -371,7 +371,7 @@ def test_quantization_failures_preserve_graph_and_parameters() -> None:
     with pytest.raises(QuantizationConfigError, match="Calibration keys"):
         oneshot(
             graph,
-            "configs/minmax-linear-w8a8.json",
+            "configs/quantization/minmax-linear-w8a8.json",
             [{"wrong": _inputs()["input_ids"]}],
         )
 

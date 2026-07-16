@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from .types import QuantizedTensor, integer_range
+from ..planning.types import QuantizedTensor, integer_range
 
 GPTQ_FALLBACK_NON_FINITE_HESSIAN = "non_finite_hessian"
 GPTQ_FALLBACK_CHOLESKY_FAILED = "cholesky_failed"

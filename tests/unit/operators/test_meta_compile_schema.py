@@ -9,11 +9,7 @@ import torch
 from torch import nn
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from mdc_llm_deploy.attention_layout import (
-    RELEASE_ATTENTION_ATTRIBUTES,
-    AttentionInput,
-)
-from mdc_llm_deploy.mdc_ops import (
+from mdc_llm_deploy.operators import (
     MDC_ONNX_DOMAIN,
     MDC_ONNX_OPSET,
     OPERATOR_SCHEMAS,
@@ -24,24 +20,21 @@ from mdc_llm_deploy.mdc_ops import (
     moe_expert,
     rms_norm,
 )
-from mdc_llm_deploy.mdc_ops.schema import (
-    OPERATOR_SCHEMAS as LEGACY_OPERATOR_SCHEMAS,
+from mdc_llm_deploy.operators.contracts.attention import (
+    RELEASE_ATTENTION_ATTRIBUTES,
+    AttentionInput,
 )
-from mdc_llm_deploy.operator_schema import (
+from mdc_llm_deploy.operators.contracts.schema import (
     OPERATOR_SCHEMAS as PROTOCOL_OPERATOR_SCHEMAS,
 )
-from mdc_llm_deploy.operator_schema import (
+from mdc_llm_deploy.operators.contracts.schema import (
     schema_for_onnx_name,
     schema_for_torch_name,
 )
 
 
 def test_schema_is_single_opset_18_source() -> None:
-    assert (
-        OPERATOR_SCHEMAS
-        is LEGACY_OPERATOR_SCHEMAS
-        is PROTOCOL_OPERATOR_SCHEMAS
-    )
+    assert OPERATOR_SCHEMAS is PROTOCOL_OPERATOR_SCHEMAS
     assert set(OPERATOR_SCHEMAS) == {
         "RmsNorm",
         "ApplyRotaryPosEmb",

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import onnx
 
-from ...attention_layout import ATTENTION_INPUT_COUNT
 from ...errors import OnnxExportError
-from ...onnx_protocol import MDC_ONNX_DOMAIN, MDC_ONNX_OPSET
-from ...operator_schema import OPERATOR_SCHEMAS
+from ...operators.contracts.attention import ATTENTION_INPUT_COUNT
+from ...operators.contracts.onnx import MDC_ONNX_DOMAIN, MDC_ONNX_OPSET
+from ...operators.contracts.schema import OPERATOR_SCHEMAS
 
 _CUSTOM_SCHEMAS = {
     schema.onnx_name: schema for schema in OPERATOR_SCHEMAS.values()

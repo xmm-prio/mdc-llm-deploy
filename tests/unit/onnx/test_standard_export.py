@@ -12,17 +12,17 @@ from torch import nn
 from torch.fx import Graph, GraphModule
 
 from mdc_llm_deploy.errors import OnnxExportError
-from mdc_llm_deploy.graph import (
+from mdc_llm_deploy.graph.lifecycle import (
     FusionBoundary,
     GraphMetadata,
     GraphStage,
     TensorAbi,
 )
-from mdc_llm_deploy.onnx_export.standard_export import (
+from mdc_llm_deploy.onnx.export.standard import (
     _example_arguments,
     export_standard_onnx,
 )
-from mdc_llm_deploy.onnx_protocol import MDC_ONNX_OPSET
+from mdc_llm_deploy.operators.contracts.onnx import MDC_ONNX_OPSET
 
 
 def _metadata(*, properties: dict[str, Any] | None = None) -> GraphMetadata:

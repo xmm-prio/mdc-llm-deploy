@@ -6,7 +6,7 @@ import onnx
 from onnx import TensorProto
 
 from ...errors import OnnxExportError
-from ..model_inspection import static_shape as _shape
+from ..inspection import static_shape as _shape
 
 
 def validate_io_abi(model: onnx.ModelProto, stage: str) -> None:

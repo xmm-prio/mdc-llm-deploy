@@ -11,13 +11,13 @@ from torch import Tensor, nn
 from torch.fx import GraphModule, Node
 
 from ..errors import UnsupportedPatternError
-from ..fx_inspection import flatten_nodes, node_target
-from ..graph import (
+from ..graph.fx.inspection import flatten_nodes, node_target
+from ..graph.lifecycle import (
     infer_model_kind,
     set_metadata,
 )
-from ..graph_types import GRAPH_SCHEMA_VERSION, GraphMetadata, GraphStage
-from ..operator_schema import TORCH_NAMESPACE
+from ..graph.metadata import GRAPH_SCHEMA_VERSION, GraphMetadata, GraphStage
+from ..operators.contracts.schema import TORCH_NAMESPACE
 from ..placement import (
     PlacementSnapshot,
     capture_placement,

@@ -5,8 +5,8 @@ from __future__ import annotations
 import ast
 import inspect
 
-from mdc_llm_deploy.onnx_export import api
-from mdc_llm_deploy.onnx_export.lowering import (
+from mdc_llm_deploy.onnx import api
+from mdc_llm_deploy.onnx.transform import (
     attention as attention_lowering,
 )
 

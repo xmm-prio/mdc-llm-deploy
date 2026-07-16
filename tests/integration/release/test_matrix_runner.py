@@ -12,13 +12,13 @@ import onnx
 import pytest
 
 from mdc_llm_deploy.capabilities import Algorithm
-from tools import release_matrix
-from tools.release_matrix import (
+from tools.release import matrix as release_matrix
+from tools.release.matrix import (
     RELEASE_SEQUENCE_LENGTH,
     UNBORN_COMMIT_SHA,
     build_release_matrix,
 )
-from tools.release_validation import validate_release_artifact
+from tools.release.validation import validate_release_artifact
 
 pytestmark = pytest.mark.integration
 

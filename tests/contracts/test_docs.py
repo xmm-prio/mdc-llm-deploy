@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mdc_llm_deploy.mdc_ops.operators import OPERATOR_SCHEMAS
+from mdc_llm_deploy.operators import OPERATOR_SCHEMAS
 
 ROOT = Path(__file__).parents[2]
 
@@ -19,7 +19,7 @@ def test_operator_documents_match_source_names() -> None:
 
     assert set(functions) == set(OPERATOR_SCHEMAS)
     for key, function_name in functions.items():
-        document = (ROOT / "docs" / "ops" / f"{key}.md").read_text(encoding="utf-8")
+        document = (ROOT / "docs" / "operators" / f"{key}.md").read_text(encoding="utf-8")
         schema = OPERATOR_SCHEMAS[key]
         assert schema.ge_name in document
         assert schema.onnx_name in document

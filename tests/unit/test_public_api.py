@@ -72,16 +72,16 @@ def test_export_has_one_public_implementation() -> None:
 def test_quantization_and_onnx_export_have_one_public_implementation() -> None:
     from mdc_llm_deploy import oneshot as root_oneshot
     from mdc_llm_deploy import onnx_export as root_onnx_export
-    from mdc_llm_deploy.onnx_export import (
+    from mdc_llm_deploy.onnx import (
         onnx_export as package_onnx_export,
     )
-    from mdc_llm_deploy.onnx_export.api import (
+    from mdc_llm_deploy.onnx.api import (
         onnx_export as module_onnx_export,
     )
     from mdc_llm_deploy.quantization import (
         oneshot as package_oneshot,
     )
-    from mdc_llm_deploy.quantization.engine import (
+    from mdc_llm_deploy.quantization.api import (
         oneshot as module_oneshot,
     )
 
@@ -162,18 +162,14 @@ def test_discovery_module_exposes_cohesive_metadata_api() -> None:
 
 
 def test_extracted_operators_keep_one_public_implementation() -> None:
-    from mdc_llm_deploy.mdc_ops import (
+    from mdc_llm_deploy.operators import (
         fused_infer_attention_score as package_attention,
     )
-    from mdc_llm_deploy.mdc_ops import moe_expert as package_moe
-    from mdc_llm_deploy.mdc_ops.attention import (
+    from mdc_llm_deploy.operators import moe_expert as package_moe
+    from mdc_llm_deploy.operators.runtime.attention import (
         fused_infer_attention_score as module_attention,
     )
-    from mdc_llm_deploy.mdc_ops.moe import moe_expert as module_moe
-    from mdc_llm_deploy.mdc_ops.operators import (
-        fused_infer_attention_score as legacy_attention,
-    )
-    from mdc_llm_deploy.mdc_ops.operators import moe_expert as legacy_moe
+    from mdc_llm_deploy.operators.runtime.moe import moe_expert as module_moe
 
-    assert package_attention is legacy_attention is module_attention
-    assert package_moe is legacy_moe is module_moe
+    assert package_attention is module_attention
+    assert package_moe is module_moe

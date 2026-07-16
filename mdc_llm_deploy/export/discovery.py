@@ -11,11 +11,11 @@ from torch import Tensor, nn
 from torch.fx import GraphModule
 
 from ..errors import UnsupportedPatternError
-from ..fx_inspection import flatten_nodes, node_target
-from ..fx_ownership import node_belongs_to
-from ..graph_types import FusionBoundary, TensorAbi
-from ..input_placement import INPUT_DEVICES_PROPERTY, capture_input_devices
-from ..onnx_protocol import MDC_ONNX_OPSET
+from ..graph.fx.inspection import flatten_nodes, node_target
+from ..graph.fx.ownership import node_belongs_to
+from ..graph.metadata import FusionBoundary, TensorAbi
+from ..operators.contracts.onnx import MDC_ONNX_OPSET
+from ..placement.inputs import INPUT_DEVICES_PROPERTY, capture_input_devices
 
 __all__ = ["DiscoveryResult", "discover_metadata"]
 

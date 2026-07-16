@@ -8,8 +8,8 @@ import torch
 from torch import Tensor
 from torch.fx import GraphModule, Node
 
-from ..errors import UnsupportedPatternError
-from ..fx_inspection import node_target
+from ...errors import UnsupportedPatternError
+from ...graph.fx.inspection import node_target
 
 
 def replace_static_sequence(value: Any, sequence: int) -> Any:

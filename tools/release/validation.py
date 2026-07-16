@@ -16,15 +16,15 @@ from mdc_llm_deploy.capabilities import (
     Target,
 )
 from mdc_llm_deploy.errors import OnnxExportError
-from mdc_llm_deploy.graph_types import GraphStage
-from mdc_llm_deploy.onnx_export.validation.metadata import (
+from mdc_llm_deploy.graph.metadata import GraphStage
+from mdc_llm_deploy.onnx.validation.metadata import (
     ValidatedMetadata,
     validate_metadata,
 )
-from mdc_llm_deploy.onnx_export.validation.model import (
+from mdc_llm_deploy.onnx.validation.model import (
     validate_serialized_model,
 )
-from mdc_llm_deploy.onnx_export.validation.topology import (
+from mdc_llm_deploy.onnx.validation.topology import (
     quantized_target_families,
     validate_custom_node_reachability,
     validate_graph_topology,

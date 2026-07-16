@@ -9,15 +9,15 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper
 
-from ...attention_layout import (
+from ...errors import OnnxExportError
+from ...graph.metadata import GraphMetadata, QuantizedTarget
+from ...graph.metadata.model import AttentionDimensions
+from ...operators.contracts.attention import (
     ATTENTION_INPUT_COUNT,
     RELEASE_ATTENTION_ATTRIBUTES,
     AttentionInput,
 )
-from ...errors import OnnxExportError
-from ...graph_types import GraphMetadata, QuantizedTarget
-from ...model_properties import AttentionDimensions
-from ..model_inspection import (
+from ..inspection import (
     optional_static_shape as static_shape,
 )
 from .cleanup import producer_map, replace_nodes

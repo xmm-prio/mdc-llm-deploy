@@ -8,19 +8,19 @@ from dataclasses import replace
 from torch import Tensor
 from torch.fx import GraphModule
 
-from ..config import QuantizationConfig
 from ..errors import GraphStateError, QuantizationConfigError
-from ..graph import metadata, set_metadata, transactional_update
-from ..graph_types import GraphStage
+from ..graph.lifecycle import metadata, set_metadata, transactional_update
+from ..graph.metadata import GraphStage
 from ..placement import capture_placement
 from .calibration import collect_calibration_samples
+from .config import QuantizationConfig
 from .materialization import MaterializationResult, materialize_alias_group
 from .placement import (
     group_alias_targets,
     restore_parameter_aliases,
     validate_quantized_placement,
 )
-from .planner import TargetPlan, plan_quantization
+from .planning import TargetPlan, plan_quantization
 
 
 def oneshot(

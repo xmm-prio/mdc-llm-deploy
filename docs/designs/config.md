@@ -135,7 +135,8 @@ GPTQ 字段只允许用于 `type` 为 `gptq` 的 modifier。
 
 `from_dict` 校验字典输入。`to_dict` 输出已解析的全部默认值。`to_json_string` 输出 UTF-8、键排序、缩进为 2 空格并以单个换行结束的可读 JSON。
 
-`QuantizationConfig` 不提供预设构造方法。版本化验收配置只来自仓库根目录 `configs/*.json`，避免代码默认值和发布配置分叉。
+`QuantizationConfig` 不提供预设构造方法。版本化验收配置只来自仓库根目录
+`configs/quantization/*.json`，避免代码默认值和发布配置分叉。
 
 ## JSON Schema
 

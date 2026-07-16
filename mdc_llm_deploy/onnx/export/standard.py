@@ -12,13 +12,13 @@ import torch
 from onnx import TensorProto, numpy_helper, shape_inference
 from torch.fx import GraphModule
 
-from ..errors import OnnxExportError
-from ..fx_inspection import linear_weight_name
-from ..graph_types import GraphMetadata
-from ..input_placement import resolve_input_devices
-from ..onnx_protocol import MDC_ONNX_OPSET
-from ..operator_schema import OPERATOR_SCHEMAS
-from .validation.model import validate_mdc_model
+from ...errors import OnnxExportError
+from ...graph.fx.inspection import linear_weight_name
+from ...graph.metadata import GraphMetadata
+from ...operators.contracts.onnx import MDC_ONNX_OPSET
+from ...operators.contracts.schema import OPERATOR_SCHEMAS
+from ...placement.inputs import resolve_input_devices
+from ..validation.model import validate_mdc_model
 
 _TORCH_DTYPES = {
     "float16": torch.float16,

@@ -9,11 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from mdc_llm_deploy.config import QuantizationConfig, schema_json
 from mdc_llm_deploy.errors import MdcDeployError, QuantizationConfigError
+from mdc_llm_deploy.quantization.config import QuantizationConfig, schema_json
 
-ROOT = Path(__file__).parents[2]
-CONFIG_PATHS = sorted((ROOT / "configs").glob("*.json"))
+ROOT = Path(__file__).parents[4]
+CONFIG_PATHS = sorted((ROOT / "configs" / "quantization").glob("*.json"))
 EXPECTED_FINGERPRINTS = {
     "gptq-linear-w4a8.json": "5269c98570f4c92e88f27c54495bb3b4b4031b023e7ed0a19cfbb8c9099221f6",
     "gptq-moe-w8a8.json": "1ebf0f890afbe93761412b50464036aebd3633f22e7764694c2eaba483743ab0",
@@ -205,13 +205,13 @@ def test_public_config_and_exception_exports() -> None:
 
 
 def test_packaged_schema_matches_generator() -> None:
-    packaged = ROOT / "mdc_llm_deploy" / "config" / "schema.json"
+    packaged = ROOT / "mdc_llm_deploy" / "quantization" / "config" / "schema.json"
     assert packaged.read_text(encoding="utf-8") == schema_json()
 
 
 def test_config_import_does_not_import_torch() -> None:
     command = (
-        "import sys; import mdc_llm_deploy.config; "
+        "import sys; import mdc_llm_deploy.quantization.config; "
         "raise SystemExit(1 if 'torch' in sys.modules else 0)"
     )
     completed = subprocess.run(

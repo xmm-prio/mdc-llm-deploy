@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 from torch.nn import functional
 
-from mdc_llm_deploy.mdc_ops import (
+from mdc_llm_deploy.operators import (
     apply_rotary_pos_emb,
     ascend_dequant,
     ascend_quant_v2,

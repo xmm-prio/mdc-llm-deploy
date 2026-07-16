@@ -5,7 +5,7 @@ from __future__ import annotations
 import onnx
 
 from ...errors import OnnxExportError
-from ..model_inspection import (
+from ..inspection import (
     optional_static_shape as static_shape,
 )
 from ..validation.topology import CUSTOM_OPS, STANDARD_DOMAINS

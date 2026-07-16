@@ -11,10 +11,6 @@ import onnx
 import pytest
 from onnx import helper, numpy_helper
 
-from mdc_llm_deploy.attention_layout import (
-    ATTENTION_INPUT_COUNT,
-    AttentionInput,
-)
 from mdc_llm_deploy.capabilities import (
     Algorithm,
     Artifact,
@@ -25,14 +21,18 @@ from mdc_llm_deploy.capabilities import (
     Target,
 )
 from mdc_llm_deploy.errors import OnnxExportError
-from mdc_llm_deploy.graph_types import GraphStage
-from mdc_llm_deploy.onnx_export.validation.metadata import ValidatedMetadata
-from mdc_llm_deploy.onnx_export.validation.topology import (
+from mdc_llm_deploy.graph.metadata import GraphStage
+from mdc_llm_deploy.onnx.validation.metadata import ValidatedMetadata
+from mdc_llm_deploy.onnx.validation.topology import (
     quantized_target_families,
     validate_custom_node_reachability,
     validate_graph_topology,
 )
-from tools import release_validation
+from mdc_llm_deploy.operators.contracts.attention import (
+    ATTENTION_INPUT_COUNT,
+    AttentionInput,
+)
+from tools.release import validation as release_validation
 
 
 def _capability(

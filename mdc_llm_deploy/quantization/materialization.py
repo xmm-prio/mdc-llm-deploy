@@ -11,16 +11,15 @@ import torch
 from torch import Tensor
 from torch.fx import GraphModule
 
-from ..config import ActivationSpec, WeightSpec
 from ..errors import QuantizationConfigError
-from ..graph_types import QuantizedTarget
-from .gptq import GptqFallbackError, gptq_weight_quantize
-from .math import (
+from ..graph.metadata import QuantizedTarget
+from .algorithms.gptq import GptqFallbackError, gptq_weight_quantize
+from .algorithms.math import (
     calculate_qparams,
     quantize,
 )
-from .planner import TargetPlan
-from .types import QuantizedTensor
+from .config import ActivationSpec, WeightSpec
+from .planning import QuantizedTensor, TargetPlan
 
 
 @dataclass(frozen=True, slots=True)

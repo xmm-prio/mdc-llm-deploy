@@ -5,33 +5,33 @@ from __future__ import annotations
 from torch.fx import GraphModule
 from torch.fx.graph import CodeGen
 
-from ..errors import GraphStateError, UnsupportedPatternError
-from ..fx_inspection import flatten_nodes, node_target
-from ..graph import (
+from ...errors import GraphStateError, UnsupportedPatternError
+from ...graph.fx.inspection import flatten_nodes, node_target
+from ...graph.lifecycle import (
     metadata,
     set_metadata,
     transactional_update,
 )
-from .decode_cache import (
+from .cache import (
     cache_target as _cache_target,
 )
-from .decode_cache import (
+from .cache import (
     insert_cache_quantization as _insert_cache_quantization,
 )
-from .decode_cache import (
+from .cache import (
     replace_attention_cache_users as _replace_attention_cache_users,
 )
-from .decode_metadata import build_decode_metadata
-from .decode_rewrite import (
+from .metadata import build_decode_metadata
+from .rewrite import (
     remove_prefill_causal_mask as _remove_prefill_causal_mask,
 )
-from .decode_rewrite import (
+from .rewrite import (
     rewrite_position_nodes as _rewrite_position_nodes,
 )
-from .decode_rewrite import (
+from .rewrite import (
     rewrite_rotary_cache as _rewrite_rotary_cache,
 )
-from .decode_rewrite import (
+from .rewrite import (
     rewrite_static_shapes as _rewrite_static_shapes,
 )
 

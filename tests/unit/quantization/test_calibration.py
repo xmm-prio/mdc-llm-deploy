@@ -6,7 +6,7 @@ from torch import nn
 from torch.fx import Graph, GraphModule
 
 from mdc_llm_deploy.errors import QuantizationConfigError
-from mdc_llm_deploy.graph import (
+from mdc_llm_deploy.graph.lifecycle import (
     GraphMetadata,
     GraphStage,
     TensorAbi,

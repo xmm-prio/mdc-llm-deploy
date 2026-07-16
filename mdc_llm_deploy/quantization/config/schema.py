@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..capabilities import (
+from ...capabilities import (
     Target,
     gptq_bits_for,
     gptq_granularity_for,

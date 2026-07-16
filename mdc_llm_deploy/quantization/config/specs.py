@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
-from ..errors import QuantizationConfigError
+from ...errors import QuantizationConfigError
 
 WeightGranularity = Literal["per_tensor", "per_channel"]
 ActivationGranularity = Literal["per_tensor", "per_token"]
@@ -35,7 +35,7 @@ def _required(value: Mapping[str, Any], fields: set[str], context: str) -> None:
 def _plain_int(value: Any, context: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise QuantizationConfigError(f"{context} must be an integer")
-    return value
+    return cast(int, value)
 
 
 def _plain_bool(value: Any, context: str) -> bool:

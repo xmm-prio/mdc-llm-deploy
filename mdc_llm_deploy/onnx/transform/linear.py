@@ -10,8 +10,8 @@ from numpy.typing import NDArray
 from onnx import TensorProto, helper, numpy_helper
 
 from ...errors import OnnxExportError
-from ...graph_types import GraphMetadata, QuantizedTarget
-from ..model_inspection import decoded_node_attributes
+from ...graph.metadata import GraphMetadata, QuantizedTarget
+from ..inspection import decoded_node_attributes
 from .support import (
     FLOAT_ONNX_DTYPES,
     activation_target,

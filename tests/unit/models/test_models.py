@@ -14,11 +14,11 @@ from mdc_llm_deploy.models import (
     Qwen3ForCausalLM,
     Qwen3MoeForCausalLM,
 )
-from mdc_llm_deploy.models.loading import (
+from mdc_llm_deploy.models.checkpoint import (
     load_safetensors,
     resolve_checkpoint,
 )
-from tests.model_fixtures import (
+from tests.support.models.qwen3 import (
     dense_config,
     dense_model,
     moe_config,

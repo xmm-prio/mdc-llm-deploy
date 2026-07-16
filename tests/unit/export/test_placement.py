@@ -6,7 +6,7 @@ from torch import nn
 
 from mdc_llm_deploy.errors import UnsupportedPatternError
 from mdc_llm_deploy.export import export
-from mdc_llm_deploy.graph import metadata
+from mdc_llm_deploy.graph.lifecycle import metadata
 
 
 class TiedExportModel(nn.Module):

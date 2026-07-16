@@ -8,8 +8,8 @@ import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from mdc_llm_deploy.errors import OnnxExportError
-from mdc_llm_deploy.onnx_export import artifact_io
-from mdc_llm_deploy.onnx_export.artifact_io import commit_validated_onnx
+from mdc_llm_deploy.onnx.export import artifacts as artifact_io
+from mdc_llm_deploy.onnx.export.artifacts import commit_validated_onnx
 
 
 def _model(weight_value: float = 1.0) -> onnx.ModelProto:

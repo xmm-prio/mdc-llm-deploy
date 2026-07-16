@@ -11,11 +11,11 @@ from numpy.typing import NDArray
 from onnx import TensorProto, helper, numpy_helper
 
 from ...errors import OnnxExportError
-from ...graph_types import GraphMetadata, QuantizedTarget
-from ...quantization_properties import (
+from ...graph.metadata import GraphMetadata, QuantizedTarget
+from ...graph.metadata.quantization import (
     ActivationQuantizationParameters,
 )
-from ..model_inspection import (
+from ..inspection import (
     optional_static_shape as static_shape,
 )
 

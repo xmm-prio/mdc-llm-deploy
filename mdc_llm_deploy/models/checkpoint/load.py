@@ -9,34 +9,13 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from .qwen3 import (
+from ..qwen3.modeling import (
     Qwen3ForCausalLM,
     Qwen3MoeForCausalLM,
     Qwen3MoeSparseMoeBlock,
 )
 
 ExportModel = Qwen3ForCausalLM | Qwen3MoeForCausalLM
-
-
-def resolve_checkpoint(
-    source: str | Path,
-    *,
-    revision: str | None = None,
-    local_files_only: bool = False,
-) -> Path:
-    """Resolve a local checkpoint directory or Hugging Face repository."""
-    candidate = Path(source)
-    if candidate.is_dir():
-        return candidate.resolve()
-    from huggingface_hub import snapshot_download
-
-    downloaded = snapshot_download(
-        repo_id=str(source),
-        revision=revision,
-        allow_patterns=["*.json", "*.safetensors"],
-        local_files_only=local_files_only,
-    )
-    return Path(downloaded)
 
 
 def load_config(directory: Path) -> dict[str, Any]:
@@ -243,5 +222,4 @@ __all__ = [
     "load_config",
     "load_model_state",
     "load_safetensors",
-    "resolve_checkpoint",
 ]

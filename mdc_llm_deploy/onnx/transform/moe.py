@@ -10,7 +10,7 @@ from numpy.typing import NDArray
 from onnx import TensorProto, helper, numpy_helper
 
 from ...errors import OnnxExportError
-from ...graph_types import GraphMetadata
+from ...graph.metadata import GraphMetadata
 from .support import (
     activation_target,
     append_quant,

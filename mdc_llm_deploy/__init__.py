@@ -6,7 +6,6 @@ import sys
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
-from .config import QuantizationConfig
 from .errors import (
     GraphStateError,
     MdcDeployError,
@@ -14,6 +13,7 @@ from .errors import (
     QuantizationConfigError,
     UnsupportedPatternError,
 )
+from .quantization.config import QuantizationConfig
 
 if TYPE_CHECKING:
     from .export import convert_to_decode, export
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
         Qwen3MoeConfig,
         Qwen3MoeForCausalLM,
     )
-    from .onnx_export.api import onnx_export
+    from .onnx.api import onnx_export
     from .quantization import oneshot
 
 __version__ = "0.1.0"
@@ -60,7 +60,7 @@ _LAZY_EXPORTS = {
     "convert_to_decode": ("mdc_llm_deploy.export", "convert_to_decode"),
     "export": ("mdc_llm_deploy.export", "export"),
     "oneshot": ("mdc_llm_deploy.quantization", "oneshot"),
-    "onnx_export": ("mdc_llm_deploy.onnx_export.api", "onnx_export"),
+    "onnx_export": ("mdc_llm_deploy.onnx.api", "onnx_export"),
 }
 
 

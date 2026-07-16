@@ -14,16 +14,16 @@ from torch import nn
 from torch.fx import Graph, GraphModule
 
 from mdc_llm_deploy.export import convert_to_decode, export
-from mdc_llm_deploy.graph import (
+from mdc_llm_deploy.graph.lifecycle import (
     GraphMetadata,
     GraphStage,
     TensorAbi,
     metadata,
     set_metadata,
 )
-from mdc_llm_deploy.onnx_export import onnx_export
+from mdc_llm_deploy.onnx import onnx_export
 from mdc_llm_deploy.quantization import oneshot
-from tests.model_fixtures import dense_model, moe_model
+from tests.support.models.qwen3 import dense_model, moe_model
 
 pytestmark = pytest.mark.integration
 
@@ -159,7 +159,7 @@ def test_cuda_qwen3_w8a8_prefill_and_decode_preserve_placement(
     graph = export(model, inputs)
     oneshot(
         graph,
-        "configs/minmax-linear-w8a8.json",
+        "configs/quantization/minmax-linear-w8a8.json",
         [inputs],
     )
 
@@ -315,7 +315,7 @@ def test_oneshot_moe_exports_int8_packed_weights(
     )
     oneshot(
         graph,
-        "configs/minmax-moe-w8a8.json",
+        "configs/quantization/minmax-moe-w8a8.json",
         [{"input_ids": torch.arange(4).reshape(1, 4)}],
     )
 

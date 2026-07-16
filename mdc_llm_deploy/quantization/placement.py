@@ -9,7 +9,7 @@ from torch.fx import GraphModule
 
 from ..errors import QuantizationConfigError
 from ..placement import PlacementSnapshot, capture_placement
-from .planner import TargetPlan
+from .planning import TargetPlan
 
 
 @dataclass(frozen=True, slots=True)

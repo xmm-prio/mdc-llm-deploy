@@ -6,7 +6,7 @@ import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from mdc_llm_deploy.errors import OnnxExportError
-from mdc_llm_deploy.onnx_export.lowering.cleanup import (
+from mdc_llm_deploy.onnx.transform.cleanup import (
     remove_dynamic_value_info,
     remove_redundant_identities,
     topologically_sort,

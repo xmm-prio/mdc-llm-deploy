@@ -6,6 +6,9 @@ from dataclasses import dataclass
 
 from torch.fx import GraphModule
 
+from ...errors import QuantizationConfigError
+from ...graph.fx.inspection import linear_weight_name
+from ...graph.lifecycle import metadata
 from ..config import ActivationSpec, QuantizationConfig, WeightSpec
 from ..config.modifiers import (
     GPTQ_ACTORDER_DEFAULT,
@@ -13,9 +16,6 @@ from ..config.modifiers import (
     GPTQ_PERCDAMP_DEFAULT,
     Modifier,
 )
-from ..errors import QuantizationConfigError
-from ..fx_inspection import linear_weight_name
-from ..graph import metadata
 from .selectors import effective_selector, selected
 
 

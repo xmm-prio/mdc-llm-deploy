@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..errors import QuantizationConfigError
+from ...errors import QuantizationConfigError
 from .modifiers import GptqModifier, MinMaxModifier, Modifier
 from .specs import _strict_fields
 

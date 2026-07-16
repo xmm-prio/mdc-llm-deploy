@@ -8,12 +8,12 @@ from typing import Any
 import onnx
 import torch
 
-from mdc_llm_deploy.attention_layout import (
+from mdc_llm_deploy.operators.contracts.attention import (
     ATTENTION_INPUT_COUNT,
     RELEASE_ATTENTION_ATTRIBUTES,
     AttentionInput,
 )
-from mdc_llm_deploy.mdc_ops.symbolics import (
+from mdc_llm_deploy.operators.onnx.symbolics import (
     _attention_symbolic,
     register_onnx_symbolics,
 )

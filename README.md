@@ -20,7 +20,7 @@ python -m pip install -e ".[dev]"
 ```
 
 `pyproject.toml` 是依赖声明真源；`requirements.txt` 仅记录当前验收环境的精确快照。
-仓库根目录的 `configs/*.json` 不会打入 wheel，因此下文预设路径仅适用于仓库内安装和运行。
+仓库根目录的 `configs/quantization/*.json` 不会打入 wheel，因此下文预设路径仅适用于仓库内安装和运行。
 
 ## API
 
@@ -115,7 +115,7 @@ inputs = {
 graph = export(model, inputs)
 graph = oneshot(
     graph,
-    "configs/minmax-linear-w8a8.json",
+    "configs/quantization/minmax-linear-w8a8.json",
     [inputs],
 )
 
@@ -189,7 +189,7 @@ model = Qwen3ForCausalLM(
 from mdc_llm_deploy import QuantizationConfig
 
 config = QuantizationConfig.load(
-    "configs/minmax-linear-w8a8.json"
+    "configs/quantization/minmax-linear-w8a8.json"
 )
 print(config.fingerprint)
 print(config.to_json_string())
@@ -205,15 +205,15 @@ print(config.to_json_string())
 
 仓库提供五份版本化预设：
 
-- `[minmax-linear-w8a8.json](configs/minmax-linear-w8a8.json)`：Dense/MoE Linear 的
+- `[minmax-linear-w8a8.json](configs/quantization/minmax-linear-w8a8.json)`：Dense/MoE Linear 的
 W8 per-channel + A8 static per-tensor；MoE router 也属于 Linear。
-- `[minmax-attention-a8.json](configs/minmax-attention-a8.json)`：Dense/MoE Attention 的
+- `[minmax-attention-a8.json](configs/quantization/minmax-attention-a8.json)`：Dense/MoE Attention 的
 query、key、value 和 score A8 static per-tensor。
-- `[minmax-moe-w8a8.json](configs/minmax-moe-w8a8.json)`：Qwen3-MoE 专家权重和激活
+- `[minmax-moe-w8a8.json](configs/quantization/minmax-moe-w8a8.json)`：Qwen3-MoE 专家权重和激活
 W8A8 static per-tensor，不包含 router。
-- `[gptq-linear-w4a8.json](configs/gptq-linear-w4a8.json)`：Linear W4 per-channel +
+- `[gptq-linear-w4a8.json](configs/quantization/gptq-linear-w4a8.json)`：Linear W4 per-channel +
 A8 static per-tensor，仅支持 FX。
-- `[gptq-moe-w8a8.json](configs/gptq-moe-w8a8.json)`：schema 合法的 MoE GPTQ W8A8
+- `[gptq-moe-w8a8.json](configs/quantization/gptq-moe-w8a8.json)`：schema 合法的 MoE GPTQ W8A8
 配置，但当前 packed Qwen3-MoE 权重会被 `oneshot()` 明确拒绝。
 
 所有 GPTQ 路径均为 FX-only，不支持 ONNX 或 ATC。

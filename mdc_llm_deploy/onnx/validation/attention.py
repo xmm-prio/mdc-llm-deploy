@@ -7,15 +7,15 @@ import math
 import onnx
 from onnx import TensorProto, numpy_helper
 
-from ...attention_layout import (
+from ...errors import OnnxExportError
+from ...operators.contracts.attention import (
     ATTENTION_INPUT_COUNT,
     ATTENTION_OUTPUT_COUNT,
     RELEASE_ATTENTION_ATTRIBUTES,
     AttentionInput,
 )
-from ...errors import OnnxExportError
-from ..model_inspection import require_attributes
-from ..model_inspection import static_shape as _shape
+from ..inspection import require_attributes
+from ..inspection import static_shape as _shape
 
 
 def validate_attention_operator(

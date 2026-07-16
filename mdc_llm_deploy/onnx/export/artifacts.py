@@ -9,8 +9,8 @@ from pathlib import Path
 
 import onnx
 
-from ..errors import OnnxExportError
-from .validation.model import validate_serialized_model
+from ...errors import OnnxExportError
+from ..validation.model import validate_serialized_model
 
 
 @dataclass(frozen=True)

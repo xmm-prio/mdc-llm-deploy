@@ -5,6 +5,12 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from ..planning.types import (
+    QuantizedTensor as QuantizedTensor,
+)
+from ..planning.types import (
+    integer_range as integer_range,
+)
 from .dequant_scale import (
     decode_dequant_scale as decode_dequant_scale,
 )
@@ -22,12 +28,6 @@ from .gptq import (
 )
 from .gptq import (
     gptq_weight_quantize as gptq_weight_quantize,
-)
-from .types import (
-    QuantizedTensor as QuantizedTensor,
-)
-from .types import (
-    integer_range as integer_range,
 )
 
 

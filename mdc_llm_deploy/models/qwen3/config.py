@@ -3,24 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Any, Literal, TypeVar
+from typing import Any, TypeVar
 
-MaskMode = Literal["causal", "none"]
 ConfigT = TypeVar("ConfigT", bound="Qwen3Config")
-
-
-@dataclass(frozen=True, slots=True)
-class ExportModelConfig:
-    """Freeze sequence-dependent export semantics during model construction."""
-
-    sequence_length: int
-    mask_mode: MaskMode = "causal"
-
-    def __post_init__(self) -> None:
-        if type(self.sequence_length) is not int or self.sequence_length <= 0:
-            raise ValueError("sequence_length must be a positive integer")
-        if self.mask_mode not in {"causal", "none"}:
-            raise ValueError("mask_mode must be 'causal' or 'none'")
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,8 +83,6 @@ class Qwen3MoeConfig(Qwen3Config):
 
 
 __all__ = [
-    "ExportModelConfig",
-    "MaskMode",
     "Qwen3Config",
     "Qwen3MoeConfig",
 ]

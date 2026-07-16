@@ -7,7 +7,7 @@ from mdc_llm_deploy.capabilities import (
     Algorithm,
     Artifact,
 )
-from tools.release_matrix import ATC_MOE_CONFIG
+from tools.release.matrix import ATC_MOE_CONFIG
 
 ONNX_MATRIX = tuple(
     item

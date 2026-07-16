@@ -6,10 +6,10 @@ from collections import Counter
 
 import onnx
 
-from ...attention_layout import AttentionInput
 from ...errors import OnnxExportError
-from ...onnx_protocol import MDC_ONNX_DOMAIN
-from ...operator_schema import OPERATOR_SCHEMAS
+from ...operators.contracts.attention import AttentionInput
+from ...operators.contracts.onnx import MDC_ONNX_DOMAIN
+from ...operators.contracts.schema import OPERATOR_SCHEMAS
 from .operator import validate_operator
 
 STANDARD_DOMAINS = frozenset({"", MDC_ONNX_DOMAIN})

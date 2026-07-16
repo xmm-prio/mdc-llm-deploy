@@ -5,7 +5,7 @@ import pytest
 from onnx import TensorProto, helper
 
 from mdc_llm_deploy.errors import OnnxExportError
-from mdc_llm_deploy.onnx_export.lowering.output import (
+from mdc_llm_deploy.onnx.transform.output import (
     retain_logits_output,
 )
 
