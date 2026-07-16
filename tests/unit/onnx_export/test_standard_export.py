@@ -93,6 +93,30 @@ def _standard_model() -> onnx.ModelProto:
     return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
 
 
+def _unfolded_standard_model() -> onnx.ModelProto:
+    first = numpy_helper.from_array(
+        np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+        name="raw_first",
+    )
+    second = numpy_helper.from_array(
+        np.asarray([[5.0, 6.0], [7.0, 8.0]], dtype=np.float32),
+        name="raw_second",
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node("Transpose", ["raw_first"], ["first_weight"]),
+            helper.make_node("MatMul", ["x", "first_weight"], ["hidden"]),
+            helper.make_node("Transpose", ["raw_second"], ["second_weight"]),
+            helper.make_node("MatMul", ["hidden", "second_weight"], ["output"]),
+        ],
+        "unfolded",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, (1, 2))],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, (1, 2))],
+        initializer=[first, second],
+    )
+    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+
+
 def _rms_standard_model() -> onnx.ModelProto:
     weight = numpy_helper.from_array(
         np.ones(2, dtype=np.float32),
@@ -208,7 +232,8 @@ def test_standard_export_restores_initializer_fqns_and_all_references(
         output: Path,
         **kwargs: Any,
     ) -> None:
-        del model, args
+        del args
+        export_options["model_training"] = model.training
         export_options.update(kwargs)
         onnx.save_model(_standard_model(), output)
 
@@ -226,12 +251,45 @@ def test_standard_export_restores_initializer_fqns_and_all_references(
         ["hidden", "graph.second_weight"],
     ]
     assert export_options["opset_version"] == MDC_ONNX_OPSET
-    assert export_options["do_constant_folding"] is True
-    assert (
-        export_options["training"]
-        is torch.onnx.TrainingMode.PRESERVE
-    )
+    assert export_options["export_params"] is True
+    assert export_options["model_training"] is False
+    assert export_options["do_constant_folding"] is False
+    assert export_options["training"] is torch.onnx.TrainingMode.PRESERVE
     assert export_options["dynamo"] is False
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_standard_export_folds_linear_transposes_without_jit_constant_folding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def save_unfolded(
+        model: nn.Module,
+        args: tuple[torch.Tensor, ...],
+        output: Path,
+        **kwargs: Any,
+    ) -> None:
+        del model, args, kwargs
+        onnx.save_model(_unfolded_standard_model(), output)
+
+    monkeypatch.setattr(torch.onnx, "export", save_unfolded)
+
+    model = export_standard_onnx(_linear_graph(), _metadata(), tmp_path)
+
+    initializers = {item.name: item for item in model.graph.initializer}
+    assert set(initializers) == {
+        "graph.first_weight",
+        "graph.second_weight",
+    }
+    np.testing.assert_array_equal(
+        numpy_helper.to_array(initializers["graph.first_weight"]),
+        np.asarray([[1.0, 3.0], [2.0, 4.0]], dtype=np.float32),
+    )
+    assert all(node.op_type != "Transpose" for node in model.graph.node)
+    assert [node.input[1] for node in model.graph.node if node.op_type == "MatMul"] == [
+        "graph.first_weight",
+        "graph.second_weight",
+    ]
     assert list(tmp_path.iterdir()) == []
 
 

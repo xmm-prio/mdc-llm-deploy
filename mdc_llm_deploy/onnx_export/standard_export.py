@@ -6,9 +6,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import onnx
 import torch
-from onnx import TensorProto, shape_inference
+from onnx import TensorProto, numpy_helper, shape_inference
 from torch.fx import GraphModule
 
 from ..errors import OnnxExportError
@@ -104,11 +105,77 @@ def _example_arguments(
     return tuple(result)
 
 
+def _fold_linear_weight_transposes(model: onnx.ModelProto) -> None:
+    """Fold only static 2-D linear weight transposes in ONNX protobuf space."""
+    initializers = {item.name: item for item in model.graph.initializer}
+    producers = {
+        output: node for node in model.graph.node for output in node.output
+    }
+    folded_nodes: list[onnx.NodeProto] = []
+    source_names: set[str] = set()
+    for node in model.graph.node:
+        if node.op_type not in {"Gemm", "MatMul"} or len(node.input) < 2:
+            continue
+        weight_name = node.input[1]
+        transpose = producers.get(weight_name)
+        if (
+            transpose is None
+            or transpose.op_type != "Transpose"
+            or len(transpose.input) != 1
+            or len(transpose.output) != 1
+            or transpose in folded_nodes
+        ):
+            continue
+        source = initializers.get(transpose.input[0])
+        if (
+            source is None
+            or len(source.dims) != 2
+            or source.data_type not in _FLOAT_ONNX_DTYPES
+        ):
+            continue
+        permutation = next(
+            (
+                tuple(attribute.ints)
+                for attribute in transpose.attribute
+                if attribute.name == "perm"
+            ),
+            (1, 0),
+        )
+        if permutation != (1, 0):
+            continue
+        array = numpy_helper.to_array(source)
+        model.graph.initializer.append(
+            numpy_helper.from_array(
+                np.ascontiguousarray(array.T),
+                name=weight_name,
+            )
+        )
+        folded_nodes.append(transpose)
+        source_names.add(source.name)
+
+    for node in folded_nodes:
+        model.graph.node.remove(node)
+    used_inputs = {
+        input_name
+        for node in model.graph.node
+        for input_name in node.input
+        if input_name
+    }
+    retained = [
+        item
+        for item in model.graph.initializer
+        if item.name not in source_names or item.name in used_inputs
+    ]
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(retained)
+
+
 def _restore_linear_initializer_names(
     model: onnx.ModelProto,
     graph: GraphModule,
 ) -> None:
     """Restore FX parameter FQNs lost by the legacy ONNX exporter."""
+    _fold_linear_weight_transposes(model)
     parameter_names = [
         weight_name
         for node in graph.graph.nodes
@@ -241,9 +308,13 @@ def export_standard_onnx(
                 temporary,
                 export_params=True,
                 opset_version=MDC_ONNX_OPSET,
-                do_constant_folding=True,
+                # Legacy JIT constant folding evaluates parameters and constants
+                # together, which is unsafe for captured mixed-device graphs.
+                do_constant_folding=False,
                 input_names=[item.name for item in metadata.input_abi],
                 output_names=[item.name for item in metadata.output_abi],
+                # ExportedProgram graph modules reject recursive train() calls;
+                # the adapter is already fixed in eval mode.
                 training=torch.onnx.TrainingMode.PRESERVE,
                 dynamo=False,
             )
