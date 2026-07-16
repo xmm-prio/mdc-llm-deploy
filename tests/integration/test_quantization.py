@@ -13,7 +13,6 @@ from mdc_llm_deploy.config import QuantizationConfig
 from mdc_llm_deploy.errors import QuantizationConfigError
 from mdc_llm_deploy.export import export
 from mdc_llm_deploy.graph import GraphStage, metadata
-from mdc_llm_deploy.models import TinyQwen3Dense, TinyQwen3Moe
 from mdc_llm_deploy.quantization import (
     calculate_qparams,
     oneshot,
@@ -26,6 +25,7 @@ from mdc_llm_deploy.quantization.math import (
     GptqFallbackError,
     gptq_weight_quantize,
 )
+from tests.model_fixtures import dense_model, moe_model
 
 pytestmark = pytest.mark.integration
 
@@ -35,7 +35,7 @@ def _inputs(sequence: int = 8) -> dict[str, torch.Tensor]:
 
 
 def _graph(model: torch.nn.Module | None = None) -> torch.fx.GraphModule:
-    return export(model or TinyQwen3Dense().eval(), _inputs())
+    return export(model or dense_model(8), _inputs())
 
 
 def _integer_sha256(value: torch.Tensor) -> str:
@@ -157,12 +157,16 @@ def test_attention_and_moe_materialization_contracts() -> None:
     }
     assert len(attention_value.properties["activation_qparams"]) == 4
 
-    moe = _graph(TinyQwen3Moe().eval())
+    moe = _graph(moe_model(8))
     oneshot(moe, "configs/minmax-moe-w8a8.json", [_inputs()])
     moe_value = metadata(moe)
 
-    assert len(moe_value.quantized_targets) == 15
+    assert len(moe_value.quantized_targets) == 1
     assert all(item.target_type == "moe" for item in moe_value.quantized_targets)
+    assert moe_value.quantized_targets[0].fqn.endswith(".expert_weights")
+    block = moe.get_submodule("model.layers.0.mlp")
+    assert block.expert_weights.dtype is torch.int8
+    assert block.quant_scales.shape == (4, 3)
     assert "moe_quant_parameter_order" not in moe_value.properties
 
 
@@ -249,45 +253,14 @@ def test_dense_gptq_json_fx_path_materializes_w4a8() -> None:
         )
 
 
-def test_moe_gptq_json_fx_path_materializes_w8a8() -> None:
-    graph = _graph(TinyQwen3Moe().eval())
+def test_moe_gptq_rejects_packed_expert_weights() -> None:
+    graph = _graph(moe_model(8))
 
-    oneshot(graph, "configs/gptq-moe-w8a8.json", [_inputs()])
-
-    value = metadata(graph)
-    targets = value.quantized_targets
-    assert len(targets) == 15
-    assert all(
-        item.algorithm == "gptq"
-        and item.target_type == "moe"
-        and item.bits == 8
-        and item.granularity == "per_tensor"
-        for item in targets
-    )
-    assert sum("shared_expert" in item.fqn for item in targets) == 3
-    assert sum(".experts." in item.fqn for item in targets) == 12
-    assert all(
-        "gate_proj" in item.fqn
-        or "up_proj" in item.fqn
-        or "down_proj" in item.fqn
-        for item in targets
-    )
-    assert not any(item.fqn.endswith(".gate") for item in targets)
-    assert set(value.properties["activation_qparams"]) == {item.fqn for item in targets}
-    assert value.properties["gptq_fallbacks"] == {}
-    for target in targets:
-        parameter = dict(graph.named_parameters())[f"{target.fqn}.weight"]
-        scale = torch.tensor(target.scale, dtype=torch.float32).reshape(1, 1)
-        integer = torch.round(parameter.float() / scale).clamp(-128, 127).to(torch.int8)
-        torch.testing.assert_close(
-            parameter,
-            (integer.float() * scale).to(parameter.dtype),
-            rtol=0,
-            atol=0,
-        )
-        assert value.properties["quantized_integer_sha256"][target.fqn] == _integer_sha256(
-            integer
-        )
+    with pytest.raises(
+        QuantizationConfigError,
+        match="does not support packed MoeExpert",
+    ):
+        oneshot(graph, "configs/gptq-moe-w8a8.json", [_inputs()])
 
 
 def test_gptq_is_deterministic_and_records_limited_fallback() -> None:

@@ -8,7 +8,6 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 import torch
 
@@ -17,26 +16,47 @@ from mdc_llm_deploy.capabilities import (
     Algorithm,
     Artifact,
     Capability,
+    MaskMode,
     ModelKind,
     Phase,
     Target,
 )
 from mdc_llm_deploy.export import convert_to_decode, export
-from mdc_llm_deploy.models import TinyConfig, TinyQwen3Dense, TinyQwen3Moe
+from mdc_llm_deploy.models import (
+    ExportModelConfig,
+    Qwen3Config,
+    Qwen3ForCausalLM,
+    Qwen3MoeConfig,
+    Qwen3MoeForCausalLM,
+)
 from mdc_llm_deploy.onnx_export import onnx_export
-from mdc_llm_deploy.onnx_export.api import MaskMode as OnnxMaskMode
 from mdc_llm_deploy.onnx_export.validator import validate_serialized_model
 from mdc_llm_deploy.quantization import oneshot
 
 ROOT = Path(__file__).parents[1]
 RELEASE_SEQUENCE_LENGTH = 3072
-ATC_MOE_CONFIG = TinyConfig(
+ATC_DENSE_CONFIG = Qwen3Config(
+    vocab_size=128,
     hidden_size=256,
     intermediate_size=512,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=64,
+    max_position_embeddings=RELEASE_SEQUENCE_LENGTH,
+)
+ATC_MOE_CONFIG = Qwen3MoeConfig(
+    vocab_size=128,
+    hidden_size=256,
+    intermediate_size=512,
+    num_hidden_layers=2,
     num_attention_heads=4,
     num_key_value_heads=2,
     head_dim=64,
     moe_intermediate_size=128,
+    num_experts=4,
+    num_experts_per_tok=2,
+    max_position_embeddings=RELEASE_SEQUENCE_LENGTH,
 )
 UNBORN_COMMIT_SHA = "0" * 40
 FP16_CONFIGURATION = {
@@ -53,6 +73,7 @@ LOCAL_ONNX_MATRIX = tuple(
     for item in CAPABILITY_MATRIX
     if item.algorithm in {Algorithm.FP16, Algorithm.MINMAX}
     and item.supports(Artifact.ONNX)
+    and item.mask_mode is MaskMode.MASKED
 )
 
 
@@ -111,7 +132,6 @@ def _name(capability: Capability, config_sha256: str, commit_sha: str) -> str:
             capability.model.value,
             capability.algorithm.value,
             target,
-            capability.mask_mode.value,
             capability.phase.value,
             config_sha256[:8],
             commit_sha[:8],
@@ -125,13 +145,12 @@ def _validate_matrix() -> None:
             item.model,
             item.algorithm,
             item.target,
-            item.mask_mode,
             item.phase,
         )
         for item in LOCAL_ONNX_MATRIX
     }
-    if len(LOCAL_ONNX_MATRIX) != 28 or len(identities) != 28:
-        raise AssertionError("Release matrix must contain 28 unique entries")
+    if len(LOCAL_ONNX_MATRIX) != 14 or len(identities) != 14:
+        raise AssertionError("Release matrix must contain 14 unique entries")
 
 
 def build_release_matrix(
@@ -157,9 +176,15 @@ def build_release_matrix(
     for capability in LOCAL_ONNX_MATRIX:
         config_sha256 = _configuration_sha256(capability)
         model = (
-            TinyQwen3Dense()
+            Qwen3ForCausalLM(
+                ATC_DENSE_CONFIG,
+                ExportModelConfig(sequence_length),
+            )
             if capability.model is ModelKind.DENSE
-            else TinyQwen3Moe(ATC_MOE_CONFIG)
+            else Qwen3MoeForCausalLM(
+                ATC_MOE_CONFIG,
+                ExportModelConfig(sequence_length),
+            )
         )
         graph = export(model.eval().half(), calibration)
         if capability.algorithm is Algorithm.MINMAX:
@@ -169,11 +194,7 @@ def build_release_matrix(
         if capability.phase is Phase.DECODE:
             convert_to_decode(graph)
         path = output / f"{_name(capability, config_sha256, commit_sha)}.onnx"
-        onnx_export(
-            graph,
-            path,
-            mask_mode=cast(OnnxMaskMode, capability.mask_mode.value),
-        )
+        onnx_export(graph, path)
         validate_serialized_model(str(path))
         artifacts.append(
             MatrixArtifact(
@@ -186,6 +207,6 @@ def build_release_matrix(
                 release_qualified=release_qualified,
             )
         )
-    if len(artifacts) != 28 or len({item.path.name for item in artifacts}) != 28:
-        raise AssertionError("Release matrix must produce 28 unique artifacts")
+    if len(artifacts) != 14 or len({item.path.name for item in artifacts}) != 14:
+        raise AssertionError("Release matrix must produce 14 unique artifacts")
     return tuple(artifacts)

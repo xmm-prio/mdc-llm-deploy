@@ -103,7 +103,6 @@ def test_import_roots_covers_relative_and_absolute_forms() -> None:
                 "graph_contract",
                 "graph_types",
                 "graph_validation",
-                "mdc_ops",
                 "onnx_export",
                 "quantization",
             },

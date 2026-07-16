@@ -447,6 +447,23 @@ def test_transaction_commits_valid_candidate_and_preserves_identity() -> None:
     assert metadata(graph).properties["revision"] == 2
 
 
+def test_transaction_recompiles_structural_graph_changes() -> None:
+    graph = _graph()
+
+    def mutate(candidate: GraphModule) -> None:
+        operation = next(
+            node
+            for node in candidate.graph.nodes
+            if node.op == "call_function"
+        )
+        operation.target = torch.neg
+        operation.args = (operation.args[0],)
+
+    transactional_update(graph, mutate)
+
+    assert graph(torch.ones(1)).item() == pytest.approx(-1.0)
+
+
 def test_transaction_failure_leaves_graph_parameters_and_metadata_unchanged() -> None:
     graph = _graph()
     original_code = graph.code

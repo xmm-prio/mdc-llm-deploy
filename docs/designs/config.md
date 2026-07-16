@@ -98,7 +98,9 @@ modifier 按声明顺序执行。每个 modifier 基于前一个 modifier 产出
 
 ### MoE
 
-`moe.weight` 接受权重配置，`moe.activation` 接受激活配置。Tiny Qwen3-MoE 的 4 个 routed expert 和 1 个 shared expert 都由 `moe` 选择；router 继续由 `linear` 选择。
+`moe.weight` 接受权重配置，`moe.activation` 接受激活配置。Qwen3-MoE 的 routed
+expert 由 `moe` 选择；router 继续由 `linear` 选择。expert 数量与 top-k 从模型配置
+和 routing shape 推导，不注入 shared expert。
 
 MinMax-MoE 发布配置固定为 int8 静态 per-tensor 激活和 int8 per-tensor 对称权重。GPTQ-MoE 发布配置固定为 int8 静态 per-tensor 激活和 int8 per-tensor 对称权重。其他 schema 可表达但后端未支持的组合，由 `onnx_export` 给出明确错误。
 

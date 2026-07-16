@@ -1,139 +1,413 @@
 from __future__ import annotations
 
-import hashlib
-import sys
+import json
+from pathlib import Path
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from mdc_llm_deploy.models import (
-    INITIALIZATION_SEED,
-    PREFILL_SEQUENCE_LENGTH,
-    TinyQwen3Dense,
-    TinyQwen3Moe,
+    AutoExportModel,
+    ExportModelConfig,
+    Qwen3ForCausalLM,
+    Qwen3MoeForCausalLM,
 )
-from mdc_llm_deploy.utils import release_input_ids
-
-EXPECTED_OUTPUT_HASHES = {
-    "win32": {
-        TinyQwen3Dense: "e4a3d62e196d4cc794c1e4eff522694b24ed1490fde04b0c569fd576c8ce53a7",
-        TinyQwen3Moe: "41752b64f4aa0484f8e8eec5d3bb506ec07b85fe573f73d9c5648c62bacaafc3",
-    },
-    "linux": {
-        TinyQwen3Dense: "f86b16202c8464bdc653c58b6c39d81f09c7a4173fceb353b59f85bce39d58a8",
-        TinyQwen3Moe: "15e2c714803c112e9ca79ff4ef9ede24ed8edffcf4fc16540a40fa10a4cc6e02",
-    },
-}
+from mdc_llm_deploy.models.loading import (
+    load_safetensors,
+    resolve_checkpoint,
+)
+from tests.model_fixtures import (
+    dense_config,
+    dense_model,
+    moe_config,
+    moe_model,
+)
 
 
-def _tensor_hash(*values: torch.Tensor) -> str:
-    digest = hashlib.sha256()
-    for value in values:
-        digest.update(value.detach().cpu().contiguous().numpy().tobytes())
-    return digest.hexdigest()
+def test_dense_model_returns_logits_and_every_layer_cache() -> None:
+    model = dense_model(8, layers=2)
+    output = model(torch.arange(8).reshape(1, 8))
+
+    assert len(output) == 5
+    assert output[0].shape == (1, 8, 128)
+    assert all(item.shape == (1, 2, 8, 16) for item in output[1:])
+    assert not model.training
+    assert all(not parameter.requires_grad for parameter in model.parameters())
 
 
-def _state_hash(model: torch.nn.Module) -> str:
-    return _tensor_hash(*(value for _, value in sorted(model.state_dict().items())))
+def test_mask_semantics_are_frozen_at_construction() -> None:
+    causal = dense_model(8, mask_mode="causal")
+    unmasked = dense_model(8, mask_mode="none")
 
-
-@pytest.mark.parametrize("model_type", [TinyQwen3Dense, TinyQwen3Moe])
-def test_tiny_models_are_seeded_without_global_rng_side_effect(model_type: type[torch.nn.Module]) -> None:
-    torch.manual_seed(1234)
-    before = torch.random.get_rng_state().clone()
-    first = model_type()
-    after = torch.random.get_rng_state()
-    second = model_type()
-
-    assert INITIALIZATION_SEED == 20260714
-    assert torch.equal(before, after)
-    assert _state_hash(first) == _state_hash(second)
-    assert not first.training
-    assert all(parameter.dtype == torch.float16 for parameter in first.parameters())
-
-
-@pytest.mark.parametrize("model_type", [TinyQwen3Dense, TinyQwen3Moe])
-def test_tiny_models_have_deterministic_forward(model_type: type[torch.nn.Module]) -> None:
-    input_ids = torch.from_numpy(release_input_ids()[:, :16].copy())
-    first = model_type()
-    second = model_type()
-
-    with torch.inference_mode():
-        first_output = first(input_ids)
-        second_output = second(input_ids)
-
-    assert _tensor_hash(*first_output) == _tensor_hash(*second_output)
-    assert torch.equal(first_output.logits, second_output.logits)
-    assert torch.equal(first_output.key_cache, second_output.key_cache)
-    assert torch.equal(first_output.value_cache, second_output.value_cache)
-
-
-@pytest.mark.parametrize("model_type", [TinyQwen3Dense, TinyQwen3Moe])
-def test_prefill_abi_shape_dtype_and_hash(model_type: type[torch.nn.Module]) -> None:
-    platform_hashes = EXPECTED_OUTPUT_HASHES.get(sys.platform)
-    if platform_hashes is None:
-        pytest.skip(f"No release hash is defined for platform {sys.platform!r}")
-
-    model = model_type()
-    input_ids = torch.from_numpy(release_input_ids().copy())
-
-    with torch.inference_mode():
-        output = model(input_ids)
-
-    assert input_ids.shape == (1, PREFILL_SEQUENCE_LENGTH)
-    assert input_ids.dtype == torch.int64
-    assert output.logits.shape == (1, 3072, 128)
-    assert output.key_cache.shape == (1, 2, 3072, 16)
-    assert output.value_cache.shape == (1, 2, 3072, 16)
-    assert output.logits.dtype == torch.float16
-    assert output.key_cache.dtype == torch.float16
-    assert output.value_cache.dtype == torch.float16
-    output_hash = _tensor_hash(*output)
-    assert len(output_hash) == 64
-    assert output_hash == platform_hashes[model_type]
-
-
-def test_tiny_architecture_is_frozen() -> None:
-    dense = TinyQwen3Dense()
-    moe = TinyQwen3Moe()
-
-    assert dense.config.vocab_size == 128
-    assert dense.config.hidden_size == 64
-    assert dense.config.intermediate_size == 128
-    assert dense.config.num_hidden_layers == 1
-    assert dense.config.num_attention_heads == 4
-    assert dense.config.num_key_value_heads == 2
-    assert dense.config.head_dim == 16
-    assert dense.config.max_position_embeddings == 3072
-    assert dense.config._attn_implementation == "eager"
-    assert dense.config.attention_dropout == 0.0
-    assert dense.config.embedding_dropout == 0.0
-    assert moe.config.num_experts == 4
-    assert moe.config.num_experts_per_tok == 2
-    assert moe.config.moe_intermediate_size == 64
-    assert moe.config.num_shared_experts == 1
-    assert len(moe.moe.experts) == 4
+    assert causal.causal_mask is not None
+    assert causal.causal_mask.dtype is torch.bool
+    assert unmasked.causal_mask is None
+    assert causal.cos_cache.shape == (1, 8, 1, 16)
+    assert causal.sin_cache.shape == (1, 8, 1, 16)
 
 
 @pytest.mark.parametrize(
-    ("input_ids", "error_type"),
-    [
-        (torch.zeros(3072, dtype=torch.int64), ValueError),
-        (torch.zeros((2, 1), dtype=torch.int64), ValueError),
-        (torch.zeros((1, 3073), dtype=torch.int64), ValueError),
-        (torch.zeros((1, 1), dtype=torch.int32), TypeError),
-    ],
-    ids=("rank", "batch-size", "sequence-length", "dtype"),
+    ("expert_count", "top_k"),
+    [(2, 1), (4, 2), (6, 3)],
 )
-def test_input_abi_rejects_invalid_values(
-    input_ids: torch.Tensor,
-    error_type: type[Exception],
+def test_moe_supports_variable_expert_count_and_top_k(
+    expert_count: int,
+    top_k: int,
 ) -> None:
-    model = TinyQwen3Dense()
-    with pytest.raises(error_type):
-        model(input_ids)
+    model = moe_model(4, expert_count=expert_count, top_k=top_k)
+    output = model(torch.arange(4).reshape(1, 4))
+    block = model.model.layers[0].mlp
+
+    assert isinstance(model, Qwen3MoeForCausalLM)
+    assert block.expert_weights.shape == (
+        expert_count,
+        3 * 64 * 32,
+    )
+    assert output[0].shape == (1, 4, 128)
 
 
-def test_model_rejects_non_floating_parameter_dtype() -> None:
-    with pytest.raises(TypeError):
-        TinyQwen3Dense(dtype=torch.int8)
+def test_moe_accepts_int8_expert_major_weights() -> None:
+    model = moe_model(4, expert_count=3, top_k=2)
+    block = model.model.layers[0].mlp
+    weights = block.expert_weights.detach().reshape(3, 3, -1)
+    scales = weights.abs().amax(dim=-1).clamp_min(1e-8) / 127
+    quantized = torch.round(weights / scales.unsqueeze(-1)).clamp(
+        -128, 127
+    ).to(torch.int8)
+
+    block.set_packed_weights(
+        quantized.reshape_as(block.expert_weights),
+        scales=scales,
+    )
+    output = model(torch.arange(4).reshape(1, 4))
+
+    assert block.expert_weights.dtype is torch.int8
+    assert block.quant_scales is not None
+    assert output[0].shape == (1, 4, 128)
+
+
+def test_model_rejects_shape_not_frozen_by_export_config() -> None:
+    model = dense_model(8)
+    with pytest.raises(ValueError, match="ExportModelConfig"):
+        model(torch.arange(4).reshape(1, 4))
+
+
+def test_auto_model_loads_single_safetensors_checkpoint(tmp_path: Path) -> None:
+    source = dense_model(4)
+    config = dense_config()
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                name: getattr(config, name)
+                for name in config.__dataclass_fields__
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = {
+        name: value.detach().clone()
+        for name, value in source.state_dict().items()
+        if name not in {"cos_cache", "sin_cache", "causal_mask"}
+    }
+    save_file(state, tmp_path / "model.safetensors")
+
+    loaded = AutoExportModel.from_pretrained(
+        tmp_path,
+        ExportModelConfig(4),
+        dtype=torch.float32,
+    )
+
+    assert isinstance(loaded, Qwen3ForCausalLM)
+    for name, value in source.state_dict().items():
+        torch.testing.assert_close(loaded.state_dict()[name], value)
+
+
+def test_loader_reads_indexed_safetensors_shards(tmp_path: Path) -> None:
+    save_file({"left": torch.ones(2)}, tmp_path / "part-1.safetensors")
+    save_file({"right": torch.zeros(3)}, tmp_path / "part-2.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "left": "part-1.safetensors",
+                    "right": "part-2.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_safetensors(tmp_path)
+
+    assert set(state) == {"left", "right"}
+
+
+def test_checkpoint_resolver_uses_hub_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import huggingface_hub
+
+    calls: list[dict[str, object]] = []
+
+    def fake_snapshot_download(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        fake_snapshot_download,
+    )
+
+    resolved = resolve_checkpoint(
+        "org/qwen",
+        revision="fixed",
+        local_files_only=True,
+    )
+
+    assert resolved == tmp_path
+    assert calls == [
+        {
+            "repo_id": "org/qwen",
+            "revision": "fixed",
+            "allow_patterns": ["*.json", "*.safetensors"],
+            "local_files_only": True,
+        }
+    ]
+
+
+def test_auto_model_packs_int8_moe_checkpoint(
+    tmp_path: Path,
+) -> None:
+    source = moe_model(4, expert_count=3, top_k=2)
+    config = moe_config(expert_count=3, top_k=2)
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                name: getattr(config, name)
+                for name in config.__dataclass_fields__
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = {
+        name: value.detach().clone()
+        for name, value in source.state_dict().items()
+        if name
+        not in {
+            "cos_cache",
+            "sin_cache",
+            "causal_mask",
+            "model.layers.0.mlp.expert_weights",
+        }
+    }
+    length = config.hidden_size * config.moe_intermediate_size
+    for expert_id in range(config.num_experts):
+        for projection_id, projection in enumerate(
+            ("gate_proj", "up_proj", "down_proj")
+        ):
+            prefix = (
+                f"model.layers.0.mlp.experts.{expert_id}.{projection}"
+            )
+            state[f"{prefix}.weight"] = torch.full(
+                (
+                    config.moe_intermediate_size,
+                    config.hidden_size,
+                )
+                if projection != "down_proj"
+                else (
+                    config.hidden_size,
+                    config.moe_intermediate_size,
+                ),
+                expert_id * 3 + projection_id + 1,
+                dtype=torch.int8,
+            )
+            state[f"{prefix}.weight_scale"] = torch.tensor(
+                0.01 * (expert_id * 3 + projection_id + 1)
+            )
+    save_file(state, tmp_path / "model.safetensors")
+
+    loaded = AutoExportModel.from_pretrained(
+        tmp_path,
+        ExportModelConfig(4),
+        dtype=torch.float32,
+    )
+    block = loaded.model.layers[0].mlp
+
+    assert isinstance(loaded, Qwen3MoeForCausalLM)
+    assert block.expert_weights.dtype is torch.int8
+    assert block.expert_weights.shape == (3, 3 * length)
+    assert block.quant_scales is not None
+    assert block.quant_scales.shape == (3, 3)
+
+
+def test_auto_model_loads_transformers_packed_moe_checkpoint(
+    tmp_path: Path,
+) -> None:
+    source = moe_model(4, expert_count=3, top_k=2)
+    config = moe_config(expert_count=3, top_k=2)
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                name: getattr(config, name)
+                for name in config.__dataclass_fields__
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = {
+        name: value.detach().clone()
+        for name, value in source.state_dict().items()
+        if name
+        not in {
+            "cos_cache",
+            "sin_cache",
+            "causal_mask",
+            "model.layers.0.mlp.expert_weights",
+        }
+    }
+    packed = source.model.layers[0].mlp.expert_weights.detach()
+    projections = packed.reshape(3, 3, 32, 64)
+    state["model.layers.0.mlp.experts.gate_up_proj"] = torch.cat(
+        (projections[:, 0], projections[:, 1]),
+        dim=1,
+    )
+    state["model.layers.0.mlp.experts.down_proj"] = (
+        packed[:, 2 * 32 * 64 :].reshape(3, 64, 32)
+    ).contiguous()
+    save_file(state, tmp_path / "model.safetensors")
+
+    loaded = AutoExportModel.from_pretrained(
+        tmp_path,
+        ExportModelConfig(4),
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(
+        loaded.model.layers[0].mlp.expert_weights,
+        packed,
+    )
+
+
+def test_dense_logits_and_kv_align_with_transformers() -> None:
+    transformers = pytest.importorskip("transformers")
+    hf_config = transformers.Qwen3Config(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=32,
+        rms_norm_eps=1e-6,
+        rope_theta=1_000_000.0,
+        attention_bias=False,
+        tie_word_embeddings=False,
+        use_cache=True,
+    )
+    reference = transformers.Qwen3ForCausalLM(hf_config).eval().float()
+    model = dense_model(8)
+    own_state = model.state_dict()
+    shared = {
+        name: value
+        for name, value in reference.state_dict().items()
+        if name in own_state and own_state[name].shape == value.shape
+    }
+    model.load_state_dict(shared, strict=False)
+    input_ids = torch.arange(8).reshape(1, 8)
+
+    with torch.inference_mode():
+        expected = reference(input_ids, use_cache=True)
+        actual = model(input_ids)
+
+    torch.testing.assert_close(actual[0], expected.logits, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(
+        actual[1],
+        expected.past_key_values.layers[0].keys,
+        atol=1e-5,
+        rtol=1e-4,
+    )
+    torch.testing.assert_close(
+        actual[2],
+        expected.past_key_values.layers[0].values,
+        atol=1e-5,
+        rtol=1e-4,
+    )
+
+
+def test_moe_logits_and_kv_align_with_transformers() -> None:
+    transformers = pytest.importorskip("transformers")
+    hf_config = transformers.Qwen3MoeConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_experts=3,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+        max_position_embeddings=32,
+        rms_norm_eps=1e-6,
+        rope_theta=1_000_000.0,
+        attention_bias=False,
+        tie_word_embeddings=False,
+        use_cache=True,
+    )
+    hf_config._experts_implementation = "eager"
+    reference = transformers.Qwen3MoeForCausalLM(
+        hf_config
+    ).eval().float()
+    model = moe_model(8, expert_count=3, top_k=2)
+    reference_state = reference.state_dict()
+    own_state = model.state_dict()
+    shared = {
+        name: value
+        for name, value in reference_state.items()
+        if name in own_state and own_state[name].shape == value.shape
+    }
+    model.load_state_dict(shared, strict=False)
+    gate_up = reference_state[
+        "model.layers.0.mlp.experts.gate_up_proj"
+    ]
+    down = reference_state["model.layers.0.mlp.experts.down_proj"]
+    rows = [
+        torch.cat(
+            (
+                    gate_up[expert_id, :32].reshape(-1),
+                    gate_up[expert_id, 32:].reshape(-1),
+                down[expert_id].reshape(-1),
+            )
+        )
+        for expert_id in range(3)
+    ]
+    model.model.layers[0].mlp.set_packed_weights(torch.stack(rows))
+    input_ids = torch.arange(8).reshape(1, 8)
+
+    with torch.inference_mode():
+        expected = reference(input_ids, use_cache=True)
+        actual = model(input_ids)
+
+    torch.testing.assert_close(
+        actual[0],
+        expected.logits,
+        atol=1e-5,
+        rtol=1e-4,
+    )
+    torch.testing.assert_close(
+        actual[1],
+        expected.past_key_values.layers[0].keys,
+        atol=1e-5,
+        rtol=1e-4,
+    )
+    torch.testing.assert_close(
+        actual[2],
+        expected.past_key_values.layers[0].values,
+        atol=1e-5,
+        rtol=1e-4,
+    )

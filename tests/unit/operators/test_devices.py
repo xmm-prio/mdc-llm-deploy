@@ -55,12 +55,10 @@ def _device_smoke(device: torch.device) -> None:
     _assert_on_device(dequantized, device)
 
     moe_output = moe_expert(
-        torch.ones(1, 2, dtype=torch.int8, device=device),
-        torch.tensor([[0, 1, 4]], dtype=torch.int16, device=device),
-        torch.tensor([[0.5, 0.5, 1.0]], dtype=torch.float16, device=device),
-        torch.ones(5 * 3 * 2 * 2, dtype=torch.int8, device=device),
-        torch.ones(21, dtype=torch.float32, device=device),
-        torch.zeros(21, dtype=torch.int32, device=device),
+        torch.ones(1, 2, device=device),
+        torch.tensor([[0, 1]], device=device),
+        torch.tensor([[0.5, 0.5]], device=device),
+        torch.ones(3, 3 * 2 * 2, device=device),
     )
     _assert_on_device(moe_output, device)
 

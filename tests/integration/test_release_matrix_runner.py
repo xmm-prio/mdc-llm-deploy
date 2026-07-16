@@ -1,4 +1,4 @@
-"""Tests for the internal 28-entry release-matrix runner."""
+"""Tests for the mask-independent release-matrix runner."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import inspect
 import subprocess
 from pathlib import Path
 
-import onnx
 import pytest
 
 from mdc_llm_deploy.capabilities import Algorithm
@@ -22,20 +21,13 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.slow
-def test_runner_short_slice_generates_and_validates_all_28_models(tmp_path: Path) -> None:
+def test_runner_short_slice_generates_and_validates_all_14_models(tmp_path: Path) -> None:
     artifacts = build_release_matrix(tmp_path, sequence_length=8)
 
-    assert len(artifacts) == 28
-    assert len({item.sha256 for item in artifacts}) == 28
+    assert len(artifacts) == 14
+    assert len({item.sha256 for item in artifacts}) == 14
     assert all(item.path.is_file() for item in artifacts)
     assert all(len(item.sha256) == 64 for item in artifacts)
-    assert all(
-        {item.key: item.value for item in onnx.load(artifact.path).metadata_props}[
-            "mdc.mask_mode"
-        ]
-        == artifact.capability.mask_mode.value
-        for artifact in artifacts
-    )
     assert all(artifact.sequence_length == 8 for artifact in artifacts)
     assert not any(artifact.release_qualified for artifact in artifacts)
     assert all(len(artifact.config_sha256) == 64 for artifact in artifacts)
@@ -49,7 +41,6 @@ def test_runner_short_slice_generates_and_validates_all_28_models(tmp_path: Path
                 artifact.capability.target.value
                 if artifact.capability.target is not None
                 else "baseline",
-                artifact.capability.mask_mode.value,
                 artifact.capability.phase.value,
                 artifact.config_sha256[:8],
                 artifact.commit_sha[:8] + ".onnx",
@@ -140,7 +131,7 @@ def test_matrix_validation_rejects_duplicate_entries_before_generation(
     )
     monkeypatch.setattr(release_matrix, "LOCAL_ONNX_MATRIX", duplicated)
 
-    with pytest.raises(AssertionError, match="28 unique entries"):
+    with pytest.raises(AssertionError, match="14 unique entries"):
         build_release_matrix(tmp_path, sequence_length=8)
 
     assert not tuple(tmp_path.iterdir())

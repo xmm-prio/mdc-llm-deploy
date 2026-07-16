@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from mdc_llm_deploy.export import export
-from mdc_llm_deploy.models import TinyQwen3Dense
+from tests.model_fixtures import dense_model
 
 InputFactory = Callable[[int], dict[str, torch.Tensor]]
 GraphFactory = Callable[[torch.nn.Module | None, int], torch.fx.GraphModule]
@@ -31,7 +31,9 @@ def graph_factory(input_factory: InputFactory) -> GraphFactory:
         model: torch.nn.Module | None = None,
         sequence_length: int = 8,
     ) -> torch.fx.GraphModule:
-        selected_model = model if model is not None else TinyQwen3Dense().eval()
+        selected_model = (
+            model if model is not None else dense_model(sequence_length)
+        )
         return export(selected_model, input_factory(sequence_length))
 
     return make_graph

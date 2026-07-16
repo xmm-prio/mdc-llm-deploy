@@ -11,26 +11,26 @@ license = { file = "LICENSE" }
 requires-python = ">=3.11,<3.13"
 authors = [{ name = "MDC LLM Deploy contributors" }]
 dependencies = [
-  "numpy>=2.0,<3",
-  "onnx>=1.17,<2",
-  "torch>=2.6,<3",
+  "accelerate>=1.2",
+  "datasets>=3.2",
+  "evaluate>=0.4",
+  "huggingface_hub>=0.34",
+  "numpy>=2.0",
+  "onnx>=1.17",
+  "onnxscript>=0.2",
+  "safetensors>=0.5",
+  "torch>=2.8",
+  "transformers>=4.57.0",
+  "triton>=3.2; platform_system == 'Linux'",
 ]
 
 [project.optional-dependencies]
-full = [
-  "accelerate>=1.2,<2",
-  "datasets>=3.2,<5",
-  "evaluate>=0.4,<1",
-  "onnxscript>=0.2,<1",
-  "transformers>=4.48,<5",
-  "triton>=3.2,<4; platform_system == 'Linux'",
-]
 dev = [
-  "build>=1.2,<2",
-  "mypy>=1.14,<2",
-  "pytest>=8.3,<9",
-  "pytest-cov>=6,<8",
-  "ruff>=0.9,<1",
+  "build>=1.2",
+  "mypy>=1.14",
+  "pytest>=8.3",
+  "pytest-cov>=6",
+  "ruff>=0.9",
 ]
 
 [tool.hatch.build.targets.wheel]

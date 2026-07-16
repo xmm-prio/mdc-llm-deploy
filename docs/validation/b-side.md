@@ -35,14 +35,14 @@ timeout_seconds: 1800
 
 以下内容均是计划，不是已完成事实：
 
-1. A 端提供已推送的候选 commit SHA；B 端拉取该 SHA，确认 `HEAD` 一致、验证前工作区干净，并记录 Python、锁文件 hash、GPU、驱动、PyTorch、Triton、ATC、CANN、OPP、目标 SoC 和 precision mode。
+1. A 端提供已推送的候选 commit SHA；B 端拉取该 SHA，确认 `HEAD` 一致、验证前工作区干净，并记录 Python、`requirements.txt` hash、GPU、驱动、PyTorch、Triton、ATC、CANN、OPP、目标 SoC 和 precision mode。
 2. B 端执行完整测试、Ruff、Mypy 和构建，并记录命令、退出码与关键错误。
-3. B 端对六个自定义算子执行 GPU 实现与独立 CPU reference 的数值对照。
+3. B 端对发布模型涉及的自定义算子执行 parser/ATC 检查。
 4. B 端为上述七个算子/节点执行八项独立 parser/ATC 探针，其中 `FusedInferAttentionScore` 分浮点和全 per-tensor INT8 两项。
 5. 对 Attention LSE 告警分别验证 `softmax_lse_flag=false`、`softmax_lse_flag=true` 和省略可选第二输出，并取得 OPP 维护方结论；结论取得前保持 `BLOCKED`。
-6. 使用候选 commit 重新生成并验证 8 项 FP16 与 20 项 MinMax 发布矩阵，不复用历史 ONNX；每条 ATC 命令超时为 1800 秒。
+6. 使用候选 commit 重新生成并验证 14 项发布矩阵，不复用历史 ONNX；每条 ATC 命令超时为 1800 秒。
 7. B 端只返回纯文本摘要；ONNX、OM 和原始日志留在 B 端并按保留策略处理。
 
 ## 解除阻塞条件
 
-仅当候选 commit 的基础门禁、六算子 GPU 数值对照、八项 parser/ATC 探针和 28 项发布矩阵全部满足 PRD 的通过定义，且 Attention LSE 告警已修复或取得正式无害性结论时，状态才可改为 `PASS`。在此之前保持 `BLOCKED`。
+仅当候选 commit 的基础门禁、parser/ATC 探针和 14 项发布矩阵全部满足 PRD 的通过定义，且 Attention LSE 告警已修复或取得正式无害性结论时，状态才可改为 `PASS`。在此之前保持 `BLOCKED`。

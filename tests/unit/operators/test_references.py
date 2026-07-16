@@ -142,59 +142,53 @@ def _independent_moe_reference(
     ids: torch.Tensor,
     route_weights: torch.Tensor,
     packed_weights: torch.Tensor,
-    scales: torch.Tensor,
-    offsets: torch.Tensor,
     intermediate_size: int,
 ) -> torch.Tensor:
     hidden_size = x.shape[1]
-    hidden = (x.float() - offsets[0]) * scales[0]
-    result = torch.zeros_like(hidden)
+    result = torch.zeros_like(x)
     cursor = 0
-    for expert_id in range(5):
-        base = 1 + expert_id * 4
+    for expert_id in range(packed_weights.shape[0]):
         matrices = []
-        for rows, columns, parameter_index in (
-            (intermediate_size, hidden_size, base),
-            (intermediate_size, hidden_size, base + 1),
-            (hidden_size, intermediate_size, base + 3),
+        for rows, columns in (
+            (intermediate_size, hidden_size),
+            (intermediate_size, hidden_size),
+            (hidden_size, intermediate_size),
         ):
             length = rows * columns
-            quantized = packed_weights[cursor : cursor + length].reshape(rows, columns)
-            matrices.append((quantized.float() - offsets[parameter_index]) * scales[parameter_index])
+            matrices.append(
+                packed_weights[expert_id, cursor : cursor + length].reshape(
+                    rows, columns
+                )
+            )
             cursor += length
         gate, up, down = matrices
-        activation = functional.silu(hidden @ gate.T) * (hidden @ up.T)
-        activation_quantized = torch.round(
-            activation / scales[base + 2] + offsets[base + 2]
-        ).clamp(-128, 127)
-        activation = (
-            activation_quantized - offsets[base + 2]
-        ) * scales[base + 2]
+        activation = functional.silu(x @ gate.T) * (x @ up.T)
         expert_output = activation @ down.T
         selected_weight = (
             (ids == expert_id).to(route_weights.dtype) * route_weights
         ).sum(dim=1, keepdim=True)
         result += expert_output * selected_weight
-    return result.half()
+        cursor = 0
+    return result
 
 
-def test_moe_five_experts_and_21_parameter_order_match_reference() -> None:
+def test_moe_float_expert_major_weights_match_reference() -> None:
     generator = torch.Generator().manual_seed(20260714)
     hidden_size, intermediate_size = 2, 3
-    x = torch.randint(-4, 5, (3, hidden_size), dtype=torch.int8, generator=generator)
-    ids = torch.tensor([[0, 1, 4], [2, 3, 4], [1, 3, 4]], dtype=torch.int16)
+    x = torch.randn(3, hidden_size, generator=generator)
+    ids = torch.tensor([[0, 1], [2, 3], [1, 3]])
     route_weights = torch.tensor(
-        [[0.25, 0.75, 1.0], [0.5, 0.5, 1.0], [0.75, 0.25, 1.0]],
-        dtype=torch.float16,
+        [[0.25, 0.75], [0.5, 0.5], [0.75, 0.25]],
     )
-    packed_count = 5 * 3 * hidden_size * intermediate_size
-    packed = torch.randint(-3, 4, (packed_count,), dtype=torch.int8, generator=generator)
-    scales = torch.linspace(0.05, 0.25, 21)
-    offsets = torch.arange(21, dtype=torch.int32) % 3 - 1
+    packed = torch.randn(
+        4,
+        3 * hidden_size * intermediate_size,
+        generator=generator,
+    )
 
-    actual = moe_expert(x, ids, route_weights, packed, scales, offsets)
+    actual = moe_expert(x, ids, route_weights, packed)
     expected = _independent_moe_reference(
-        x, ids, route_weights, packed, scales, offsets, intermediate_size
+        x, ids, route_weights, packed, intermediate_size
     )
 
-    torch.testing.assert_close(actual, expected, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(actual, expected)

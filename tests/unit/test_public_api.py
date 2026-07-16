@@ -10,6 +10,12 @@ def test_root_public_api_surface_is_frozen() -> None:
     import mdc_llm_deploy
 
     assert set(mdc_llm_deploy.__all__) == {
+        "AutoExportModel",
+        "ExportModelConfig",
+        "Qwen3Config",
+        "Qwen3ForCausalLM",
+        "Qwen3MoeConfig",
+        "Qwen3MoeForCausalLM",
         "GraphStateError",
         "MdcDeployError",
         "OnnxExportError",
@@ -113,19 +119,13 @@ def test_public_entrypoint_signatures_are_frozen() -> None:
     assert tuple(onnx_parameters) == (
         "graph",
         "output_path",
-        "mask_mode",
-        "overwrite",
+        "external_data",
     )
     assert (
-        onnx_parameters["mask_mode"].kind
+        onnx_parameters["external_data"].kind
         is inspect.Parameter.KEYWORD_ONLY
     )
-    assert onnx_parameters["mask_mode"].default is inspect.Parameter.empty
-    assert (
-        onnx_parameters["overwrite"].kind
-        is inspect.Parameter.KEYWORD_ONLY
-    )
-    assert onnx_parameters["overwrite"].default is False
+    assert onnx_parameters["external_data"].default is True
 
 
 def test_public_exception_hierarchy_is_frozen() -> None:

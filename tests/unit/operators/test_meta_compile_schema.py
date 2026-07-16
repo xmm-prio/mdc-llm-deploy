@@ -135,15 +135,13 @@ def test_meta_outputs_cover_all_operators() -> None:
     assert dequantized.dtype == torch.float16
 
     moe = moe_expert(
-        torch.empty(2, 4, dtype=torch.int8, device="meta"),
-        torch.empty(2, 3, dtype=torch.int16, device="meta"),
-        torch.empty(2, 3, dtype=torch.float16, device="meta"),
-        torch.empty(5 * 3 * 4 * 8, dtype=torch.int8, device="meta"),
-        torch.empty(21, dtype=torch.float32, device="meta"),
-        torch.empty(21, dtype=torch.int32, device="meta"),
+        torch.empty(2, 4, device="meta"),
+        torch.empty(2, 3, dtype=torch.int64, device="meta"),
+        torch.empty(2, 3, device="meta"),
+        torch.empty(5, 3 * 4 * 8, device="meta"),
     )
     assert moe.shape == (2, 4)
-    assert moe.dtype == torch.float16
+    assert moe.dtype == torch.float32
 
 
 def test_fake_tensor_outputs_have_expected_metadata() -> None:

@@ -17,12 +17,10 @@ from mdc_llm_deploy.mdc_ops import (
 
 def _valid_moe_inputs() -> tuple[torch.Tensor, ...]:
     return (
-        torch.ones((1, 2), dtype=torch.int8),
-        torch.tensor([[0, 1, 4]], dtype=torch.int16),
-        torch.tensor([[0.5, 0.5, 1.0]], dtype=torch.float16),
-        torch.ones(5 * 3 * 2 * 2, dtype=torch.int8),
-        torch.ones(21, dtype=torch.float32),
-        torch.zeros(21, dtype=torch.int32),
+        torch.ones((1, 2)),
+        torch.tensor([[0, 1]]),
+        torch.tensor([[0.5, 0.5]]),
+        torch.ones((3, 3 * 2 * 2)),
     )
 
 
@@ -126,24 +124,20 @@ def test_dequant_rejects_high_bits_nonfinite_and_shape() -> None:
 @pytest.mark.parametrize(
     ("argument_index", "replacement", "message"),
     [
-        (0, torch.empty(0, 2, dtype=torch.int8), "non-empty rank-2"),
-        (4, torch.ones(20), "21 ordered scales"),
-        (1, torch.tensor([[1, 1, 4]], dtype=torch.int16), "unique"),
-        (1, torch.tensor([[0, 1, 3]], dtype=torch.int16), "shared id 4"),
+        (0, torch.empty(0, 2), "non-empty rank-2"),
+        (1, torch.tensor([[1, 1]]), "unique"),
+        (1, torch.tensor([[0, 3]]), "outside expert range"),
         (
             2,
-            torch.tensor([[0.25, 0.5, 1.0]], dtype=torch.float16),
+            torch.tensor([[0.25, 0.5]]),
             "sum to one",
         ),
-        (5, torch.zeros(20, dtype=torch.int32), "21-scale order"),
     ],
     ids=(
         "empty-token-count",
-        "scale-count",
         "duplicate-expert-ids",
-        "shared-expert-id",
+        "expert-id-range",
         "route-weight-sum",
-        "offset-count",
     ),
 )
 def test_moe_rejects_wrong_contract_and_route_values(
@@ -161,10 +155,23 @@ def test_moe_rejects_wrong_contract_and_route_values(
 def test_moe_accepts_fp16_rounded_routed_weight_sum() -> None:
     valid = list(_valid_moe_inputs())
     valid[2] = torch.tensor(
-        [[0.3333, 0.6667, 1.0]],
-        dtype=torch.float16,
+        [[0.3333, 0.6667]],
     )
 
     result = moe_expert(*valid)
 
     assert result.shape == (1, 2)
+
+
+def test_moe_int8_weights_require_per_projection_scales() -> None:
+    valid = list(_valid_moe_inputs())
+    valid[3] = valid[3].to(torch.int8)
+    with pytest.raises(ValueError, match="require quant_scales"):
+        moe_expert(*valid)
+
+    result = moe_expert(
+        *valid,
+        torch.ones(9),
+        torch.zeros(9, dtype=torch.int32),
+    )
+    assert result.dtype is torch.float32

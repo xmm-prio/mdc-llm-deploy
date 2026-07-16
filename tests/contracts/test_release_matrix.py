@@ -1,4 +1,4 @@
-"""Release-structure coverage for all 28 FP16/MinMax ONNX combinations."""
+"""Release coverage without a redundant mask dimension."""
 
 from __future__ import annotations
 
@@ -24,15 +24,11 @@ def test_release_onnx_matrix_has_exactly_28_unique_entries() -> None:
             item.algorithm,
             item.target,
             item.phase,
-            item.mask_mode,
         )
         for item in ONNX_MATRIX
     }
 
-    assert len(ONNX_MATRIX) == 28
-    assert len(identities) == 28
-    assert sum(item.algorithm is Algorithm.FP16 for item in ONNX_MATRIX) == 8
-    assert sum(item.algorithm is Algorithm.MINMAX for item in ONNX_MATRIX) == 20
+    assert len(identities) == 14
 
 
 def test_release_moe_fixture_uses_atc_verified_dimensions() -> None:
