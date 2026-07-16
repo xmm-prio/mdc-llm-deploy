@@ -4,12 +4,73 @@ from __future__ import annotations
 
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import onnx
 
 from ..errors import OnnxExportError
 from .validation.model import validate_serialized_model
+
+
+@dataclass(frozen=True)
+class _PublicationMember:
+    target: Path
+    staged: Path | None
+
+
+def _snapshot_publication(
+    members: tuple[_PublicationMember, ...],
+    directory: Path,
+) -> dict[Path, Path | None]:
+    snapshots: dict[Path, Path | None] = {}
+    for index, member in enumerate(members):
+        if member.target.exists():
+            backup = directory / f".backup-{index}"
+            os.link(member.target, backup)
+            snapshots[member.target] = backup
+        else:
+            snapshots[member.target] = None
+    return snapshots
+
+
+def _restore_publication_member(
+    member: _PublicationMember,
+    backup: Path | None,
+) -> None:
+    if backup is None:
+        member.target.unlink(missing_ok=True)
+    else:
+        os.replace(backup, member.target)
+
+
+def _commit_publication(
+    members: tuple[_PublicationMember, ...],
+    directory: Path,
+) -> None:
+    snapshots = _snapshot_publication(members, directory)
+    attempted: list[_PublicationMember] = []
+    try:
+        for member in members:
+            attempted.append(member)
+            if member.staged is None:
+                member.target.unlink(missing_ok=True)
+            else:
+                os.replace(member.staged, member.target)
+    except Exception as publication_error:
+        rollback_errors: list[Exception] = []
+        for member in reversed(attempted):
+            try:
+                _restore_publication_member(member, snapshots[member.target])
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+        if rollback_errors:
+            summary = "; ".join(str(error) for error in rollback_errors)
+            raise OnnxExportError(
+                "ONNX publication failed: "
+                f"{publication_error}; rollback failed: {summary}"
+            ) from publication_error
+        raise
 
 
 def commit_validated_onnx(
@@ -41,11 +102,20 @@ def commit_validated_onnx(
             else:
                 onnx.save_model(model, temporary_model)
             validate_serialized_model(str(temporary_model))
-            if external_data and temporary_data.is_file():
-                os.replace(temporary_data, data_target)
-            elif data_target.exists():
-                data_target.unlink()
-            os.replace(temporary_model, target)
+            if external_data:
+                members = (
+                    _PublicationMember(
+                        data_target,
+                        temporary_data if temporary_data.is_file() else None,
+                    ),
+                    _PublicationMember(target, temporary_model),
+                )
+            else:
+                members = (
+                    _PublicationMember(target, temporary_model),
+                    _PublicationMember(data_target, None),
+                )
+            _commit_publication(members, Path(directory))
         return onnx.load(target, load_external_data=True)
     except OnnxExportError:
         raise

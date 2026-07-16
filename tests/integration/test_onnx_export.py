@@ -5,9 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import onnx
 import pytest
 import torch
+from onnx.reference import ReferenceEvaluator
 from torch import nn
 from torch.fx import Graph, GraphModule
 
@@ -69,6 +71,80 @@ def _tensor_devices(graph: GraphModule) -> dict[str, torch.device]:
         **{name: value.device for name, value in graph.named_parameters()},
         **{name: value.device for name, value in graph.named_buffers()},
     }
+
+
+def _cuda_linear_graph(device: torch.device) -> GraphModule:
+    root = nn.Module()
+    root.register_parameter(
+        "weight",
+        nn.Parameter(
+            torch.tensor(
+                [[1.0, 2.0], [-3.0, 0.5], [4.0, -1.0]],
+                device=device,
+            )
+        ),
+    )
+    fx_graph = Graph()
+    value = fx_graph.placeholder("value")
+    weight = fx_graph.get_attr("weight")
+    result = fx_graph.call_function(
+        torch.ops.aten.linear.default,
+        (value, weight, None),
+    )
+    fx_graph.output(result)
+    graph = GraphModule(root, fx_graph)
+    set_metadata(
+        graph,
+        GraphMetadata(
+            schema_version=1,
+            stage=GraphStage.FLOAT_PREFILL,
+            model_kind="dense",
+            input_abi=(TensorAbi("value", "float32", (1, 2)),),
+            output_abi=(TensorAbi("result", "float32", (1, 3)),),
+            sequence_length=2,
+            properties={"input_devices": {"value": str(device)}},
+        ),
+    )
+    return graph
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_linear_legacy_export_preserves_numerics(
+    tmp_path: Path,
+) -> None:
+    device = torch.device("cuda:0")
+    graph = _cuda_linear_graph(device)
+    target = tmp_path / "cuda-linear.onnx"
+    before_devices = _tensor_devices(graph)
+
+    model = onnx_export(graph, target, external_data=False)
+
+    assert _tensor_devices(graph) == before_devices
+    assert before_devices == {"weight": device}
+    assert target.is_file()
+    initializers = {item.name for item in model.graph.initializer}
+    assert "graph.weight" in initializers
+    producers = {
+        output: node
+        for node in model.graph.node
+        for output in node.output
+    }
+    linear_nodes = [
+        node for node in model.graph.node if node.op_type in {"Gemm", "MatMul"}
+    ]
+    assert len(linear_nodes) == 1
+    assert linear_nodes[0].input[1] == "graph.weight"
+    weight_producer = producers.get(linear_nodes[0].input[1])
+    assert weight_producer is None or weight_producer.op_type != "Transpose"
+
+    value = torch.tensor([[1.5, -2.0]], device=device)
+    expected = graph(value).detach().cpu().numpy()
+    actual = ReferenceEvaluator(model).run(
+        None,
+        {"value": value.cpu().numpy()},
+    )[0]
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
