@@ -14,6 +14,7 @@ from ..errors import UnsupportedPatternError
 from ..fx_inspection import flatten_nodes, node_target
 from ..fx_ownership import node_belongs_to
 from ..graph_types import FusionBoundary, TensorAbi
+from ..input_placement import INPUT_DEVICES_PROPERTY, capture_input_devices
 from ..onnx_protocol import MDC_ONNX_OPSET
 
 __all__ = ["DiscoveryResult", "discover_metadata"]
@@ -172,11 +173,13 @@ def discover_metadata(
     example_inputs: Mapping[str, Tensor],
 ) -> DiscoveryResult:
     """Discover graph metadata without mutating model or graph."""
+    properties = _model_properties(model, graph)
+    properties[INPUT_DEVICES_PROPERTY] = capture_input_devices(example_inputs)
     return DiscoveryResult(
         input_abi=tuple(
             _tensor_abi(name, value) for name, value in example_inputs.items()
         ),
         output_abi=_output_abi(graph),
         boundaries=_discover_boundaries(model, graph),
-        properties=_model_properties(model, graph),
+        properties=properties,
     )

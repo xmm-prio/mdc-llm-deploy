@@ -14,6 +14,7 @@ from torch.fx import GraphModule
 from ..errors import OnnxExportError
 from ..fx_inspection import linear_weight_name
 from ..graph_types import GraphMetadata
+from ..input_placement import resolve_input_devices
 from ..onnx_protocol import MDC_ONNX_OPSET
 from ..operator_schema import OPERATOR_SCHEMAS
 from .validation.model import validate_mdc_model
@@ -81,24 +82,25 @@ class _PositionalGraph(torch.nn.Module):
         return self.graph(*args)
 
 
-def _device(graph: GraphModule) -> torch.device:
-    for tensor in (*tuple(graph.parameters()), *tuple(graph.buffers())):
-        return tensor.device
-    return torch.device("cpu")
-
-
 def _example_arguments(
-    graph: GraphModule,
     metadata: GraphMetadata,
 ) -> tuple[torch.Tensor, ...]:
-    device = _device(graph)
+    try:
+        devices = resolve_input_devices(metadata)
+    except ValueError as error:
+        raise OnnxExportError(str(error)) from error
     result: list[torch.Tensor] = []
-    for item in metadata.input_abi:
+    for item, device in zip(metadata.input_abi, devices, strict=True):
         try:
             dtype = _TORCH_DTYPES[item.dtype]
         except KeyError as error:
             raise OnnxExportError(f"Unsupported input dtype: {item.dtype}") from error
-        result.append(torch.zeros(item.shape, dtype=dtype, device=device))
+        try:
+            result.append(torch.zeros(item.shape, dtype=dtype, device=device))
+        except Exception as error:
+            raise OnnxExportError(
+                f"Cannot create ONNX input {item.name!r} on {device}: {error}"
+            ) from error
     return tuple(result)
 
 
@@ -235,7 +237,7 @@ def export_standard_onnx(
                     tuple(item.name for item in metadata.input_abi),
                     use_kwargs=metadata.stage.is_prefill,
                 ),
-                _example_arguments(graph, metadata),
+                _example_arguments(metadata),
                 temporary,
                 export_params=True,
                 opset_version=MDC_ONNX_OPSET,

@@ -18,11 +18,14 @@ from mdc_llm_deploy.graph import (
     GraphStage,
     TensorAbi,
 )
-from mdc_llm_deploy.onnx_export.standard_export import export_standard_onnx
+from mdc_llm_deploy.onnx_export.standard_export import (
+    _example_arguments,
+    export_standard_onnx,
+)
 from mdc_llm_deploy.onnx_protocol import MDC_ONNX_OPSET
 
 
-def _metadata() -> GraphMetadata:
+def _metadata(*, properties: dict[str, Any] | None = None) -> GraphMetadata:
     return GraphMetadata(
         schema_version=1,
         stage=GraphStage.FLOAT_PREFILL,
@@ -30,6 +33,11 @@ def _metadata() -> GraphMetadata:
         input_abi=(TensorAbi("x", "float32", (1, 2)),),
         output_abi=(TensorAbi("output", "float32", (1, 2)),),
         sequence_length=2,
+        properties=(
+            {"input_devices": {"x": "cpu"}}
+            if properties is None
+            else properties
+        ),
     )
 
 
@@ -109,6 +117,62 @@ def _rms_standard_model() -> onnx.ModelProto:
         initializer=[weight],
     )
     return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+
+
+def test_example_arguments_follow_per_input_device_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[torch.device] = []
+    original_zeros = torch.zeros
+
+    def record_zeros(
+        shape: tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        captured.append(device)
+        return original_zeros(shape, dtype=dtype)
+
+    monkeypatch.setattr(torch, "zeros", record_zeros)
+    value = GraphMetadata(
+        schema_version=1,
+        stage=GraphStage.FLOAT_PREFILL,
+        model_kind="dense",
+        input_abi=(
+            TensorAbi("tokens", "int64", (1, 2)),
+            TensorAbi("mask", "bool", (1, 2)),
+        ),
+        output_abi=(TensorAbi("output", "float32", (1, 2)),),
+        properties={
+            "input_devices": {
+                "tokens": "cuda:1",
+                "mask": "cpu",
+            }
+        },
+    )
+
+    arguments = _example_arguments(value)
+
+    assert captured == [torch.device("cuda:1"), torch.device("cpu")]
+    assert [argument.dtype for argument in arguments] == [torch.int64, torch.bool]
+
+
+@pytest.mark.parametrize(
+    ("properties", "message"),
+    [
+        ({}, "contract is missing"),
+        ({"input_devices": {"other": "cpu"}}, "missing=\\['x'\\]"),
+        ({"input_devices": {"x": 0}}, "for 'x' must be a string"),
+        ({"input_devices": {"x": "not-a-device"}}, "for 'x' is invalid"),
+    ],
+)
+def test_example_arguments_reject_invalid_input_device_contract(
+    properties: dict[str, Any],
+    message: str,
+) -> None:
+    with pytest.raises(OnnxExportError, match=message):
+        _example_arguments(_metadata(properties=properties))
 
 
 def test_standard_export_wraps_external_failure_and_removes_temporary_file(
@@ -196,6 +260,7 @@ def test_standard_export_folds_rms_norm_weight_into_initializer(
             FusionBoundary("rms_norm", "norm", ("mul",)),
         ),
         sequence_length=value.sequence_length,
+        properties=value.properties,
     )
 
     model = export_standard_onnx(_rms_graph(), value, tmp_path)

@@ -42,6 +42,9 @@ def test_dense_fx_export_preserves_internal_per_layer_kv_outputs(
             )
         ),
     )
+    assert metadata(graph).properties["input_devices"] == {
+        "input_ids": "cpu"
+    }
 
 
 def test_moe_export_preserves_custom_operator() -> None:
@@ -78,6 +81,13 @@ def test_decode_rewrite_handles_every_layer_cache() -> None:
         "present.1.value",
     )
     assert value.properties["cache_devices"] == {
+        "past.0.key": "cpu",
+        "past.0.value": "cpu",
+        "past.1.key": "cpu",
+        "past.1.value": "cpu",
+    }
+    assert value.properties["input_devices"] == {
+        "input_ids": "cpu",
         "past.0.key": "cpu",
         "past.0.value": "cpu",
         "past.1.key": "cpu",

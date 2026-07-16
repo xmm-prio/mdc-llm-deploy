@@ -10,6 +10,7 @@ from torch.fx import GraphModule
 from ..errors import GraphStateError
 from ..fx_inspection import node_target
 from ..graph_types import GraphMetadata, GraphStage, TensorAbi
+from ..input_placement import INPUT_DEVICES_PROPERTY, resolve_input_devices
 from ..model_properties import AttentionDimensions
 from .decode_cache import cache_target
 
@@ -35,6 +36,7 @@ def build_decode_metadata(
         dimensions = AttentionDimensions.from_properties(
             value.properties
         )
+        original_devices = resolve_input_devices(value)
     except ValueError as error:
         raise GraphStateError(str(error)) from error
     original_inputs = tuple(
@@ -98,6 +100,10 @@ def build_decode_metadata(
         for item in value.output_abi
     )
     properties = dict(value.properties)
+    input_devices = {
+        item.name: str(device)
+        for item, device in zip(value.input_abi, original_devices, strict=True)
+    }
     cache_devices: dict[str, str] = {}
     for layer_id in range(len(cache_outputs) // 2):
         for edge in ("key", "value"):
@@ -117,12 +123,14 @@ def build_decode_metadata(
                     f"{layer_id} {edge}"
                 )
             cache_devices[f"past.{layer_id}.{edge}"] = str(tensor.device)
+    input_devices.update(cache_devices)
     properties.update(
         {
             "decode_rewrite": True,
             "cache_layout": "BNSD",
             "cache_length": value.sequence_length - 1,
             "cache_devices": cache_devices,
+            INPUT_DEVICES_PROPERTY: input_devices,
             "query_length": 1,
             "position_ids": (value.sequence_length - 1,),
             "mask_semantics": (

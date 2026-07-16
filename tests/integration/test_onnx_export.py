@@ -16,6 +16,7 @@ from mdc_llm_deploy.graph import (
     GraphMetadata,
     GraphStage,
     TensorAbi,
+    metadata,
     set_metadata,
 )
 from mdc_llm_deploy.onnx_export import onnx_export
@@ -42,6 +43,7 @@ def test_model_independent_small_operator_graph_exports(
             input_abi=(TensorAbi("value", "float32", (1, 2)),),
             output_abi=(TensorAbi("result", "float32", (1, 2)),),
             sequence_length=2,
+            properties={"input_devices": {"value": "cpu"}},
         ),
     )
 
@@ -60,6 +62,61 @@ def _graph(
         dense_model(4, mask_mode=mask_mode),
         {"input_ids": torch.arange(4).reshape(1, 4)},
     )
+
+
+def _tensor_devices(graph: GraphModule) -> dict[str, torch.device]:
+    return {
+        **{name: value.device for name, value in graph.named_parameters()},
+        **{name: value.device for name, value in graph.named_buffers()},
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_qwen3_w8a8_prefill_and_decode_preserve_placement(
+    tmp_path: Path,
+) -> None:
+    device = torch.device("cuda")
+    model = dense_model(4).to(device)
+    inputs = {
+        "input_ids": torch.arange(4, device=device).reshape(1, 4),
+    }
+    graph = export(model, inputs)
+    oneshot(
+        graph,
+        "configs/minmax-linear-w8a8.json",
+        [inputs],
+    )
+
+    before_prefill = _tensor_devices(graph)
+    prefill = onnx_export(
+        graph,
+        tmp_path / "cuda-prefill.onnx",
+        external_data=False,
+    )
+
+    assert prefill.graph.input[0].name == "input_ids"
+    assert _tensor_devices(graph) == before_prefill
+    assert metadata(graph).properties["input_devices"] == {
+        "input_ids": "cuda:0"
+    }
+
+    convert_to_decode(graph)
+    before_decode = _tensor_devices(graph)
+    decode = onnx_export(
+        graph,
+        tmp_path / "cuda-decode.onnx",
+        external_data=False,
+    )
+
+    assert [item.name for item in decode.graph.input] == [
+        "input_ids",
+        "past.0.key",
+        "past.0.value",
+    ]
+    assert _tensor_devices(graph) == before_decode
+    assert set(metadata(graph).properties["input_devices"].values()) == {
+        "cuda:0"
+    }
 
 
 @pytest.mark.parametrize("mask_mode", ["causal", "none"])

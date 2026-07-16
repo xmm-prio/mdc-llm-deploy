@@ -95,6 +95,7 @@ from mdc_llm_deploy import (
 )
 
 sequence_length = 3072
+device = torch.device("cuda")
 model = AutoExportModel.from_pretrained(
     "Qwen/Qwen3-4B",
     ExportModelConfig(
@@ -102,11 +103,12 @@ model = AutoExportModel.from_pretrained(
         mask_mode="causal",
     ),
     dtype=torch.float16,
-)
+).to(device)
 inputs = {
     "input_ids": torch.zeros(
         (1, sequence_length),
         dtype=torch.int64,
+        device=device,
     )
 }
 
@@ -125,6 +127,9 @@ onnx_export(graph, "output/qwen3-decode.onnx")
 > [!WARNING]
 > `convert_to_decode()` 会更新同一 FX 图。请先导出 prefill，再执行转换和 decode 导出；转换后不能
 > 再从该图生成 prefill。量化同样必须在转换前完成。
+>
+> 模型、导出输入和 `oneshot()` 的校准批次必须位于同一设备。GPU 导出时，请在创建输入及校准
+> 数据时显式传入同一个 CUDA `device`。
 
 不需要量化时，跳过 `oneshot()` 即可导出 FP16 产物。默认输出为：
 
