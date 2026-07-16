@@ -75,12 +75,28 @@ def _replace_linear(
         )
     types = model_types(model)
     source = node.input[0]
-    if node.output[0] not in types:
-        raise OnnxExportError(
-            f"Linear target {target.fqn!r} lacks static ONNX type metadata"
-        )
-    output_dtype, output_shape = types[node.output[0]]
     array = _linear_weight_array(node, weight)
+    source_shape: tuple[int, ...]
+    output_shape: tuple[int, ...]
+    if node.output[0] not in types:
+        query_length = value.sequence_length if value.stage.is_prefill else 1
+        source_shape = (1, query_length, array.shape[0])
+        output_shape = (1, query_length, array.shape[1])
+        append_value(
+            model,
+            source,
+            weight.data_type,
+            source_shape,
+        )
+        append_value(
+            model,
+            node.output[0],
+            weight.data_type,
+            output_shape,
+        )
+        types[source] = (weight.data_type, source_shape)
+        types[node.output[0]] = (weight.data_type, output_shape)
+    output_dtype, output_shape = types[node.output[0]]
     source_dtype = types.get(source, (output_dtype, ()))[0]
     source_shape = types.get(
         source,

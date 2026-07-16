@@ -30,8 +30,6 @@ def build_decode_metadata(
         if any(node in live_nodes for node in boundary.nodes)
     )
 
-    key_target = cache_target(value, "key")
-    value_target = cache_target(value, "value")
     try:
         dimensions = AttentionDimensions.from_properties(
             value.properties
@@ -54,21 +52,32 @@ def build_decode_metadata(
         value.sequence_length - 1,
         dimensions.head_dim,
     )
-    updated_inputs = (
-        *original_inputs,
-        TensorAbi(
-            "past_key_values.0.key",
-            "int8" if key_target is not None else value.output_abi[1].dtype,
-            cache_shape,
-        ),
-        TensorAbi(
-            "past_key_values.0.value",
-            "int8"
-            if value_target is not None
-            else value.output_abi[2].dtype,
-            cache_shape,
-        ),
-    )
+    cache_outputs = value.output_abi[1:]
+    if len(cache_outputs) % 2:
+        raise GraphStateError("Cache outputs must contain key/value pairs")
+    cache_inputs: list[TensorAbi] = []
+    for layer_id in range(len(cache_outputs) // 2):
+        key_target = cache_target(value, "key", layer_id)
+        value_target = cache_target(value, "value", layer_id)
+        cache_inputs.extend(
+            (
+                TensorAbi(
+                    f"past.{layer_id}.key",
+                    "int8"
+                    if key_target is not None
+                    else cache_outputs[layer_id * 2].dtype,
+                    cache_shape,
+                ),
+                TensorAbi(
+                    f"past.{layer_id}.value",
+                    "int8"
+                    if value_target is not None
+                    else cache_outputs[layer_id * 2 + 1].dtype,
+                    cache_shape,
+                ),
+            )
+        )
+    updated_inputs = (*original_inputs, *cache_inputs)
     updated_outputs = tuple(
         replace(item, shape=(1, 1, item.shape[-1]))
         if item.name == "logits"
@@ -76,14 +85,12 @@ def build_decode_metadata(
             item,
             dtype=(
                 "int8"
-                if (
-                    item.name.endswith(".key")
-                    and key_target is not None
+                if cache_target(
+                    value,
+                    "key" if item.name.endswith(".key") else "value",
+                    int(item.name.split(".")[1]),
                 )
-                or (
-                    item.name.endswith(".value")
-                    and value_target is not None
-                )
+                is not None
                 else item.dtype
             ),
         )

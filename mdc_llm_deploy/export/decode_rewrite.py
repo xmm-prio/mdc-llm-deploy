@@ -31,6 +31,51 @@ def replace_static_sequence(value: Any, sequence: int) -> Any:
     return value
 
 
+def rewrite_static_shapes(
+    candidate: GraphModule,
+    sequence: int,
+) -> None:
+    """Rewrite sequence axes without changing equal-valued head dimensions."""
+    for node in candidate.graph.nodes:
+        if (
+            node.op != "call_function"
+            or not any(
+                operation in node_target(node)
+                for operation in ("aten::view", "aten::reshape")
+            )
+            or len(node.args) < 2
+            or not isinstance(node.args[1], (list, tuple))
+        ):
+            continue
+        shape = list(node.args[1])
+        if len(shape) >= 3 and shape[1] == sequence:
+            shape[1] = 1
+            node.args = (
+                node.args[0],
+                type(node.args[1])(shape),
+                *node.args[2:],
+            )
+
+
+def rewrite_rotary_cache(
+    candidate: GraphModule,
+    sequence: int,
+) -> None:
+    """Narrow precomputed rotary caches to the decode position."""
+    for name in ("cos_cache", "sin_cache"):
+        value = getattr(candidate, name, None)
+        if (
+            not isinstance(value, Tensor)
+            or value.ndim < 2
+            or value.shape[1] != sequence
+        ):
+            continue
+        candidate.register_buffer(
+            name,
+            value[:, sequence - 1 : sequence].detach().clone(),
+        )
+
+
 def rewrite_position_nodes(
     candidate: GraphModule,
     sequence: int,

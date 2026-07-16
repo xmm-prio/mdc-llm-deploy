@@ -16,8 +16,6 @@ from ..fx_ownership import node_belongs_to
 from ..graph_types import FusionBoundary, TensorAbi
 from ..onnx_protocol import MDC_ONNX_OPSET
 
-_OUTPUT_NAMES = ("logits", "present.0.key", "present.0.value")
-
 __all__ = ["DiscoveryResult", "discover_metadata"]
 
 
@@ -47,10 +45,13 @@ def _structural_module_kind(module: nn.Module) -> str | None:
     children = dict(module.named_children())
     if {"q_proj", "k_proj", "v_proj", "o_proj"} <= children.keys():
         return "attention"
-    if {"router", "experts", "shared_expert"} <= children.keys():
+    if (
+        "gate" in children
+        and "expert_weights" in dict(module.named_parameters(recurse=False))
+    ):
         return "moe"
     buffers = dict(module.named_buffers(recurse=False))
-    if "inv_freq" in buffers:
+    if "inv_freq" in buffers or "_mdc_rotary" in buffers:
         return "rope"
     parameters = dict(module.named_parameters(recurse=False))
     if (
@@ -122,11 +123,12 @@ def _output_abi(graph: GraphModule) -> tuple[TensorAbi, ...]:
     for index, node in enumerate(flatten_nodes(output_node.args[0])):
         tensor = node.meta.get("val")
         if isinstance(tensor, Tensor):
-            name = (
-                _OUTPUT_NAMES[index]
-                if index < len(_OUTPUT_NAMES)
-                else f"output.{index}"
-            )
+            if index == 0:
+                name = "logits"
+            else:
+                cache_index = index - 1
+                layer_id, cache_kind = divmod(cache_index, 2)
+                name = f"present.{layer_id}.{'key' if cache_kind == 0 else 'value'}"
             result.append(_tensor_abi(name, tensor))
     if not result:
         raise UnsupportedPatternError(
@@ -141,6 +143,11 @@ def _model_properties(model: nn.Module, graph: GraphModule) -> dict[str, Any]:
         "opset": MDC_ONNX_OPSET,
         "source": "torch.export",
         "dialect": "ATEN",
+        "mask_mode": getattr(
+            getattr(model, "export_config", None),
+            "mask_mode",
+            "causal",
+        ),
         "rms_norm_epsilon": getattr(config, "rms_norm_eps", None),
         "hidden_size": getattr(config, "hidden_size", None),
         "vocab_size": getattr(config, "vocab_size", None),
@@ -151,7 +158,6 @@ def _model_properties(model: nn.Module, graph: GraphModule) -> dict[str, Any]:
         "moe_intermediate_size": getattr(config, "moe_intermediate_size", None),
         "num_experts": getattr(config, "num_experts", None),
         "num_experts_per_tok": getattr(config, "num_experts_per_tok", None),
-        "num_shared_experts": getattr(config, "num_shared_experts", None),
     }
     properties["aten_node_count"] = sum(
         node.op == "call_function" and "aten::" in node_target(node)

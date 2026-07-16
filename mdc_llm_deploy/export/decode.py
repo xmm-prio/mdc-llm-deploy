@@ -26,10 +26,13 @@ from .decode_rewrite import (
     remove_prefill_causal_mask as _remove_prefill_causal_mask,
 )
 from .decode_rewrite import (
-    replace_static_sequence as _replace_static_sequence,
+    rewrite_position_nodes as _rewrite_position_nodes,
 )
 from .decode_rewrite import (
-    rewrite_position_nodes as _rewrite_position_nodes,
+    rewrite_rotary_cache as _rewrite_rotary_cache,
+)
+from .decode_rewrite import (
+    rewrite_static_shapes as _rewrite_static_shapes,
 )
 
 
@@ -49,75 +52,74 @@ def convert_to_decode(graph: GraphModule) -> GraphModule:
         value = metadata(candidate)
         output = next(node for node in candidate.graph.nodes if node.op == "output")
         outputs = list(flatten_nodes(output.args[0]))
-        if len(outputs) < 3:
+        if len(outputs) < 3 or (len(outputs) - 1) % 2:
             raise UnsupportedPatternError(
-                "Decode conversion requires logits, key, and value outputs"
+                "Decode conversion requires logits and per-layer key/value outputs"
             )
-        current_key, current_value = outputs[1:3]
-        if not any(
-            "repeat_interleave" in node_target(user)
-            for user in current_key.users
-        ):
-            raise UnsupportedPatternError(
-                "Decode conversion cannot locate key attention use"
-            )
-        if not any(
-            "repeat_interleave" in node_target(user)
-            for user in current_value.users
-        ):
-            raise UnsupportedPatternError(
-                "Decode conversion cannot locate value attention use"
-            )
-        cache_use = next(
-            node
-            for node in candidate.graph.nodes
-            if node in current_key.users or node in current_value.users
-            if "repeat_interleave" in node_target(node)
-        )
-
         first_compute = next(
             node
             for node in candidate.graph.nodes
             if node.op not in {"placeholder", "get_attr"}
         )
-        with candidate.graph.inserting_before(first_compute):
-            past_key = candidate.graph.placeholder("past_key_values_0_key")
-            past_value = candidate.graph.placeholder("past_key_values_0_value")
-        with candidate.graph.inserting_before(cache_use):
-            present_key, attention_key = _insert_cache_quantization(
-                candidate,
-                current_key,
-                past_key,
-                _cache_target(value, "key"),
-                "key",
-                value.sequence_length,
-            )
-            present_value, attention_value = _insert_cache_quantization(
-                candidate,
-                current_value,
-                past_value,
-                _cache_target(value, "value"),
-                "value",
-                value.sequence_length,
-            )
-        _replace_attention_cache_users(current_key, attention_key, output)
-        _replace_attention_cache_users(current_value, attention_value, output)
         output_values = outputs.copy()
-        output_values[1] = present_key
-        output_values[2] = present_value
+        layer_count = (len(outputs) - 1) // 2
+        for layer_id in range(layer_count):
+            current_key = outputs[1 + layer_id * 2]
+            current_value = outputs[2 + layer_id * 2]
+            key_uses = [
+                user
+                for user in current_key.users
+                if "repeat_interleave" in node_target(user)
+            ]
+            value_uses = [
+                user
+                for user in current_value.users
+                if "repeat_interleave" in node_target(user)
+            ]
+            if not key_uses or not value_uses:
+                raise UnsupportedPatternError(
+                    f"Decode conversion cannot locate layer {layer_id} cache use"
+                )
+            with candidate.graph.inserting_before(first_compute):
+                past_key = candidate.graph.placeholder(
+                    f"past_{layer_id}_key"
+                )
+                past_value = candidate.graph.placeholder(
+                    f"past_{layer_id}_value"
+                )
+            cache_use = key_uses[0]
+            with candidate.graph.inserting_before(cache_use):
+                present_key, attention_key = _insert_cache_quantization(
+                    candidate,
+                    current_key,
+                    past_key,
+                    _cache_target(value, "key", layer_id),
+                    f"{layer_id}_key",
+                    value.sequence_length,
+                )
+                present_value, attention_value = _insert_cache_quantization(
+                    candidate,
+                    current_value,
+                    past_value,
+                    _cache_target(value, "value", layer_id),
+                    f"{layer_id}_value",
+                    value.sequence_length,
+                )
+            _replace_attention_cache_users(
+                current_key, attention_key, output
+            )
+            _replace_attention_cache_users(
+                current_value, attention_value, output
+            )
+            output_values[1 + layer_id * 2] = present_key
+            output_values[2 + layer_id * 2] = present_value
         output.args = (tuple(output_values),)
         candidate.graph.set_codegen(CodeGen())  # type: ignore[no-untyped-call]
 
         _rewrite_position_nodes(candidate, value.sequence_length)
+        _rewrite_rotary_cache(candidate, value.sequence_length)
         _remove_prefill_causal_mask(candidate)
-        for node in candidate.graph.nodes:
-            if node.op in {"placeholder", "get_attr", "output"}:
-                continue
-            node.args = _replace_static_sequence(node.args, value.sequence_length)
-            node.kwargs = _replace_static_sequence(
-                dict(node.kwargs),
-                value.sequence_length,
-            )
+        _rewrite_static_shapes(candidate, value.sequence_length)
         candidate.graph.eliminate_dead_code()
         set_metadata(
             candidate,

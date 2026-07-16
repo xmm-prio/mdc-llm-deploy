@@ -34,11 +34,19 @@ from .model_inspection import (
 MaskMode = Literal["masked", "maskless"]
 
 
-def _target(value: GraphMetadata, edge: str) -> QuantizedTarget | None:
+def _target(
+    value: GraphMetadata,
+    edge: str,
+    attention_fqn: str,
+) -> QuantizedTarget | None:
     matches = [
         item
         for item in value.quantized_targets
         if item.target_type == "attention" and item.fqn.rsplit(".", 1)[-1] == edge
+        and (
+            item.fqn.startswith(f"{attention_fqn}.")
+            or f".{attention_fqn}." in f".{item.fqn}."
+        )
     ]
     return matches[0] if matches else None
 
@@ -121,8 +129,66 @@ def lower_rms_norms(model: onnx.ModelProto, value: GraphMetadata) -> None:
             ),
             None,
         )
-        if source is None or source not in types or terminal.output[0] not in types:
-            raise OnnxExportError(f"RmsNorm boundary {boundary.fqn!r} lacks static type metadata")
+        if source is None:
+            source = normalized.input[0]
+        if source not in types or terminal.output[0] not in types:
+            try:
+                dimensions = AttentionDimensions.from_properties(
+                    value.properties
+                )
+            except ValueError as error:
+                raise OnnxExportError(str(error)) from error
+            sequence = (
+                value.sequence_length if value.stage.is_prefill else 1
+            )
+            shape: tuple[int, ...]
+            if boundary.fqn.endswith(".q_norm"):
+                shape = (
+                    1,
+                    sequence,
+                    dimensions.num_attention_heads,
+                    dimensions.head_dim,
+                )
+            elif boundary.fqn.endswith(".k_norm"):
+                shape = (
+                    1,
+                    sequence,
+                    dimensions.num_key_value_heads,
+                    dimensions.head_dim,
+                )
+            else:
+                hidden_size = value.properties.get("hidden_size")
+                if type(hidden_size) is not int or hidden_size <= 0:
+                    raise OnnxExportError(
+                        "RmsNorm lowering requires positive hidden_size"
+                    )
+                shape = (1, sequence, hidden_size)
+            initializer_by_name = {
+                item.name: item for item in model.graph.initializer
+            }
+            gamma_source = gamma
+            gamma_producer = producer_map(model).get(gamma_source)
+            while (
+                gamma_source not in initializer_by_name
+                and gamma_producer is not None
+                and gamma_producer.op_type == "Identity"
+            ):
+                gamma_source = gamma_producer.input[0]
+                gamma_producer = producer_map(model).get(gamma_source)
+            gamma_tensor = initializer_by_name.get(gamma_source)
+            if gamma_tensor is None:
+                raise OnnxExportError(
+                    f"RmsNorm gamma {gamma!r} lacks initializer metadata"
+                )
+            append_value(model, source, gamma_tensor.data_type, shape)
+            append_value(
+                model,
+                terminal.output[0],
+                gamma_tensor.data_type,
+                shape,
+            )
+            types[source] = (gamma_tensor.data_type, shape)
+            types[terminal.output[0]] = (gamma_tensor.data_type, shape)
         dtype, source_shape = types[source]
         output_dtype, output_shape = types[terminal.output[0]]
         if (
@@ -242,6 +308,8 @@ def lower_rope_attention(
     model: onnx.ModelProto,
     value: GraphMetadata,
     mask_mode: MaskMode,
+    *,
+    layer_id: int = 0,
 ) -> None:
     """Replace FQN-anchored Tiny RoPE and attention standard subgraphs."""
     try:
@@ -275,6 +343,21 @@ def lower_rope_attention(
     value_reshape = _single_consumer(consumers, value_projection.output[0], "Reshape")
     query = query_reshape.output[0]
     key = key_reshape.output[0]
+    query_norms = [
+        node
+        for node in model.graph.node
+        if node.name == f"mdc.rms_norm.{attention_fqn}.q_norm"
+    ]
+    key_norms = [
+        node
+        for node in model.graph.node
+        if node.name == f"mdc.rms_norm.{attention_fqn}.k_norm"
+    ]
+    if query_norms or key_norms:
+        if len(query_norms) != 1 or len(key_norms) != 1:
+            raise OnnxExportError("Q/K normalization mapping is ambiguous")
+        query = query_norms[0].output[0]
+        key = key_norms[0].output[0]
     if query not in types or key not in types:
         raise OnnxExportError("RoPE projection boundaries lack static type metadata")
     query_dtype, query_shape = types[query]
@@ -325,11 +408,19 @@ def lower_rope_attention(
     key_rope = key_terminal.output[0]
     query_transpose = _single_consumer(consumers, query_rope, "Transpose")
     key_output = next(
-        (item for item in model.graph.output if item.name == "present.0.key"),
+        (
+            item
+            for item in model.graph.output
+            if item.name == f"present.{layer_id}.key"
+        ),
         None,
     )
     value_output = next(
-        (item for item in model.graph.output if item.name == "present.0.value"),
+        (
+            item
+            for item in model.graph.output
+            if item.name == f"present.{layer_id}.value"
+        ),
         None,
     )
     if key_output is None or value_output is None:
@@ -357,12 +448,12 @@ def lower_rope_attention(
         not matches_cache(
             key_cache,
             current_key,
-            "past_key_values.0.key",
+            f"past.{layer_id}.key",
         )
         or not matches_cache(
             value_cache,
             current_value,
-            "past_key_values.0.value",
+            f"past.{layer_id}.value",
         )
     ):
         raise OnnxExportError("Attention cache outputs do not match FQN projections")
@@ -392,10 +483,10 @@ def lower_rope_attention(
         raise OnnxExportError("Attention cache outputs lack static type metadata")
     key_input = key_output.name
     value_input = value_output.name
-    key_target = _target(value, "key")
-    value_target = _target(value, "value")
-    query_target = _target(value, "query")
-    score_target = _target(value, "score")
+    key_target = _target(value, "key", attention_fqn)
+    value_target = _target(value, "value", attention_fqn)
+    query_target = _target(value, "query", attention_fqn)
+    score_target = _target(value, "score", attention_fqn)
     if query_target is not None:
         query_bnsd = append_quant(
             model, query_bnsd, query_bnsd_shape, query_target, "mdc.attention.query_quant"

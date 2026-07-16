@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import onnx
@@ -28,7 +29,6 @@ from .graph_cleanup import (
     topologically_sort,
 )
 from .linear_lowering import append_quantized_linears
-from .moe_lowering import append_moe, moe_metadata_properties
 from .standard_export import export_standard_onnx
 from .validator import validate_mdc_model
 
@@ -48,10 +48,34 @@ def _lower(
     )
     if mask_mode == "maskless":
         lower_maskless_attention(model)
-    lower_rms_norms(model, value)
-    lower_rope_attention(model, value, mask_mode)
+    if any(boundary.kind == "rms_norm" for boundary in value.boundaries):
+        lower_rms_norms(model, value)
+    attention_boundaries = sorted(
+        (
+            boundary
+            for boundary in value.boundaries
+            if boundary.kind == "attention"
+        ),
+        key=lambda boundary: boundary.fqn,
+    )
+    for layer_id, attention in enumerate(attention_boundaries):
+        ropes = tuple(
+            boundary
+            for boundary in value.boundaries
+            if boundary.kind == "rope"
+            and boundary.fqn.startswith(f"{attention.fqn}.")
+        )
+        if len(ropes) != 1:
+            raise OnnxExportError(
+                f"Attention {attention.fqn!r} requires one owned RoPE boundary"
+            )
+        lower_rope_attention(
+            model,
+            replace(value, boundaries=(attention, ropes[0])),
+            mask_mode,
+            layer_id=layer_id,
+        )
     append_quantized_linears(model, value)
-    append_moe(model, value)
     prune_unreachable(model)
     topologically_sort(model)
     algorithms = sorted({item.algorithm for item in value.quantized_targets}) or ["fp16"]
@@ -74,7 +98,6 @@ def _lower(
     linear_target_count = sum(item.target_type == "linear" for item in value.quantized_targets)
     if linear_target_count:
         properties["mdc.linear.target_count"] = str(linear_target_count)
-    properties.update(moe_metadata_properties(value))
     remove_dynamic_value_info(model)
     helper.set_model_props(
         model,
@@ -87,19 +110,26 @@ def onnx_export(
     graph: GraphModule,
     output_path: str | Path,
     *,
-    mask_mode: MaskMode,
-    overwrite: bool = False,
+    external_data: bool = True,
 ) -> onnx.ModelProto:
-    """Lower an FX graph and atomically replace the requested ONNX file."""
+    """Lower an FX graph and atomically replace requested ONNX artifacts."""
     value = metadata(graph)
+    configured_mask = value.properties.get("mask_mode", "causal")
+    if configured_mask not in {"causal", "none"}:
+        raise OnnxExportError("Graph mask_mode metadata is invalid")
+    mask_mode: MaskMode = (
+        "masked" if configured_mask == "causal" else "maskless"
+    )
     validate_onnx_compatibility(value, mask_mode)
     target = Path(output_path)
     if target.suffix.lower() != ".onnx":
         raise OnnxExportError("output_path must use .onnx suffix")
-    if target.exists() and not overwrite:
-        raise FileExistsError(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     standard = export_standard_onnx(graph, value, target.parent)
     model = _lower(standard, value, mask_mode)
     validate_mdc_model(model)
-    return commit_validated_onnx(model, target, overwrite=overwrite)
+    return commit_validated_onnx(
+        model,
+        target,
+        external_data=external_data,
+    )

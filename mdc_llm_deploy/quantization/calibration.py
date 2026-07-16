@@ -18,9 +18,15 @@ from ..graph import metadata
 class _CalibrationInterpreter(Interpreter):
     """Capture actual linear inputs and attention edges from one FX execution."""
 
-    def __init__(self, graph: GraphModule, attention_fqns: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        graph: GraphModule,
+        attention_fqns: tuple[str, ...],
+        moe_fqns: tuple[str, ...] = (),
+    ) -> None:
         super().__init__(graph, garbage_collect_values=True)
         self.attention_fqns = attention_fqns
+        self.moe_fqns = moe_fqns
         self.samples: dict[str, list[Tensor]] = {}
 
     def _record(self, name: str, value: Any) -> None:
@@ -65,6 +71,21 @@ class _CalibrationInterpreter(Interpreter):
             and any(isinstance(argument, (float, int)) for argument in args)
         ):
             self._record(f"{attention_fqn}.score", result)
+        if (
+            node.target
+            == torch.ops.mdc_llm_deploy.moe_expert.default
+            and self.moe_fqns
+        ):
+            owner = next(
+                (
+                    fqn
+                    for fqn in self.moe_fqns
+                    if node_belongs_to(node, fqn)
+                ),
+                self.moe_fqns[0] if len(self.moe_fqns) == 1 else None,
+            )
+            if owner is not None:
+                self._record(f"{owner}.expert_weights", args[0])
         return result
 
 
@@ -92,6 +113,11 @@ def collect_calibration_samples(
         boundary.fqn
         for boundary in graph_metadata.boundaries
         if boundary.kind == "attention"
+    )
+    moe_fqns = tuple(
+        boundary.fqn
+        for boundary in graph_metadata.boundaries
+        if boundary.kind == "moe"
     )
     captured: dict[str, list[Tensor]] = {}
     observed = 0
@@ -126,7 +152,11 @@ def collect_calibration_samples(
                 raise QuantizationConfigError(
                     f"Calibration value {name!r} contains NaN or Inf"
                 )
-        recorder = _CalibrationInterpreter(graph, attention_fqns)
+        recorder = _CalibrationInterpreter(
+            graph,
+            attention_fqns,
+            moe_fqns,
+        )
         try:
             with torch.inference_mode():
                 recorder.run(*(batch[name] for name in expected))

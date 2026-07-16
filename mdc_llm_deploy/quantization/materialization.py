@@ -73,6 +73,7 @@ def _activation_parameters(
 
 
 def _materialize_weight(
+    candidate: GraphModule,
     parameter: Tensor,
     target: TargetPlan,
     calibration: Mapping[str, Tensor],
@@ -88,6 +89,14 @@ def _materialize_weight(
     )
     fallback_reason: str | None = None
     if target.algorithm == "gptq":
+        if (
+            target.target_type == "moe"
+            and target.parameter_name is not None
+            and target.parameter_name.endswith(".expert_weights")
+        ):
+            raise QuantizationConfigError(
+                "GPTQ does not support packed MoeExpert weights"
+            )
         samples = _required_sample(calibration, target.fqn)
         try:
             result = gptq_weight_quantize(
@@ -116,8 +125,65 @@ def _materialize_weight(
             symmetric=target.weight.symmetric,
             axis=axis,
         )
-    with torch.no_grad():
-        parameter.copy_(result.dequantized)
+    if (
+        target.target_type == "moe"
+        and target.parameter_name is not None
+        and target.parameter_name.endswith(".expert_weights")
+    ):
+        module_name = target.parameter_name.rsplit(".", 1)[0]
+        module = candidate.get_submodule(module_name)
+        expert_count = int(parameter.shape[0])
+        scales = result.scale.reshape(-1)
+        if scales.numel() == 1:
+            scales = scales.repeat(expert_count * 3)
+        if scales.numel() != expert_count * 3:
+            raise QuantizationConfigError(
+                "Packed MoeExpert requires one scale per projection"
+            )
+        module.register_parameter(
+            "expert_weights",
+            torch.nn.Parameter(
+                result.values.detach().clone(),
+                requires_grad=False,
+            ),
+        )
+        module.register_parameter(
+            "quant_scales",
+            torch.nn.Parameter(
+                scales.reshape(expert_count, 3).float(),
+                requires_grad=False,
+            ),
+        )
+        scale_name = f"{module_name}.quant_scales"
+        for node in candidate.graph.nodes:
+            if (
+                node.op != "call_function"
+                or node.target
+                != torch.ops.mdc_llm_deploy.moe_expert.default
+                or len(node.args) < 4
+            ):
+                continue
+            packed = node.args[3]
+            if (
+                getattr(packed, "op", None) != "get_attr"
+                or getattr(packed, "target", None)
+                != target.parameter_name
+            ):
+                continue
+            with candidate.graph.inserting_before(node):
+                scale_node = candidate.graph.get_attr(scale_name)
+            arguments = list(node.args)
+            arguments.extend([None] * (6 - len(arguments)))
+            arguments[4] = scale_node
+            node.args = tuple(arguments)
+            break
+        else:
+            raise QuantizationConfigError(
+                "Packed MoeExpert node disappeared during materialization"
+            )
+    else:
+        with torch.no_grad():
+            parameter.copy_(result.dequantized)
     return result, fallback_reason
 
 
@@ -172,6 +238,7 @@ def materialize_target(
     result: QuantizedTensor | None = None
     if parameter is not None and target.weight is not None:
         result, fallback_reason = _materialize_weight(
+            candidate,
             parameter,
             target,
             calibration,

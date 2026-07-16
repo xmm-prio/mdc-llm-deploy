@@ -15,6 +15,8 @@ from ..errors import OnnxExportError
 from ..fx_inspection import linear_weight_name
 from ..graph_types import GraphMetadata
 from ..onnx_protocol import MDC_ONNX_OPSET
+from ..operator_schema import OPERATOR_SCHEMAS
+from .validator import validate_mdc_model
 
 _TORCH_DTYPES = {
     "float16": torch.float16,
@@ -31,6 +33,29 @@ _FLOAT_ONNX_DTYPES: set[int] = {
     int(TensorProto.FLOAT),
     int(TensorProto.BFLOAT16),
 }
+
+
+def _seed_custom_value_info(model: onnx.ModelProto) -> None:
+    """Seed shape propagation across custom operators with identity-shaped output."""
+    values = {
+        item.name: item
+        for item in (
+            *model.graph.input,
+            *model.graph.output,
+            *model.graph.value_info,
+        )
+    }
+    for node in model.graph.node:
+        if node.op_type != "MoeExpert" or not node.input or not node.output:
+            continue
+        source = values.get(node.input[0])
+        if source is None or node.output[0] in values:
+            continue
+        output = onnx.ValueInfoProto()
+        output.CopyFrom(source)
+        output.name = node.output[0]
+        model.graph.value_info.append(output)
+        values[output.name] = output
 
 
 class _PositionalGraph(torch.nn.Module):
@@ -142,13 +167,23 @@ def export_standard_onnx(
             )
             standard = onnx.load(temporary, load_external_data=True)
             _restore_linear_initializer_names(standard, graph)
-            onnx.checker.check_model(standard, full_check=True)
+            custom_names = {
+                schema.onnx_name for schema in OPERATOR_SCHEMAS.values()
+            }
+            contains_custom = any(
+                node.op_type in custom_names for node in standard.graph.node
+            )
+            if contains_custom:
+                _seed_custom_value_info(standard)
             standard = shape_inference.infer_shapes(
                 standard,
-                strict_mode=True,
+                strict_mode=not contains_custom,
                 data_prop=True,
             )
-            onnx.checker.check_model(standard, full_check=True)
+            if contains_custom:
+                validate_mdc_model(standard)
+            else:
+                onnx.checker.check_model(standard, full_check=True)
             return standard
     except OnnxExportError:
         raise

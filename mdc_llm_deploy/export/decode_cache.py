@@ -14,6 +14,7 @@ from ..graph_types import GraphMetadata, QuantizedTarget
 def cache_target(
     value: GraphMetadata,
     edge: str,
+    layer_id: int | None = None,
 ) -> QuantizedTarget | None:
     """Return the unique quantization target for one cache edge."""
     matches = [
@@ -21,6 +22,10 @@ def cache_target(
         for target in value.quantized_targets
         if target.target_type == "attention"
         and target.fqn.rsplit(".", 1)[-1] == edge
+        and (
+            layer_id is None
+            or f".layers.{layer_id}." in f".{target.fqn}."
+        )
     ]
     if len(matches) > 1:
         raise UnsupportedPatternError(

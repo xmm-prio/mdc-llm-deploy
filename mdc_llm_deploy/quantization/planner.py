@@ -37,7 +37,11 @@ class TargetPlan:
 
 def _is_moe_parameter(name: str) -> bool:
     lowered = name.lower()
-    return "experts." in lowered or "shared_expert" in lowered
+    return (
+        "experts." in lowered
+        or "shared_expert" in lowered
+        or lowered.endswith(".expert_weights")
+    )
 
 
 def _linear_weight_names(graph: GraphModule) -> frozenset[str]:
@@ -63,7 +67,12 @@ def _moe_parameters(graph: GraphModule) -> tuple[str, ...]:
     return tuple(
         name
         for name, parameter in graph.named_parameters()
-        if name in linear_weights and parameter.ndim == 2 and _is_moe_parameter(name)
+        if parameter.ndim == 2
+        and _is_moe_parameter(name)
+        and (
+            name in linear_weights
+            or name.endswith(".expert_weights")
+        )
     )
 
 

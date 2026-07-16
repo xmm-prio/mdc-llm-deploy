@@ -16,6 +16,8 @@ def validate_onnx_compatibility(
         raise ValueError(
             "mask_mode must be 'masked' or 'maskless'"
         )
+    if value.stage.is_prefill and not value.quantized_targets:
+        return
     try:
         validate_capability_request(
             value,

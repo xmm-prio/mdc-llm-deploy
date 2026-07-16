@@ -17,6 +17,7 @@ from ..graph import (
     set_metadata,
 )
 from ..graph_types import GRAPH_SCHEMA_VERSION, GraphMetadata, GraphStage
+from ..operator_schema import TORCH_NAMESPACE
 from .decode import convert_to_decode as convert_to_decode
 from .discovery import discover_metadata
 
@@ -29,6 +30,7 @@ def _validate_aten_graph(graph: GraphModule) -> None:
         or (
             node.op == "call_function"
             and "aten::" not in node_target(node)
+            and f"{TORCH_NAMESPACE}::" not in node_target(node)
             and node.target is not operator.getitem
         )
     ]

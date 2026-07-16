@@ -1,10 +1,9 @@
-"""Validated and atomic persistence for MDC ONNX artifacts."""
+"""Validated atomic persistence for ONNX and external tensor data."""
 
 from __future__ import annotations
 
 import os
 import tempfile
-from contextlib import suppress
 from pathlib import Path
 
 import onnx
@@ -17,37 +16,41 @@ def commit_validated_onnx(
     model: onnx.ModelProto,
     target: Path,
     *,
-    overwrite: bool,
+    external_data: bool,
 ) -> onnx.ModelProto:
-    """Serialize, validate, and atomically replace an ONNX artifact."""
-    descriptor = -1
-    temporary: Path | None = None
+    """Validate temporary artifacts and atomically replace final paths."""
+    data_target = target.with_name(f"{target.name}.data")
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
+        with tempfile.TemporaryDirectory(
             prefix=f".{target.stem}.",
-            suffix=".onnx.tmp",
             dir=target.parent,
-        )
-        temporary = Path(temporary_name)
-        os.close(descriptor)
-        descriptor = -1
-        onnx.save_model(model, temporary)
-        validated = validate_serialized_model(str(temporary))
-        if overwrite:
-            os.replace(temporary, target)
-        elif os.name == "nt":
-            os.rename(temporary, target)
-        else:
-            os.link(temporary, target)
-        return validated
-    except (FileExistsError, OnnxExportError):
+            ignore_cleanup_errors=True,
+        ) as directory:
+            temporary_model = Path(directory) / target.name
+            temporary_data = Path(directory) / data_target.name
+            if external_data:
+                onnx.save_model(
+                    model,
+                    temporary_model,
+                    save_as_external_data=True,
+                    all_tensors_to_one_file=True,
+                    location=data_target.name,
+                    size_threshold=0,
+                    convert_attribute=False,
+                )
+            else:
+                onnx.save_model(model, temporary_model)
+            validate_serialized_model(str(temporary_model))
+            if external_data and temporary_data.is_file():
+                os.replace(temporary_data, data_target)
+            elif data_target.exists():
+                data_target.unlink()
+            os.replace(temporary_model, target)
+        return onnx.load(target, load_external_data=True)
+    except OnnxExportError:
         raise
     except Exception as error:
         raise OnnxExportError(f"ONNX export failed: {error}") from error
-    finally:
-        if descriptor >= 0:
-            with suppress(OSError):
-                os.close(descriptor)
-        if temporary is not None:
-            with suppress(OSError):
-                temporary.unlink(missing_ok=True)
+
+
+__all__ = ["commit_validated_onnx"]
