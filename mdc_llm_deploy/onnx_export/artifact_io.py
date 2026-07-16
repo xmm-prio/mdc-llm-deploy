@@ -9,7 +9,7 @@ from pathlib import Path
 import onnx
 
 from ..errors import OnnxExportError
-from .validator import validate_serialized_model
+from .validation.model import validate_serialized_model
 
 
 def commit_validated_onnx(

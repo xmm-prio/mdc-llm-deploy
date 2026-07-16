@@ -7,12 +7,12 @@ import math
 import onnx
 from onnx import TensorProto, numpy_helper
 
-from ..errors import OnnxExportError
-from ..operator_schema import schema_for_onnx_name
-from .attention_validation import validate_attention_operator
-from .model_inspection import (
+from ...errors import OnnxExportError
+from ...operator_schema import schema_for_onnx_name
+from ..model_inspection import (
     require_attributes as _require_attributes,
 )
+from .attention import validate_attention_operator
 
 
 def validate_operator(

@@ -5,7 +5,10 @@ from __future__ import annotations
 import ast
 import inspect
 
-from mdc_llm_deploy.onnx_export import api, attention_lowering
+from mdc_llm_deploy.onnx_export import api
+from mdc_llm_deploy.onnx_export.lowering import (
+    attention as attention_lowering,
+)
 
 
 def test_attention_lowering_exposes_public_stage_entries_without_api_dependency() -> None:

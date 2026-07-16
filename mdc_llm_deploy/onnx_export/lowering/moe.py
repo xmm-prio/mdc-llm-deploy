@@ -8,9 +8,9 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from ..errors import OnnxExportError
-from ..graph_types import GraphMetadata
-from .lowering_support import (
+from ...errors import OnnxExportError
+from ...graph_types import GraphMetadata
+from .support import (
     activation_target,
     append_quant,
     append_value,

@@ -9,16 +9,19 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper
 
-from ..attention_layout import (
+from ...attention_layout import (
     ATTENTION_INPUT_COUNT,
     RELEASE_ATTENTION_ATTRIBUTES,
     AttentionInput,
 )
-from ..errors import OnnxExportError
-from ..graph_types import GraphMetadata, QuantizedTarget
-from ..model_properties import AttentionDimensions
-from .graph_cleanup import producer_map, replace_nodes
-from .lowering_support import (
+from ...errors import OnnxExportError
+from ...graph_types import GraphMetadata, QuantizedTarget
+from ...model_properties import AttentionDimensions
+from ..model_inspection import (
+    optional_static_shape as static_shape,
+)
+from .cleanup import producer_map, replace_nodes
+from .support import (
     append_quant,
     append_value,
     initializer,
@@ -26,9 +29,6 @@ from .lowering_support import (
     offset_initializer,
     scale_initializer,
     unique_name,
-)
-from .model_inspection import (
-    optional_static_shape as static_shape,
 )
 
 MaskMode = Literal["masked", "maskless"]
@@ -101,6 +101,9 @@ def lower_maskless_attention(model: onnx.ModelProto) -> None:
 def lower_rms_norms(model: onnx.ModelProto, value: GraphMetadata) -> None:
     """Replace every FQN-owned Tiny RMSNorm terminal with NPURmsNorm."""
     types = model_types(model)
+    initializers = {
+        item.name: item for item in model.graph.initializer
+    }
     nodes = list(model.graph.node)
     removed: set[int] = set()
     replacements: dict[int, list[onnx.NodeProto]] = {}
@@ -109,6 +112,11 @@ def lower_rms_norms(model: onnx.ModelProto, value: GraphMetadata) -> None:
         raise OnnxExportError("MDC ONNX lowering requires an RmsNorm boundary")
     for boundary in boundaries:
         gamma = f"graph.{boundary.fqn}.weight"
+        gamma_tensor = initializers.get(gamma)
+        if gamma_tensor is None:
+            raise OnnxExportError(
+                f"RmsNorm gamma {gamma!r} must be an initializer"
+            )
         matches = [node for node in nodes if node.op_type == "Mul" and gamma in node.input]
         if len(matches) != 1:
             raise OnnxExportError(
@@ -163,23 +171,6 @@ def lower_rms_norms(model: onnx.ModelProto, value: GraphMetadata) -> None:
                         "RmsNorm lowering requires positive hidden_size"
                     )
                 shape = (1, sequence, hidden_size)
-            initializer_by_name = {
-                item.name: item for item in model.graph.initializer
-            }
-            gamma_source = gamma
-            gamma_producer = producer_map(model).get(gamma_source)
-            while (
-                gamma_source not in initializer_by_name
-                and gamma_producer is not None
-                and gamma_producer.op_type == "Identity"
-            ):
-                gamma_source = gamma_producer.input[0]
-                gamma_producer = producer_map(model).get(gamma_source)
-            gamma_tensor = initializer_by_name.get(gamma_source)
-            if gamma_tensor is None:
-                raise OnnxExportError(
-                    f"RmsNorm gamma {gamma!r} lacks initializer metadata"
-                )
             append_value(model, source, gamma_tensor.data_type, shape)
             append_value(
                 model,

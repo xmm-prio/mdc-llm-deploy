@@ -16,7 +16,7 @@ from ..fx_inspection import linear_weight_name
 from ..graph_types import GraphMetadata
 from ..onnx_protocol import MDC_ONNX_OPSET
 from ..operator_schema import OPERATOR_SCHEMAS
-from .validator import validate_mdc_model
+from .validation.model import validate_mdc_model
 
 _TORCH_DTYPES = {
     "float16": torch.float16,
@@ -136,6 +136,86 @@ def _restore_linear_initializer_names(
                     node.input[index] = new_name
 
 
+def _fold_initializer_alias(
+    model: onnx.ModelProto,
+    canonical_name: str,
+) -> str | None:
+    """Fold an Identity-exported parameter value into its initializer."""
+    initializers = {item.name: item for item in model.graph.initializer}
+    if canonical_name in initializers:
+        return None
+    producers = {
+        output: node for node in model.graph.node for output in node.output
+    }
+    aliases: set[str] = set()
+    source = canonical_name
+    identities: list[onnx.NodeProto] = []
+    while source not in initializers:
+        producer = producers.get(source)
+        if (
+            producer is None
+            or producer.op_type != "Identity"
+            or len(producer.input) != 1
+            or len(producer.output) != 1
+        ):
+            raise OnnxExportError(
+                f"Parameter {canonical_name!r} is not backed by an initializer"
+            )
+        identities.append(producer)
+        aliases.add(source)
+        source = producer.input[0]
+    initializer = onnx.TensorProto()
+    initializer.CopyFrom(initializers[source])
+    initializer.name = canonical_name
+    model.graph.initializer.append(initializer)
+    identity_ids = {id(node) for node in identities}
+    for node in model.graph.node:
+        if id(node) in identity_ids:
+            continue
+        for index, input_name in enumerate(node.input):
+            if input_name in aliases:
+                node.input[index] = canonical_name
+    for identity in identities:
+        model.graph.node.remove(identity)
+    retained_values = [
+        item
+        for item in model.graph.value_info
+        if item.name not in aliases or item.name == canonical_name
+    ]
+    del model.graph.value_info[:]
+    model.graph.value_info.extend(retained_values)
+    return source
+
+
+def _fold_rms_norm_initializers(
+    model: onnx.ModelProto,
+    metadata: GraphMetadata,
+) -> None:
+    """Make every RmsNorm weight a direct canonical initializer."""
+    alias_sources: set[str] = set()
+    for boundary in metadata.boundaries:
+        if boundary.kind == "rms_norm":
+            source = _fold_initializer_alias(
+                model,
+                f"graph.{boundary.fqn}.weight",
+            )
+            if source is not None:
+                alias_sources.add(source)
+    used_inputs = {
+        input_name
+        for node in model.graph.node
+        for input_name in node.input
+        if input_name
+    }
+    retained_initializers = [
+        item
+        for item in model.graph.initializer
+        if item.name not in alias_sources or item.name in used_inputs
+    ]
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(retained_initializers)
+
+
 def export_standard_onnx(
     graph: GraphModule,
     metadata: GraphMetadata,
@@ -167,6 +247,7 @@ def export_standard_onnx(
             )
             standard = onnx.load(temporary, load_external_data=True)
             _restore_linear_initializer_names(standard, graph)
+            _fold_rms_norm_initializers(standard, metadata)
             custom_names = {
                 schema.onnx_name for schema in OPERATOR_SCHEMAS.values()
             }

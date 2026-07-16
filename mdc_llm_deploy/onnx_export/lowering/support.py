@@ -9,12 +9,12 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from ..errors import OnnxExportError
-from ..graph_types import GraphMetadata, QuantizedTarget
-from ..quantization_properties import (
+from ...errors import OnnxExportError
+from ...graph_types import GraphMetadata, QuantizedTarget
+from ...quantization_properties import (
     ActivationQuantizationParameters,
 )
-from .model_inspection import (
+from ..model_inspection import (
     optional_static_shape as static_shape,
 )
 

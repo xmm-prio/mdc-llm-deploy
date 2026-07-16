@@ -4,7 +4,7 @@ import pytest
 from onnx import helper
 
 from mdc_llm_deploy.errors import OnnxExportError
-from mdc_llm_deploy.onnx_export.operator_validation import (
+from mdc_llm_deploy.onnx_export.validation.operator import (
     validate_operator,
 )
 

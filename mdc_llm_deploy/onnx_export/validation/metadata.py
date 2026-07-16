@@ -6,9 +6,9 @@ from dataclasses import dataclass
 
 import onnx
 
-from ..capabilities import Algorithm, ModelKind, Target
-from ..errors import OnnxExportError
-from ..graph_types import GRAPH_SCHEMA_VERSION, GraphStage
+from ...capabilities import Algorithm, ModelKind, Target
+from ...errors import OnnxExportError
+from ...graph_types import GRAPH_SCHEMA_VERSION, GraphStage
 
 
 @dataclass(frozen=True, slots=True)

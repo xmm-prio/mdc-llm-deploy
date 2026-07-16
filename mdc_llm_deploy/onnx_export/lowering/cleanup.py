@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import onnx
 
-from ..errors import OnnxExportError
-from .model_inspection import (
+from ...errors import OnnxExportError
+from ..model_inspection import (
     optional_static_shape as static_shape,
 )
-from .topology_validation import CUSTOM_OPS, STANDARD_DOMAINS
+from ..validation.topology import CUSTOM_OPS, STANDARD_DOMAINS
 
 
 def producer_map(model: onnx.ModelProto) -> dict[str, onnx.NodeProto]:

@@ -14,24 +14,25 @@ from ..graph import metadata
 from ..graph_types import GraphMetadata
 from ..onnx_protocol import MDC_ONNX_OPSET
 from .artifact_io import commit_validated_onnx
-from .attention_lowering import (
+from .lowering.attention import (
     MaskMode as MaskMode,
 )
-from .attention_lowering import (
+from .lowering.attention import (
     lower_maskless_attention,
     lower_rms_norms,
     lower_rope_attention,
 )
-from .compatibility import validate_onnx_compatibility
-from .graph_cleanup import (
+from .lowering.cleanup import (
     prune_unreachable,
     remove_dynamic_value_info,
     topologically_sort,
 )
-from .linear_lowering import append_quantized_linears
-from .moe_lowering import adapt_quantized_moe
+from .lowering.linear import append_quantized_linears
+from .lowering.moe import adapt_quantized_moe
+from .lowering.output import retain_logits_output
 from .standard_export import export_standard_onnx
-from .validator import validate_mdc_model
+from .validation.compatibility import validate_onnx_compatibility
+from .validation.model import validate_mdc_model
 
 
 def _lower(
@@ -78,6 +79,8 @@ def _lower(
         )
     append_quantized_linears(model, value)
     adapt_quantized_moe(model, value)
+    if value.output_abi and value.output_abi[0].name == "logits":
+        retain_logits_output(model)
     prune_unreachable(model)
     topologically_sort(model)
     algorithms = sorted({item.algorithm for item in value.quantized_targets}) or ["fp16"]

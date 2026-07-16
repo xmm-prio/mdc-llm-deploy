@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from ..errors import OnnxExportError, UnsupportedPatternError
-from ..graph import validate_capability_request
-from ..graph_types import GraphMetadata
+from ...errors import OnnxExportError, UnsupportedPatternError
+from ...graph import validate_capability_request
+from ...graph_types import GraphMetadata
 
 
 def validate_onnx_compatibility(

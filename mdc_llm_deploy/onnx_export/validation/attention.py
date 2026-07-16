@@ -7,15 +7,15 @@ import math
 import onnx
 from onnx import TensorProto, numpy_helper
 
-from ..attention_layout import (
+from ...attention_layout import (
     ATTENTION_INPUT_COUNT,
     ATTENTION_OUTPUT_COUNT,
     RELEASE_ATTENTION_ATTRIBUTES,
     AttentionInput,
 )
-from ..errors import OnnxExportError
-from .model_inspection import require_attributes
-from .model_inspection import static_shape as _shape
+from ...errors import OnnxExportError
+from ..model_inspection import require_attributes
+from ..model_inspection import static_shape as _shape
 
 
 def validate_attention_operator(
@@ -93,8 +93,25 @@ def _validate_mask_initializer(
     mask = initializers.get(attention.input[AttentionInput.ATTEN_MASK])
     if mask is None or mask.data_type != TensorProto.BOOL:
         raise OnnxExportError("Attention mask must be a BOOL initializer")
-    cache_shape = _shape(model.graph.output[1])
-    query_length = _shape(model.graph.output[0])[1]
+    values = {
+        item.name: item
+        for item in (
+            *model.graph.input,
+            *model.graph.output,
+            *model.graph.value_info,
+        )
+    }
+    query = values.get(attention.input[AttentionInput.QUERY])
+    key = values.get(attention.input[AttentionInput.KEY])
+    if query is None or key is None:
+        raise OnnxExportError(
+            "Attention mask validation requires typed query and key inputs"
+        )
+    query_shape = _shape(query)
+    cache_shape = _shape(key)
+    if len(query_shape) != 4 or len(cache_shape) != 4:
+        raise OnnxExportError("Attention mask inputs must use rank 4")
+    query_length = query_shape[2]
     expected = (1, 1, query_length, cache_shape[2])
     if tuple(mask.dims) != expected:
         raise OnnxExportError(f"{stage} attention mask shape must be {expected}")
