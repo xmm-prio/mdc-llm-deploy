@@ -14,7 +14,9 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.parametrize("layers", [1, 2])
-def test_dense_export_preserves_per_layer_kv_outputs(layers: int) -> None:
+def test_dense_fx_export_preserves_internal_per_layer_kv_outputs(
+    layers: int,
+) -> None:
     model = dense_model(8, layers=layers)
     inputs = {"input_ids": torch.arange(8).reshape(1, 8)}
     expected = model(**inputs)

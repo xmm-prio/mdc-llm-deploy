@@ -68,12 +68,12 @@ onnx_export(prefill, "qwen3-decode.onnx")
 ```
 
 `export()` 捕获静态 FX 图，并按 RMSNorm、RoPE、FIA 顺序规范化。未命中融合模式时保留标准
-小算子。每层 KV 输出命名为 `present.N.key/value`；decode 输入命名为
-`past.N.key/value`。
+小算子。FX 图内部暂存每层 KV，供 decode 重写和 ONNX lowering 使用；最终 prefill、decode
+ONNX 均只输出 `logits`。decode 输入保留 `past.N.key/value`，缓存由调用方提供。
 
-`onnx_export(graph, output_path, *, external_data=True)` 保留 FX 输入输出顺序，验证后原子
-覆盖目标。默认 external data 文件名为 `<模型文件名>.data`。mask 语义来自构造模型时的
-`ExportModelConfig`，ONNX API 不再接受 mask 选择参数。
+`onnx_export(graph, output_path, *, external_data=True)` 保留 FX 输入顺序，并将公开输出收敛为
+`logits`，验证后原子覆盖目标。默认 external data 文件名为 `<模型文件名>.data`。mask
+语义来自构造模型时的 `ExportModelConfig`，ONNX API 不再接受 mask 选择参数。
 
 ## MoE ABI
 

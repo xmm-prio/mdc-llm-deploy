@@ -30,7 +30,9 @@ from mdc_llm_deploy.models import (
     Qwen3MoeForCausalLM,
 )
 from mdc_llm_deploy.onnx_export import onnx_export
-from mdc_llm_deploy.onnx_export.validator import validate_serialized_model
+from mdc_llm_deploy.onnx_export.validation.model import (
+    validate_serialized_model,
+)
 from mdc_llm_deploy.quantization import oneshot
 
 ROOT = Path(__file__).parents[1]

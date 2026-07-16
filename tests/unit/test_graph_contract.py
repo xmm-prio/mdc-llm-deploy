@@ -302,7 +302,7 @@ def test_empty_fusion_boundary_nodes_remain_valid() -> None:
 
 
 def test_onnx_activation_qparams_accept_frozen_mapping_and_tuples() -> None:
-    from mdc_llm_deploy.onnx_export.lowering_support import activation_target
+    from mdc_llm_deploy.onnx_export.lowering.support import activation_target
 
     target = _quantized_target()
     value = _metadata(

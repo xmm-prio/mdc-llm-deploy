@@ -74,11 +74,7 @@ def test_onnx_semantics_come_from_model_config(
     assert target.is_file()
     assert (tmp_path / f"{mask_mode}.onnx.data").is_file()
     assert [item.name for item in model.graph.input] == ["input_ids"]
-    assert [item.name for item in model.graph.output] == [
-        "logits",
-        "present.0.key",
-        "present.0.value",
-    ]
+    assert [item.name for item in model.graph.output] == ["logits"]
     onnx.load(target, load_external_data=True)
 
 
@@ -109,14 +105,26 @@ def test_two_layer_onnx_contains_per_layer_custom_operators(
     counts = {
         op_type: sum(node.op_type == op_type for node in model.graph.node)
         for op_type in (
+            "NPURmsNorm",
             "FusedInferAttentionScore",
             "ApplyRotaryPosEmb",
         )
     }
     assert counts == {
+        "NPURmsNorm": 9,
         "FusedInferAttentionScore": 2,
         "ApplyRotaryPosEmb": 2,
     }
+    initializers = {item.name for item in model.graph.initializer}
+    rms_nodes = [
+        node for node in model.graph.node if node.op_type == "NPURmsNorm"
+    ]
+    assert all(
+        node.input[1] in initializers
+        and node.input[1].startswith("graph.")
+        and node.input[1].endswith(".weight")
+        for node in rms_nodes
+    )
 
 
 def test_float_moe_exports_one_expert_major_custom_node(
@@ -196,7 +204,7 @@ def test_oneshot_moe_exports_int8_packed_weights(
     assert producers[node.input[1]].op_type == "Cast"
 
 
-def test_two_layer_decode_preserves_every_cache_name(
+def test_two_layer_decode_accepts_every_cache_and_only_returns_logits(
     tmp_path: Path,
 ) -> None:
     graph = export(
@@ -214,13 +222,7 @@ def test_two_layer_decode_preserves_every_cache_name(
         "past.1.key",
         "past.1.value",
     ]
-    assert [item.name for item in model.graph.output] == [
-        "logits",
-        "present.0.key",
-        "present.0.value",
-        "present.1.key",
-        "present.1.value",
-    ]
+    assert [item.name for item in model.graph.output] == ["logits"]
     assert sum(
         node.op_type == "FusedInferAttentionScore"
         for node in model.graph.node
