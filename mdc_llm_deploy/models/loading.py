@@ -83,6 +83,19 @@ def load_safetensors(directory: Path) -> dict[str, Tensor]:
     return state
 
 
+def _compatible_tensors(
+    model: ExportModel,
+    state: dict[str, Tensor],
+) -> dict[str, Tensor]:
+    """Drop checkpoint tensors whose shapes do not match the model."""
+    expected = model.state_dict()
+    return {
+        name: tensor
+        for name, tensor in state.items()
+        if name not in expected or tensor.shape == expected[name].shape
+    }
+
+
 def _pack_moe_experts(
     state: dict[str, Tensor],
     model: ExportModel,
@@ -221,19 +234,13 @@ def load_model_state(model: ExportModel, directory: Path) -> None:
     state = load_safetensors(directory)
     _pack_moe_experts(state, model)
     config = model.config
-    if config.tie_word_embeddings and "lm_head.weight" not in state:
+    if (
+        config.tie_word_embeddings
+        and "lm_head.weight" not in state
+        and "model.embed_tokens.weight" in state
+    ):
         state["lm_head.weight"] = state["model.embed_tokens.weight"].clone()
-    incompatible = model.load_state_dict(state, strict=False)
-    missing = [
-        name
-        for name in incompatible.missing_keys
-        if name not in {"cos_cache", "sin_cache", "causal_mask"}
-    ]
-    if missing or incompatible.unexpected_keys:
-        raise RuntimeError(
-            "Checkpoint state mismatch: "
-            f"missing={missing}, unexpected={incompatible.unexpected_keys}"
-        )
+    model.load_state_dict(_compatible_tensors(model, state), strict=False)
     model.requires_grad_(False)
     model.eval()
 

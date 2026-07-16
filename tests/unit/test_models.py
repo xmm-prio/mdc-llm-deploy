@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -137,6 +137,51 @@ def test_auto_model_loads_single_safetensors_checkpoint(tmp_path: Path) -> None:
     assert isinstance(loaded, Qwen3ForCausalLM)
     for name, value in source.state_dict().items():
         torch.testing.assert_close(loaded.state_dict()[name], value)
+
+
+def test_auto_model_tolerates_checkpoint_state_mismatches(tmp_path: Path) -> None:
+    source = dense_model(4)
+    config = dense_config()
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                name: getattr(config, name)
+                for name in config.__dataclass_fields__
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = {
+        name: value.detach().clone()
+        for name, value in source.state_dict().items()
+        if name
+        not in {
+            "cos_cache",
+            "sin_cache",
+            "causal_mask",
+            "model.embed_tokens.weight",
+        }
+    }
+    state["model.norm.weight"] = torch.full_like(
+        state["model.norm.weight"],
+        3,
+    )
+    state["lm_head.weight"] = torch.ones(1, 1)
+    state["unexpected.weight"] = torch.ones(1)
+    save_file(state, tmp_path / "model.safetensors")
+
+    loaded = AutoExportModel.from_pretrained(
+        tmp_path,
+        ExportModelConfig(4),
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(
+        loaded.model.norm.weight,
+        torch.full_like(loaded.model.norm.weight, 3),
+    )
+    assert loaded.model.embed_tokens.weight.shape == (128, 64)
+    assert loaded.lm_head.weight.shape == (128, 64)
 
 
 def test_loader_reads_indexed_safetensors_shards(tmp_path: Path) -> None:
