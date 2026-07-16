@@ -78,7 +78,7 @@ class MoeExpertLayout:
         candidate = fqn.rsplit(".", 1)[-1]
         if candidate not in self.projections:
             return None
-        return cast(Projection, candidate)
+        return candidate
 
     def _validate_expert(self, expert_id: int) -> None:
         self._require_int("expert_id", expert_id)

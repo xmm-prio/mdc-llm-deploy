@@ -6,6 +6,7 @@ from collections.abc import Mapping
 
 import numpy as np
 import onnx
+from numpy.typing import NDArray
 from onnx import TensorProto, helper, numpy_helper
 
 from ...errors import OnnxExportError
@@ -24,7 +25,7 @@ def _intermediate_scales(
     value: GraphMetadata,
     target_fqn: str,
     expert_count: int,
-) -> np.ndarray:
+) -> NDArray[np.float32]:
     activation = value.properties.get("activation_qparams")
     if not isinstance(activation, Mapping):
         raise OnnxExportError("MoeExpert activation qparams are missing")

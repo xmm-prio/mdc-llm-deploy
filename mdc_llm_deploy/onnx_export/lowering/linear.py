@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import onnx
+from numpy.typing import NDArray
 from onnx import TensorProto, helper, numpy_helper
 
 from ...errors import OnnxExportError
@@ -26,7 +27,7 @@ from .support import (
 def _linear_weight_array(
     node: onnx.NodeProto,
     weight: onnx.TensorProto,
-) -> np.ndarray:
+) -> NDArray[np.float32]:
     array = numpy_helper.to_array(weight).astype(np.float32)
     if node.op_type == "MatMul":
         return array

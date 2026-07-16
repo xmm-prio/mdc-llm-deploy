@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 import onnx
+from numpy.typing import NDArray
 from onnx import TensorProto, helper, numpy_helper
 
 from ...errors import OnnxExportError
@@ -36,7 +37,7 @@ _ONNX_DTYPES = {
 _NP_FLOAT32 = np.dtype(np.float32)
 
 
-def initializer(name: str, value: np.ndarray) -> onnx.TensorProto:
+def initializer(name: str, value: NDArray[Any]) -> onnx.TensorProto:
     """Create a contiguous named ONNX initializer."""
     return numpy_helper.from_array(np.ascontiguousarray(value), name=name)
 

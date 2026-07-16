@@ -35,7 +35,7 @@ def _required(value: Mapping[str, Any], fields: set[str], context: str) -> None:
 def _plain_int(value: Any, context: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise QuantizationConfigError(f"{context} must be an integer")
-    return cast(int, value)
+    return value
 
 
 def _plain_bool(value: Any, context: str) -> bool:

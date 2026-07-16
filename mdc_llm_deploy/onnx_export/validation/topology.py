@@ -22,6 +22,9 @@ def quantized_target_families(
     model: onnx.ModelProto,
 ) -> frozenset[str]:
     """Infer quantized target families from validated graph topology."""
+    initializers = {
+        item.name: item for item in model.graph.initializer
+    }
     producers = {
         output: node
         for node in model.graph.node
@@ -29,37 +32,63 @@ def quantized_target_families(
         if output
     }
     result: set[str] = set()
-    if any(
-        node.op_type == "MoeExpert"
+    moe_nodes = [
+        node
         for node in model.graph.node
-    ):
-        result.add("moe")
-    attention = next(
-        (
-            node
-            for node in model.graph.node
-            if node.op_type == "FusedInferAttentionScore"
-        ),
-        None,
-    )
-    if attention is not None and any(
-        attention.input[index]
-        for index in (
-            AttentionInput.DEQUANT_SCALE1,
-            AttentionInput.QUANT_SCALE1,
-            AttentionInput.DEQUANT_SCALE2,
-            AttentionInput.QUANT_SCALE2,
-            AttentionInput.QUANT_OFFSET2,
-            AttentionInput.ANTIQUANT_SCALE,
-            AttentionInput.ANTIQUANT_OFFSET,
-            AttentionInput.KEY_ANTIQUANT_SCALE,
-            AttentionInput.KEY_ANTIQUANT_OFFSET,
-            AttentionInput.VALUE_ANTIQUANT_SCALE,
-            AttentionInput.VALUE_ANTIQUANT_OFFSET,
-            AttentionInput.KEY_ROPE_ANTIQUANT_SCALE,
-            AttentionInput.DEQUANT_SCALE_QUERY,
+        if node.op_type == "MoeExpert"
+    ]
+    quantized_moe_nodes = [
+        node
+        for node in moe_nodes
+        if (
+            len(node.input) > 4
+            and bool(node.input[4])
+            and (weight := initializers.get(node.input[3])) is not None
+            and weight.data_type == onnx.TensorProto.INT8
         )
+    ]
+    if quantized_moe_nodes and len(quantized_moe_nodes) != len(moe_nodes):
+        raise OnnxExportError(
+            "MoeExpert quantization coverage is inconsistent"
+        )
+    if quantized_moe_nodes:
+        result.add("moe")
+    attention_quantization_inputs = (
+        AttentionInput.DEQUANT_SCALE1,
+        AttentionInput.QUANT_SCALE1,
+        AttentionInput.DEQUANT_SCALE2,
+        AttentionInput.QUANT_SCALE2,
+        AttentionInput.QUANT_OFFSET2,
+        AttentionInput.ANTIQUANT_SCALE,
+        AttentionInput.ANTIQUANT_OFFSET,
+        AttentionInput.KEY_ANTIQUANT_SCALE,
+        AttentionInput.KEY_ANTIQUANT_OFFSET,
+        AttentionInput.VALUE_ANTIQUANT_SCALE,
+        AttentionInput.VALUE_ANTIQUANT_OFFSET,
+        AttentionInput.KEY_ROPE_ANTIQUANT_SCALE,
+        AttentionInput.DEQUANT_SCALE_QUERY,
+    )
+    attention_nodes = [
+        node
+        for node in model.graph.node
+        if node.op_type == "FusedInferAttentionScore"
+    ]
+    quantized_attention_nodes = [
+        node
+        for node in attention_nodes
+        if any(
+            index < len(node.input) and bool(node.input[index])
+            for index in attention_quantization_inputs
+        )
+    ]
+    if (
+        quantized_attention_nodes
+        and len(quantized_attention_nodes) != len(attention_nodes)
     ):
+        raise OnnxExportError(
+            "Attention quantization coverage is inconsistent"
+        )
+    if quantized_attention_nodes:
         result.add("attention")
     for node in model.graph.node:
         if node.op_type != "AscendDequant" or not node.input:

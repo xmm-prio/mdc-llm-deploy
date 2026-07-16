@@ -30,10 +30,8 @@ from mdc_llm_deploy.models import (
     Qwen3MoeForCausalLM,
 )
 from mdc_llm_deploy.onnx_export import onnx_export
-from mdc_llm_deploy.onnx_export.validation.model import (
-    validate_serialized_model,
-)
 from mdc_llm_deploy.quantization import oneshot
+from tools.release_validation import validate_release_artifact
 
 ROOT = Path(__file__).parents[1]
 RELEASE_SEQUENCE_LENGTH = 3072
@@ -77,6 +75,25 @@ LOCAL_ONNX_MATRIX = tuple(
     and item.supports(Artifact.ONNX)
     and item.mask_mode is MaskMode.MASKED
 )
+_HASH_CHUNK_SIZE = 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactMember:
+    """Integrity metadata for one published artifact member."""
+
+    name: str
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactManifest:
+    """Stable integrity manifest for one published ONNX artifact."""
+
+    schema_version: int
+    members: tuple[ArtifactMember, ...]
+    bundle_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +102,7 @@ class MatrixArtifact:
 
     capability: Capability
     path: Path
-    sha256: str
+    manifest: ArtifactManifest
     config_sha256: str
     commit_sha: str
     sequence_length: int
@@ -100,6 +117,51 @@ def _canonical_json_sha256(value: object) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _artifact_member(path: Path) -> ArtifactMember:
+    """Stream one regular file into its integrity metadata."""
+    if not path.is_file():
+        raise ValueError(f"Artifact member is not a regular file: {path}")
+    digest = hashlib.sha256()
+    size_bytes = 0
+    try:
+        with path.open("rb") as stream:
+            while chunk := stream.read(_HASH_CHUNK_SIZE):
+                size_bytes += len(chunk)
+                digest.update(chunk)
+    except OSError as exc:
+        raise OSError(f"Unable to read artifact member: {path}") from exc
+    return ArtifactMember(
+        name=path.name,
+        size_bytes=size_bytes,
+        sha256=digest.hexdigest(),
+    )
+
+
+def _build_artifact_manifest(path: Path) -> ArtifactManifest:
+    """Build the fixed two-member release manifest for an ONNX artifact."""
+    members = (
+        _artifact_member(path),
+        _artifact_member(path.with_name(f"{path.name}.data")),
+    )
+    schema_version = 1
+    payload = {
+        "members": [
+            {
+                "name": member.name,
+                "sha256": member.sha256,
+                "size_bytes": member.size_bytes,
+            }
+            for member in members
+        ],
+        "schema_version": schema_version,
+    }
+    return ArtifactManifest(
+        schema_version=schema_version,
+        members=members,
+        bundle_sha256=_canonical_json_sha256(payload),
+    )
 
 
 def _configuration_sha256(capability: Capability) -> str:
@@ -160,7 +222,7 @@ def build_release_matrix(
     *,
     sequence_length: int = RELEASE_SEQUENCE_LENGTH,
 ) -> tuple[MatrixArtifact, ...]:
-    """Generate and structurally validate every FP16/MinMax ONNX combination.
+    """Generate and semantically validate every FP16/MinMax ONNX combination.
 
     Runs using a shorter explicit sequence length are test slices, not release
     validation. Callers must inspect ``release_qualified`` before summarizing.
@@ -197,12 +259,12 @@ def build_release_matrix(
             convert_to_decode(graph)
         path = output / f"{_name(capability, config_sha256, commit_sha)}.onnx"
         onnx_export(graph, path)
-        validate_serialized_model(str(path))
+        validate_release_artifact(path, capability)
         artifacts.append(
             MatrixArtifact(
                 capability=capability,
                 path=path,
-                sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                manifest=_build_artifact_manifest(path),
                 config_sha256=config_sha256,
                 commit_sha=commit_sha,
                 sequence_length=sequence_length,
