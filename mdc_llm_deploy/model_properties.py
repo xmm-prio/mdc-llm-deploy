@@ -69,7 +69,7 @@ class AttentionDimensions:
 
 @dataclass(frozen=True, slots=True)
 class MoeDimensions:
-    """Validated model dimensions required by Tiny MoE lowering."""
+    """Validated model dimensions required by MoE lowering."""
 
     hidden_size: int
     intermediate_size: int

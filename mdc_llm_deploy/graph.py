@@ -93,11 +93,12 @@ def transactional_update(graph: T, mutator: Callable[[T], None]) -> T:
     candidate.recompile()
     validate_graph(candidate)
     object.__setattr__(graph, "__dict__", candidate.__dict__)
+    graph.recompile()
     return graph
 
 
 def infer_model_kind(module: nn.Module) -> str:
-    """Infer Tiny model kind from module metadata."""
+    """Infer model kind from module metadata."""
     kind = getattr(module, "_mdc_model_kind", None)
     if kind in {"dense", "moe"}:
         return str(kind)

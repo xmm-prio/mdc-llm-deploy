@@ -190,8 +190,12 @@ def _moe_symbolic(
     quant_scales: Any,
     quant_offsets: Any,
 ) -> Any:
-    inputs = [x, topk_ids, topk_weight, expert_weights, quant_scales]
+    inputs = [x, topk_ids, topk_weight, expert_weights]
+    if quant_scales is not None:
+        inputs.append(quant_scales)
     if quant_offsets is not None:
+        if quant_scales is None:
+            inputs.append(_optional_input_placeholder_tensor(graph))
         inputs.append(quant_offsets)
     return graph.op(_schema("MoeExpert").onnx_name, *inputs)
 

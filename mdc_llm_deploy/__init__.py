@@ -17,17 +17,31 @@ from .errors import (
 
 if TYPE_CHECKING:
     from .export import convert_to_decode, export
+    from .models import (
+        AutoExportModel,
+        ExportModelConfig,
+        Qwen3Config,
+        Qwen3ForCausalLM,
+        Qwen3MoeConfig,
+        Qwen3MoeForCausalLM,
+    )
     from .onnx_export.api import onnx_export
     from .quantization import oneshot
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "AutoExportModel",
+    "ExportModelConfig",
     "GraphStateError",
     "MdcDeployError",
     "OnnxExportError",
     "QuantizationConfig",
     "QuantizationConfigError",
+    "Qwen3Config",
+    "Qwen3ForCausalLM",
+    "Qwen3MoeConfig",
+    "Qwen3MoeForCausalLM",
     "UnsupportedPatternError",
     "__version__",
     "convert_to_decode",
@@ -37,6 +51,12 @@ __all__ = [
 ]
 
 _LAZY_EXPORTS = {
+    "AutoExportModel": ("mdc_llm_deploy.models", "AutoExportModel"),
+    "ExportModelConfig": ("mdc_llm_deploy.models", "ExportModelConfig"),
+    "Qwen3Config": ("mdc_llm_deploy.models", "Qwen3Config"),
+    "Qwen3ForCausalLM": ("mdc_llm_deploy.models", "Qwen3ForCausalLM"),
+    "Qwen3MoeConfig": ("mdc_llm_deploy.models", "Qwen3MoeConfig"),
+    "Qwen3MoeForCausalLM": ("mdc_llm_deploy.models", "Qwen3MoeForCausalLM"),
     "convert_to_decode": ("mdc_llm_deploy.export", "convert_to_decode"),
     "export": ("mdc_llm_deploy.export", "export"),
     "oneshot": ("mdc_llm_deploy.quantization", "oneshot"),

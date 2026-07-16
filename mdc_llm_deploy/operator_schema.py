@@ -141,7 +141,7 @@ OPERATOR_SCHEMAS: Mapping[str, OperatorSchema] = MappingProxyType({
         torch_schema=(
             "moe_expert(Tensor x, Tensor topk_ids, "
             "Tensor topk_weight, Tensor expert_weights, "
-            "Tensor quant_scales, Tensor? quant_offsets=None) "
+            "Tensor? quant_scales=None, Tensor? quant_offsets=None) "
             "-> Tensor"
         ),
         inputs=(

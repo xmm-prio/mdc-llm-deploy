@@ -1,4 +1,4 @@
-"""Tiny MoE validation, reference kernel, and meta kernel."""
+"""Generic expert-major MoE validation and reference kernels."""
 # mypy: disable-error-code="no-any-return"
 
 from __future__ import annotations
@@ -7,7 +7,6 @@ import torch
 from torch import Tensor
 from torch.nn import functional
 
-from ..moe_layout import DEFAULT_MOE_LAYOUT, Projection
 from ._runtime_validation import (
     can_read_values,
     check_finite,
@@ -15,72 +14,76 @@ from ._runtime_validation import (
     check_same_device,
 )
 
+_PROJECTION_COUNT = 3
+
+
+def _projection_matrices(
+    packed: Tensor,
+    hidden_size: int,
+    scales: Tensor | None,
+    offsets: Tensor | None,
+    expert_id: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    packed_width = packed.numel()
+    denominator = _PROJECTION_COUNT * hidden_size
+    if packed_width == 0 or packed_width % denominator:
+        raise ValueError("Packed expert width is invalid")
+    intermediate_size = packed_width // denominator
+    lengths = hidden_size * intermediate_size
+    matrices: list[Tensor] = []
+    for projection_id, shape in enumerate(
+        (
+            (intermediate_size, hidden_size),
+            (intermediate_size, hidden_size),
+            (hidden_size, intermediate_size),
+        )
+    ):
+        start = projection_id * lengths
+        matrix = packed[start : start + lengths].reshape(shape)
+        if matrix.dtype == torch.int8:
+            if scales is None:
+                raise ValueError("INT8 expert weights require quant_scales")
+            parameter_index = expert_id * _PROJECTION_COUNT + projection_id
+            offset = (
+                torch.zeros((), dtype=torch.int32, device=matrix.device)
+                if offsets is None
+                else offsets.reshape(-1)[parameter_index]
+            )
+            matrix = (
+                matrix.float() - offset.float()
+            ) * scales.reshape(-1)[parameter_index].float()
+        else:
+            matrix = matrix.float()
+        matrices.append(matrix)
+    return matrices[0], matrices[1], matrices[2]
+
 
 def moe_expert_reference(
     x: Tensor,
     topk_ids: Tensor,
     topk_weight: Tensor,
     expert_weights: Tensor,
-    quant_scales: Tensor,
+    quant_scales: Tensor | None = None,
     quant_offsets: Tensor | None = None,
 ) -> Tensor:
-    """Execute the fixed Tiny MoE ABI with PyTorch reference operations."""
-    offsets = (
-        torch.zeros_like(quant_scales, dtype=torch.int32)
-        if quant_offsets is None
-        else quant_offsets
-    )
-    hidden = (x.float() - offsets[0].float()) * quant_scales[0]
-    hidden_size = x.shape[1]
-    intermediate_size = expert_weights.numel() // (
-        DEFAULT_MOE_LAYOUT.packed_projection_count * hidden_size
-    )
+    """Execute expert-major packed weights with PyTorch operations."""
+    hidden = x.float()
     output = torch.zeros_like(hidden)
-    segments = DEFAULT_MOE_LAYOUT.weight_segments(
-        hidden_size,
-        intermediate_size,
-    )
-    gate_projection, up_projection = (
-        DEFAULT_MOE_LAYOUT.input_activation_projections
-    )
-    for expert_id in range(DEFAULT_MOE_LAYOUT.expert_count):
-        matrices: dict[Projection, Tensor] = {}
-        for segment in (
-            item for item in segments if item.expert_id == expert_id
-        ):
-            scale_index = DEFAULT_MOE_LAYOUT.scale_index(
-                expert_id,
-                DEFAULT_MOE_LAYOUT.quant_slot_for_projection(
-                    segment.projection
-                ),
-            )
-            packed = expert_weights[
-                segment.offset : segment.offset + segment.length
-            ].view(segment.rows, segment.columns)
-            matrix = (
-                packed.float() - offsets[scale_index].float()
-            ) * quant_scales[scale_index]
-            matrices[segment.projection] = matrix
-        gate = matrices[gate_projection]
-        up = matrices[up_projection]
-        down = matrices[DEFAULT_MOE_LAYOUT.output_projection]
-        intermediate = functional.silu(hidden @ gate.t()) * (hidden @ up.t())
-        activation_index = DEFAULT_MOE_LAYOUT.scale_index(
+    for expert_id in range(expert_weights.shape[0]):
+        gate, up, down = _projection_matrices(
+            expert_weights[expert_id],
+            x.shape[-1],
+            quant_scales,
+            quant_offsets,
             expert_id,
-            "intermediate",
         )
-        activation_scale = quant_scales[activation_index]
-        activation_offset = offsets[activation_index].float()
-        quantized = torch.round(
-            intermediate / activation_scale + activation_offset
-        ).clamp(-128, 127)
-        intermediate = (quantized - activation_offset) * activation_scale
-        expert_output = intermediate @ down.t()
-        weight = (
+        expert_output = functional.silu(hidden @ gate.t()) * (hidden @ up.t())
+        expert_output = expert_output @ down.t()
+        route_weight = (
             (topk_ids == expert_id).to(topk_weight.dtype) * topk_weight
-        ).sum(dim=1, keepdim=True)
-        output += expert_output * weight.float()
-    return output.to(torch.float16)
+        ).sum(dim=-1, keepdim=True)
+        output = output + expert_output * route_weight.float()
+    return output.to(x.dtype)
 
 
 def moe_expert_meta(
@@ -88,12 +91,43 @@ def moe_expert_meta(
     topk_ids: Tensor,
     topk_weight: Tensor,
     expert_weights: Tensor,
-    quant_scales: Tensor,
+    quant_scales: Tensor | None = None,
     quant_offsets: Tensor | None = None,
 ) -> Tensor:
-    """Return output metadata for the fixed Tiny MoE ABI."""
+    """Return metadata matching the activation input."""
     del topk_ids, topk_weight, expert_weights, quant_scales, quant_offsets
-    return torch.empty_like(x, dtype=torch.float16)
+    return torch.empty_like(x)
+
+
+def _validate_quantization(
+    expert_weights: Tensor,
+    quant_scales: Tensor | None,
+    quant_offsets: Tensor | None,
+) -> None:
+    expert_count = expert_weights.shape[0]
+    expected = expert_count * _PROJECTION_COUNT
+    if expert_weights.dtype == torch.int8:
+        if quant_scales is None:
+            raise ValueError("INT8 expert weights require quant_scales")
+        if quant_scales.dtype not in {torch.float16, torch.float32}:
+            raise TypeError("MoeExpert quant_scales must be floating point")
+        if quant_scales.numel() != expected:
+            raise ValueError(
+                f"MoeExpert quant_scales must contain {expected} values"
+            )
+        if can_read_values(quant_scales) and bool((quant_scales <= 0).any()):
+            raise ValueError("MoeExpert quant_scales must be positive")
+        if quant_offsets is not None:
+            if quant_offsets.dtype != torch.int32:
+                raise TypeError("MoeExpert quant_offsets must use int32")
+            if quant_offsets.numel() != expected:
+                raise ValueError(
+                    f"MoeExpert quant_offsets must contain {expected} values"
+                )
+    elif not expert_weights.dtype.is_floating_point:
+        raise TypeError("MoeExpert weights must be floating point or int8")
+    elif quant_scales is not None or quant_offsets is not None:
+        raise ValueError("Floating-point expert weights do not use quant parameters")
 
 
 def moe_expert(
@@ -101,88 +135,62 @@ def moe_expert(
     topk_ids: Tensor,
     topk_weight: Tensor,
     expert_weights: Tensor,
-    quant_scales: Tensor,
+    quant_scales: Tensor | None = None,
     quant_offsets: Tensor | None = None,
 ) -> Tensor:
-    """Execute packed Tiny MoE using the fixed deployment ABI."""
-    values = (x, topk_ids, topk_weight, expert_weights, quant_scales, quant_offsets)
+    """Execute a validated inference-only expert-major MoE."""
+    values = (
+        x,
+        topk_ids,
+        topk_weight,
+        expert_weights,
+        quant_scales,
+        quant_offsets,
+    )
     check_no_autograd(*values)
     check_same_device("MoeExpert", *values)
-    if x.dtype != torch.int8 or expert_weights.dtype != torch.int8:
-        raise TypeError("MoeExpert activations and weights must use int8")
-    if topk_ids.dtype != torch.int16 or topk_weight.dtype != torch.float16:
-        raise TypeError("MoeExpert routing tensors must use int16 and float16")
-    if quant_scales.dtype != torch.float32:
-        raise TypeError("MoeExpert quant_scales must use float32")
-    if quant_offsets is not None and quant_offsets.dtype != torch.int32:
-        raise TypeError("MoeExpert quant_offsets must use int32")
-    check_finite("MoeExpert", topk_weight, quant_scales)
+    if not x.dtype.is_floating_point:
+        raise TypeError("MoeExpert activations must be floating point")
+    if topk_ids.dtype not in {torch.int32, torch.int64}:
+        raise TypeError("MoeExpert topk_ids must use int32 or int64")
+    if topk_weight.dtype != x.dtype:
+        raise TypeError("MoeExpert topk_weight must match activation dtype")
+    check_finite("MoeExpert", x, topk_weight, quant_scales)
     if x.ndim != 2 or x.shape[0] == 0 or x.shape[1] == 0:
         raise ValueError("MoeExpert x must be a non-empty rank-2 tensor")
-    expected_route_shape = (x.shape[0], DEFAULT_MOE_LAYOUT.route_width)
-    if tuple(topk_ids.shape) != expected_route_shape or tuple(
-        topk_weight.shape
-    ) != expected_route_shape:
-        raise ValueError(
-            f"MoeExpert routing shape must be [tokenNum, {DEFAULT_MOE_LAYOUT.route_width}]"
-        )
-    if expert_weights.ndim != 1:
-        raise ValueError("MoeExpert expert_weights must be packed rank 1")
-    if tuple(quant_scales.shape) != (DEFAULT_MOE_LAYOUT.quant_parameter_count,):
-        raise ValueError(
-            "MoeExpert requires exactly "
-            f"{DEFAULT_MOE_LAYOUT.quant_parameter_count} ordered scales"
-        )
-    if quant_offsets is not None and tuple(quant_offsets.shape) != (
-        DEFAULT_MOE_LAYOUT.quant_parameter_count,
+    if expert_weights.ndim != 2 or expert_weights.shape[0] == 0:
+        raise ValueError("expert_weights must be non-empty expert-major rank 2")
+    route_shape = tuple(topk_ids.shape)
+    if (
+        len(route_shape) != 2
+        or route_shape[0] != x.shape[0]
+        or route_shape[1] == 0
+        or tuple(topk_weight.shape) != route_shape
     ):
-        raise ValueError(
-            "MoeExpert offsets must match the "
-            f"{DEFAULT_MOE_LAYOUT.quant_parameter_count}-scale order"
-        )
-    denominator = DEFAULT_MOE_LAYOUT.packed_projection_count * x.shape[1]
-    if expert_weights.numel() == 0 or expert_weights.numel() % denominator:
-        raise ValueError("Packed expert weight length is invalid")
-    if can_read_values(quant_scales) and bool((quant_scales <= 0).any()):
-        raise ValueError("MoeExpert quant_scales must be positive")
+        raise ValueError("Routing tensors must have shape [token_count, top_k]")
+    expert_count = expert_weights.shape[0]
+    if route_shape[1] > expert_count:
+        raise ValueError("Routing top_k cannot exceed expert_count")
+    packed_denominator = _PROJECTION_COUNT * x.shape[1]
+    if expert_weights.shape[1] % packed_denominator:
+        raise ValueError("Packed expert width is invalid")
+    _validate_quantization(expert_weights, quant_scales, quant_offsets)
     if can_read_values(topk_ids):
-        routed_ids = topk_ids[:, : DEFAULT_MOE_LAYOUT.routed_top_k]
-        if bool((routed_ids < 0).any()) or bool(
-            (routed_ids >= DEFAULT_MOE_LAYOUT.routed_expert_count).any()
-        ):
-            raise ValueError(
-                "MoeExpert routed id is outside "
-                f"[0, {DEFAULT_MOE_LAYOUT.routed_expert_count})"
-            )
-        sorted_ids = torch.sort(routed_ids, dim=1).values
+        if bool((topk_ids < 0).any()) or bool((topk_ids >= expert_count).any()):
+            raise ValueError("MoeExpert routing id is outside expert range")
+        sorted_ids = torch.sort(topk_ids, dim=-1).values
         if bool((sorted_ids[:, 1:] == sorted_ids[:, :-1]).any()):
-            raise ValueError("MoeExpert routed ids must be unique per token")
-        if not bool(
-            (
-                topk_ids[:, DEFAULT_MOE_LAYOUT.routed_top_k]
-                == DEFAULT_MOE_LAYOUT.shared_expert_id
-            ).all()
-        ):
-            raise ValueError(
-                f"MoeExpert shared id {DEFAULT_MOE_LAYOUT.shared_expert_id} "
-                "must appear last"
-            )
-        routed_weights = topk_weight[
-            :, : DEFAULT_MOE_LAYOUT.routed_top_k
-        ].float()
-        if bool((topk_weight < 0).any()) or not torch.allclose(
-            routed_weights.sum(dim=1),
+            raise ValueError("MoeExpert routing ids must be unique per token")
+    if can_read_values(topk_weight) and (
+        bool((topk_weight < 0).any())
+        or not torch.allclose(
+            topk_weight.float().sum(dim=-1),
             torch.ones(x.shape[0], device=x.device),
             atol=1e-3,
             rtol=1e-3,
-        ):
-            raise ValueError(
-                "MoeExpert routed weights must be non-negative and sum to one"
-            )
-        if not bool(
-            (topk_weight[:, DEFAULT_MOE_LAYOUT.routed_top_k] == 1).all()
-        ):
-            raise ValueError("MoeExpert shared weight must equal one")
+        )
+    ):
+        raise ValueError("Routing weights must be non-negative and sum to one")
     return torch.ops.mdc_llm_deploy.moe_expert.default(
         x,
         topk_ids,

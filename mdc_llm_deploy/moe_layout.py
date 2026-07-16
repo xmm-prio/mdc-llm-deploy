@@ -1,11 +1,11 @@
-"""Framework-independent Tiny MoE deployment ABI layout."""
+"""Framework-independent expert-major MoE deployment layout."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal, cast
 
-QuantSlot = Literal["gate", "up", "intermediate", "down"]
+QuantSlot = Literal["gate", "up", "down"]
 Projection = Literal["gate_proj", "up_proj", "down_proj"]
 
 
@@ -22,38 +22,25 @@ class WeightSegment:
 
 
 @dataclass(frozen=True, slots=True)
-class TinyMoeAbiLayout:
-    """Current fixed Tiny MoE ABI consumed by MDC operators."""
+class MoeExpertLayout:
+    """Describe an expert-major packed MoE weight matrix."""
 
-    routed_expert_count: int = 4
-    shared_expert_count: int = 1
-    routed_top_k: int = 2
+    expert_count: int
     projections: tuple[Projection, ...] = (
         "gate_proj",
         "up_proj",
         "down_proj",
     )
-    quant_slots: tuple[QuantSlot, ...] = (
-        "gate",
-        "up",
-        "intermediate",
-        "down",
-    )
+    quant_slots: tuple[QuantSlot, ...] = ("gate", "up", "down")
 
     def __post_init__(self) -> None:
-        self._require_int("routed_expert_count", self.routed_expert_count)
-        self._require_int("shared_expert_count", self.shared_expert_count)
-        self._require_int("routed_top_k", self.routed_top_k)
-        if self.routed_expert_count != 4:
-            raise ValueError("Tiny MoE ABI requires exactly four routed experts")
-        if self.shared_expert_count != 1:
-            raise ValueError("Tiny MoE ABI requires exactly one shared expert")
-        if self.routed_top_k != 2:
-            raise ValueError("Tiny MoE ABI requires routed top-k 2")
+        self._require_int("expert_count", self.expert_count)
+        if self.expert_count <= 0:
+            raise ValueError("expert_count must be positive")
         if self.projections != ("gate_proj", "up_proj", "down_proj"):
-            raise ValueError("Tiny MoE ABI projection order is fixed")
-        if self.quant_slots != ("gate", "up", "intermediate", "down"):
-            raise ValueError("Tiny MoE ABI quantization slot order is fixed")
+            raise ValueError("MoE projection order is fixed")
+        if self.quant_slots != ("gate", "up", "down"):
+            raise ValueError("MoE quantization slot order is fixed")
 
     @staticmethod
     def _require_int(name: str, value: object) -> int:
@@ -62,24 +49,9 @@ class TinyMoeAbiLayout:
         return value
 
     @property
-    def expert_count(self) -> int:
-        """Return routed plus shared expert count."""
-        return self.routed_expert_count + self.shared_expert_count
-
-    @property
-    def shared_expert_id(self) -> int:
-        """Return the packed shared expert id."""
-        return self.routed_expert_count
-
-    @property
-    def route_width(self) -> int:
-        """Return routed selections plus shared expert."""
-        return self.routed_top_k + self.shared_expert_count
-
-    @property
     def quant_parameter_count(self) -> int:
-        """Return global input plus per-expert quantization slots."""
-        return 1 + self.expert_count * len(self.quant_slots)
+        """Return per-projection quantization parameter count."""
+        return self.expert_count * len(self.quant_slots)
 
     @property
     def packed_projection_count(self) -> int:
@@ -120,7 +92,7 @@ class TinyMoeAbiLayout:
             slot_index = self.quant_slots.index(slot)
         except ValueError as error:
             raise ValueError(f"Unsupported quantization slot: {slot}") from error
-        return 1 + expert_id * len(self.quant_slots) + slot_index
+        return expert_id * len(self.quant_slots) + slot_index
 
     def weight_index(self, expert_id: int, projection: Projection) -> int:
         """Return one flattened projection segment index."""
@@ -154,7 +126,8 @@ class TinyMoeAbiLayout:
         self._require_int("intermediate_size", intermediate_size)
         if hidden_size <= 0 or intermediate_size <= 0:
             raise ValueError("MoE hidden and intermediate sizes must be positive")
-        index = self.weight_index(expert_id, projection)
+        self._validate_expert(expert_id)
+        index = self.projections.index(projection)
         length = hidden_size * intermediate_size
         rows, columns = (
             (hidden_size, intermediate_size)
@@ -197,47 +170,45 @@ class TinyMoeAbiLayout:
         self._require_int("intermediate_size", intermediate_size)
         if hidden_size <= 0 or intermediate_size <= 0:
             raise ValueError("MoE hidden and intermediate sizes must be positive")
-        return (
-            self.packed_projection_count
-            * hidden_size
-            * intermediate_size
-        )
+        return len(self.projections) * hidden_size * intermediate_size
 
-    def routing_shape(self, token_count: int) -> tuple[int, int]:
-        """Return the operator routing tensor shape."""
+    def routing_shape(self, token_count: int, top_k: int) -> tuple[int, int]:
+        """Return routing shape for a caller-selected top-k."""
         self._require_int("token_count", token_count)
+        self._require_int("top_k", top_k)
         if token_count <= 0:
             raise ValueError("token_count must be positive")
-        return token_count, self.route_width
+        if not 0 < top_k <= self.expert_count:
+            raise ValueError("top_k must be in [1, expert_count]")
+        return token_count, top_k
 
     def quant_parameter_order(self) -> tuple[str, ...]:
         """Return stable quantization metadata names."""
-        return (
-            "input",
-            *tuple(
-                f"expert.{expert_id}.{slot}"
-                for expert_id in range(self.expert_count)
-                for slot in self.quant_slots
-            ),
+        return tuple(
+            f"expert.{expert_id}.{slot}"
+            for expert_id in range(self.expert_count)
+            for slot in self.quant_slots
         )
 
     def expert_order(self) -> tuple[str, ...]:
         """Return stable packed expert metadata labels."""
-        return (
-            *tuple(
-                str(expert_id)
-                for expert_id in range(self.routed_expert_count)
-            ),
-            f"{self.shared_expert_id}(shared)",
-        )
+        return tuple(str(expert_id) for expert_id in range(self.expert_count))
 
 
-DEFAULT_MOE_LAYOUT = TinyMoeAbiLayout()
+def infer_moe_layout(expert_weights_shape: tuple[int, ...]) -> MoeExpertLayout:
+    """Infer layout from a rank-2 expert-major packed tensor shape."""
+    if len(expert_weights_shape) != 2:
+        raise ValueError("expert_weights must be expert-major rank 2")
+    expert_count, packed_width = expert_weights_shape
+    layout = MoeExpertLayout(expert_count)
+    if packed_width <= 0:
+        raise ValueError("packed expert width must be positive")
+    return layout
 
 __all__ = [
-    "DEFAULT_MOE_LAYOUT",
+    "MoeExpertLayout",
     "Projection",
     "QuantSlot",
-    "TinyMoeAbiLayout",
     "WeightSegment",
+    "infer_moe_layout",
 ]
