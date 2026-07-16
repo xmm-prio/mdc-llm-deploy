@@ -7,6 +7,7 @@ import inspect
 import subprocess
 from pathlib import Path
 
+import onnx
 import pytest
 
 from mdc_llm_deploy.capabilities import Algorithm
@@ -32,6 +33,13 @@ def test_runner_short_slice_generates_and_validates_all_14_models(tmp_path: Path
     assert not any(artifact.release_qualified for artifact in artifacts)
     assert all(len(artifact.config_sha256) == 64 for artifact in artifacts)
     assert all(len(artifact.commit_sha) == 40 for artifact in artifacts)
+    for artifact in artifacts:
+        names = [
+            node.name
+            for node in onnx.load(artifact.path).graph.node
+            if node.name
+        ]
+        assert len(names) == len(set(names))
     assert all(
         artifact.path.name
         == "-".join(

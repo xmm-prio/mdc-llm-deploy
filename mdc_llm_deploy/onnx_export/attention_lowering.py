@@ -487,13 +487,22 @@ def lower_rope_attention(
     value_target = _target(value, "value", attention_fqn)
     query_target = _target(value, "query", attention_fqn)
     score_target = _target(value, "score", attention_fqn)
+    quant_name = f"mdc.attention.{attention_fqn}"
     if query_target is not None:
         query_bnsd = append_quant(
-            model, query_bnsd, query_bnsd_shape, query_target, "mdc.attention.query_quant"
+            model,
+            query_bnsd,
+            query_bnsd_shape,
+            query_target,
+            f"{quant_name}.query_quant",
         )
     if key_target is not None and key_output.type.tensor_type.elem_type != TensorProto.INT8:
         key_input = _quantize_graph_output(
-            model, key_output, key_shape_full, key_target, "mdc.attention.key_quant"
+            model,
+            key_output,
+            key_shape_full,
+            key_target,
+            f"{quant_name}.key_quant",
         )
     if value_target is not None and value_output.type.tensor_type.elem_type != TensorProto.INT8:
         value_input = _quantize_graph_output(
@@ -501,7 +510,7 @@ def lower_rope_attention(
             value_output,
             value_shape_full,
             value_target,
-            "mdc.attention.value_quant",
+            f"{quant_name}.value_quant",
         )
 
     inputs = [""] * ATTENTION_INPUT_COUNT
