@@ -8,7 +8,7 @@
 
 - 历史最小探针曾确认：`MoeExpert` 的 `hiddenSize=64/128` 会发生 tiling 失败。
 - 历史最小探针曾确认：`MoeExpert` 在 `hiddenSize=256`、`expertInterDim=128/256`、`tokenNum=8/3072` 的部分组合上可完成 ATC 编译。
-- 历史探针来自修复过程中的临时模型，不等于候选 commit 通过；候选 commit 的 parser 探针、GPU 数值验证和 28 项发布矩阵均须重新执行。
+- 历史探针来自修复过程中的临时模型，不等于候选 commit 通过；候选 commit 的 parser 探针和 14 项发布矩阵均须重新执行。
 - `FusedInferAttentionScore` 历史探针曾出现 `output index 1 shape:[0] not valid` 告警。Attention LSE 告警未定性：尚未确认其来自 ONNX parser、GE shape inference 还是 OPP 支持检查，也未取得 OPP 维护方的无害性结论。
 - 没有执行 MDC 真机推理。因此不得声明模型“可部署到 MDC”“可在 MDC 运行”或“真机已验证”。
 - B 端没有向 A 端返回 ONNX、OM 或原始日志，也没有在 B 端修改代码。

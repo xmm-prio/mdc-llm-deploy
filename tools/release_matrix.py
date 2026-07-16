@@ -1,4 +1,4 @@
-"""Internal runner for the 28-entry local ONNX release matrix."""
+"""Internal runner for the 14-entry local ONNX release matrix."""
 
 from __future__ import annotations
 
