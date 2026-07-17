@@ -328,6 +328,141 @@ def _moe_model(weight_dtypes: tuple[np.dtype[np.generic], ...]) -> onnx.ModelPro
     )
 
 
+def _reference_quantized_target_families(
+    model: onnx.ModelProto,
+) -> frozenset[str]:
+    initializers = {
+        item.name: item for item in model.graph.initializer
+    }
+    producers = {
+        output: node
+        for node in model.graph.node
+        for output in node.output
+        if output
+    }
+    result: set[str] = set()
+    moe_nodes = [
+        node for node in model.graph.node if node.op_type == "MoeExpert"
+    ]
+    quantized_moe_nodes = [
+        node
+        for node in moe_nodes
+        if (
+            len(node.input) > 4
+            and bool(node.input[4])
+            and (weight := initializers.get(node.input[3])) is not None
+            and weight.data_type == onnx.TensorProto.INT8
+        )
+    ]
+    if quantized_moe_nodes and len(quantized_moe_nodes) != len(moe_nodes):
+        raise OnnxExportError(
+            "MoeExpert quantization coverage is inconsistent"
+        )
+    if quantized_moe_nodes:
+        result.add("moe")
+    attention_quantization_inputs = (
+        AttentionInput.DEQUANT_SCALE1,
+        AttentionInput.QUANT_SCALE1,
+        AttentionInput.DEQUANT_SCALE2,
+        AttentionInput.QUANT_SCALE2,
+        AttentionInput.QUANT_OFFSET2,
+        AttentionInput.ANTIQUANT_SCALE,
+        AttentionInput.ANTIQUANT_OFFSET,
+        AttentionInput.KEY_ANTIQUANT_SCALE,
+        AttentionInput.KEY_ANTIQUANT_OFFSET,
+        AttentionInput.VALUE_ANTIQUANT_SCALE,
+        AttentionInput.VALUE_ANTIQUANT_OFFSET,
+        AttentionInput.KEY_ROPE_ANTIQUANT_SCALE,
+        AttentionInput.DEQUANT_SCALE_QUERY,
+    )
+    attention_nodes = [
+        node
+        for node in model.graph.node
+        if node.op_type == "FusedInferAttentionScore"
+    ]
+    quantized_attention_nodes = [
+        node
+        for node in attention_nodes
+        if any(
+            index < len(node.input) and bool(node.input[index])
+            for index in attention_quantization_inputs
+        )
+    ]
+    if (
+        quantized_attention_nodes
+        and len(quantized_attention_nodes) != len(attention_nodes)
+    ):
+        raise OnnxExportError(
+            "Attention quantization coverage is inconsistent"
+        )
+    if quantized_attention_nodes:
+        result.add("attention")
+    for node in model.graph.node:
+        if node.op_type != "AscendDequant" or not node.input:
+            continue
+        accumulator = producers.get(node.input[0])
+        if (
+            accumulator is None
+            or accumulator.op_type != "MatMul"
+            or not accumulator.input
+        ):
+            continue
+        quantizer = producers.get(accumulator.input[0])
+        if (
+            quantizer is not None
+            and quantizer.op_type == "NPUAscendQuantV2"
+        ):
+            result.add("linear")
+    return frozenset(result)
+
+
+def _target_model(
+    nodes: list[onnx.NodeProto],
+    initializers: list[onnx.TensorProto] | None = None,
+) -> onnx.ModelProto:
+    return helper.make_model(
+        helper.make_graph(
+            nodes,
+            "targets",
+            [],
+            [],
+            initializer=initializers or [],
+        )
+    )
+
+
+def _attention_node(name: str, *, quantized: bool) -> onnx.NodeProto:
+    inputs = [""] * ATTENTION_INPUT_COUNT
+    if quantized:
+        inputs[AttentionInput.DEQUANT_SCALE1] = f"{name}.scale"
+    return helper.make_node(
+        "FusedInferAttentionScore",
+        inputs,
+        [f"{name}.output", f"{name}.lse"],
+        name=name,
+    )
+
+
+def _linear_nodes(prefix: str) -> list[onnx.NodeProto]:
+    return [
+        helper.make_node(
+            "NPUAscendQuantV2",
+            [f"{prefix}.input"],
+            [f"{prefix}.quantized"],
+        ),
+        helper.make_node(
+            "MatMul",
+            [f"{prefix}.quantized", f"{prefix}.weight"],
+            [f"{prefix}.accumulator"],
+        ),
+        helper.make_node(
+            "AscendDequant",
+            [f"{prefix}.accumulator"],
+            [f"{prefix}.output"],
+        ),
+    ]
+
+
 def test_float_moe_is_not_a_quantized_target() -> None:
     model = _moe_model((np.dtype(np.float16), np.dtype(np.float16)))
 
@@ -343,7 +478,10 @@ def test_int8_moe_is_a_quantized_target() -> None:
 def test_mixed_moe_quantization_is_rejected() -> None:
     model = _moe_model((np.dtype(np.int8), np.dtype(np.float16)))
 
-    with pytest.raises(OnnxExportError, match="coverage is inconsistent"):
+    with pytest.raises(
+        OnnxExportError,
+        match=r"^MoeExpert quantization coverage is inconsistent$",
+    ):
         quantized_target_families(model)
 
 
@@ -371,7 +509,174 @@ def test_mixed_attention_quantization_is_rejected() -> None:
         )
     )
 
-    with pytest.raises(OnnxExportError, match="coverage is inconsistent"):
+    with pytest.raises(
+        OnnxExportError,
+        match=r"^Attention quantization coverage is inconsistent$",
+    ):
+        quantized_target_families(model)
+
+
+def test_quantized_target_families_matches_frozen_reference() -> None:
+    int8_weight = numpy_helper.from_array(
+        np.ones((1,), dtype=np.int8),
+        name="moe.weight",
+    )
+    scale = numpy_helper.from_array(
+        np.ones((1,), dtype=np.float32),
+        name="moe.scale",
+    )
+    moe = helper.make_node(
+        "MoeExpert",
+        ["x", "ids", "scores", "moe.weight", "moe.scale", ""],
+        ["moe.output"],
+    )
+    broken_linear_nodes = [
+        helper.make_node("AscendDequant", [], ["no_input"]),
+        helper.make_node("AscendDequant", ["missing"], ["no_producer"]),
+        helper.make_node("Identity", ["x"], ["not_matmul"]),
+        helper.make_node("AscendDequant", ["not_matmul"], ["wrong_producer"]),
+        helper.make_node("MatMul", [], ["empty_matmul"]),
+        helper.make_node("AscendDequant", ["empty_matmul"], ["empty_input"]),
+        helper.make_node("MatMul", ["missing_quantizer"], ["missing_acc"]),
+        helper.make_node("AscendDequant", ["missing_acc"], ["missing_quant"]),
+        helper.make_node("Identity", ["x"], ["identity_quantizer"]),
+        helper.make_node("MatMul", ["identity_quantizer"], ["identity_acc"]),
+        helper.make_node("AscendDequant", ["identity_acc"], ["wrong_quant"]),
+    ]
+    cases = [
+        _target_model([]),
+        _target_model(
+            [
+                helper.make_node(
+                    "Identity", [f"x.{index}"], [f"y.{index}"]
+                )
+                for index in range(64)
+            ]
+        ),
+        _moe_model((np.dtype(np.float16), np.dtype(np.float16))),
+        _moe_model((np.dtype(np.int8), np.dtype(np.int8))),
+        _target_model([_attention_node("float", quantized=False)]),
+        _target_model([_attention_node("quantized", quantized=True)]),
+        _target_model(_linear_nodes("valid")),
+        _target_model(
+            [
+                *_linear_nodes("all"),
+                _attention_node("all", quantized=True),
+                moe,
+            ],
+            [int8_weight, scale],
+        ),
+        _target_model([*_linear_nodes("valid"), *broken_linear_nodes]),
+    ]
+
+    for model in cases:
+        actual = quantized_target_families(model)
+        assert actual == _reference_quantized_target_families(model)
+        assert isinstance(actual, frozenset)
+    assert quantized_target_families(cases[-3]) == frozenset({"linear"})
+    assert quantized_target_families(cases[-2]) == frozenset(
+        {"linear", "attention", "moe"}
+    )
+
+
+@pytest.mark.parametrize(
+    ("duplicate_nodes", "expected"),
+    [
+        (
+            [
+                helper.make_node("NPUAscendQuantV2", ["x"], ["quantized"]),
+                helper.make_node("Identity", ["x"], ["quantized"]),
+            ],
+            frozenset(),
+        ),
+        (
+            [
+                helper.make_node("Identity", ["x"], ["quantized"]),
+                helper.make_node("NPUAscendQuantV2", ["x"], ["quantized"]),
+            ],
+            frozenset({"linear"}),
+        ),
+    ],
+)
+def test_quantized_target_producer_index_is_last_wins(
+    duplicate_nodes: list[onnx.NodeProto],
+    expected: frozenset[str],
+) -> None:
+    model = _target_model(
+        [
+            helper.make_node("Identity", ["x"], [""]),
+            *duplicate_nodes,
+            helper.make_node(
+                "MatMul", ["quantized", "weight"], ["accumulator"]
+            ),
+            helper.make_node(
+                "AscendDequant", ["accumulator"], ["output"]
+            ),
+        ]
+    )
+
+    assert quantized_target_families(model) == expected
+
+
+@pytest.mark.parametrize(
+    ("dtypes", "expected"),
+    [
+        ((np.float16, np.int8), frozenset({"moe"})),
+        ((np.int8, np.float16), frozenset()),
+    ],
+)
+def test_quantized_target_initializer_index_is_last_wins(
+    dtypes: tuple[type[np.generic], type[np.generic]],
+    expected: frozenset[str],
+) -> None:
+    initializers = [
+        numpy_helper.from_array(np.ones((1,), dtype=dtype), name="weight")
+        for dtype in dtypes
+    ]
+    initializers.append(
+        numpy_helper.from_array(
+            np.ones((1,), dtype=np.float32),
+            name="scale",
+        )
+    )
+    model = _target_model(
+        [
+            helper.make_node(
+                "MoeExpert",
+                ["x", "ids", "scores", "weight", "scale", ""],
+                ["output"],
+            )
+        ],
+        initializers,
+    )
+
+    assert quantized_target_families(model) == expected
+
+
+@pytest.mark.parametrize("attention_first", [False, True])
+def test_moe_coverage_error_precedes_attention_coverage_error(
+    attention_first: bool,
+) -> None:
+    moe_model = _moe_model((np.dtype(np.int8), np.dtype(np.float16)))
+    moe_nodes = list(moe_model.graph.node)
+    attention_nodes = [
+        _attention_node("float", quantized=False),
+        _attention_node("quantized", quantized=True),
+    ]
+    sections = (
+        [attention_nodes, moe_nodes]
+        if attention_first
+        else [moe_nodes, attention_nodes]
+    )
+    model = _target_model(
+        [node for section in sections for node in section],
+        list(moe_model.graph.initializer),
+    )
+
+    with pytest.raises(
+        OnnxExportError,
+        match=r"^MoeExpert quantization coverage is inconsistent$",
+    ):
         quantized_target_families(model)
 
 

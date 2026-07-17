@@ -15,6 +15,10 @@ def resolve_checkpoint(
     candidate = Path(source)
     if candidate.is_dir():
         return candidate.resolve()
+    if candidate.exists():
+        raise ValueError(
+            f"Local checkpoint source must be a directory: {candidate}"
+        )
     from huggingface_hub import snapshot_download
 
     downloaded = snapshot_download(

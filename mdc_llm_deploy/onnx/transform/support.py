@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
@@ -85,6 +86,8 @@ def append_quant(
     source_shape: tuple[int, ...],
     target: QuantizedTarget,
     name: str,
+    *,
+    name_allocator: Callable[[str], str] | None = None,
 ) -> str:
     """Append an MDC INT8 activation quantization node."""
     source_dtype = model_types(model)[source][0]
@@ -97,14 +100,20 @@ def append_quant(
         target,
         inverse=True,
         dtype=parameter_dtype,
+        name_allocator=name_allocator,
     )
     offset = offset_initializer(
         model,
         f"{name}.offset",
         target,
         dtype=parameter_dtype,
+        name_allocator=name_allocator,
     )
-    output = unique_name(model, f"{name}.output")
+    output = (
+        name_allocator(f"{name}.output")
+        if name_allocator is not None
+        else unique_name(model, f"{name}.output")
+    )
     axis = -2 if target.granularity == "per_token" else -1
     model.graph.node.append(
         helper.make_node(
@@ -127,6 +136,7 @@ def scale_initializer(
     *,
     inverse: bool,
     dtype: np.dtype[Any] = _NP_FLOAT32,
+    name_allocator: Callable[[str], str] | None = None,
 ) -> str:
     """Materialize a quantization scale initializer."""
     values = np.asarray(target.scale, dtype=np.float32)
@@ -134,7 +144,11 @@ def scale_initializer(
         if np.dtype(dtype) == np.dtype(np.float16) and (values < (1.0 / 65504.0)).any():
             raise OnnxExportError(f"FP16 quantization scale for {target.fqn!r} is too small")
         values = 1.0 / values
-    result = unique_name(model, name)
+    result = (
+        name_allocator(name)
+        if name_allocator is not None
+        else unique_name(model, name)
+    )
     model.graph.initializer.append(initializer(result, values.astype(dtype).squeeze()))
     return result
 
@@ -145,9 +159,14 @@ def offset_initializer(
     target: QuantizedTarget,
     *,
     dtype: np.dtype[Any] = _NP_FLOAT32,
+    name_allocator: Callable[[str], str] | None = None,
 ) -> str:
     """Materialize a quantization zero-point initializer."""
-    result = unique_name(model, name)
+    result = (
+        name_allocator(name)
+        if name_allocator is not None
+        else unique_name(model, name)
+    )
     values = np.asarray(target.zero_point, dtype=dtype).squeeze()
     model.graph.initializer.append(initializer(result, values))
     return result

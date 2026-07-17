@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,20 @@ class _PublicationMember:
     staged: Path | None
 
 
+def _snapshot_file(source: Path, backup: Path) -> None:
+    follow_symlinks = os.name != "nt"
+    try:
+        os.link(source, backup, follow_symlinks=follow_symlinks)
+    except OSError as link_error:
+        try:
+            shutil.copy2(source, backup, follow_symlinks=follow_symlinks)
+        except OSError as copy_error:
+            raise OnnxExportError(
+                "ONNX snapshot failed: "
+                f"link failed: {link_error}; copy failed: {copy_error}"
+            ) from copy_error
+
+
 def _snapshot_publication(
     members: tuple[_PublicationMember, ...],
     directory: Path,
@@ -27,7 +42,7 @@ def _snapshot_publication(
     for index, member in enumerate(members):
         if member.target.exists():
             backup = directory / f".backup-{index}"
-            os.link(member.target, backup)
+            _snapshot_file(member.target, backup)
             snapshots[member.target] = backup
         else:
             snapshots[member.target] = None

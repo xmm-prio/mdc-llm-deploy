@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator, Mapping
+from types import MappingProxyType
 from typing import Any
 
 from ...errors import GraphStateError
@@ -12,16 +13,33 @@ from ...errors import GraphStateError
 class FrozenJsonMapping(Mapping[str, Any]):
     """Immutable, value-equal mapping for frozen JSON-like data."""
 
-    __slots__ = ("_items",)
+    __slots__ = ("_index", "_items")
     _items: tuple[tuple[str, Any], ...]
+    _index: Mapping[str, Any] | None
 
     def __init__(self, items: tuple[tuple[str, Any], ...]) -> None:
         object.__setattr__(self, "_items", items)
+        object.__setattr__(self, "_index", None)
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError(f"{type(self).__name__!s} is immutable")
 
     def __getitem__(self, key: str) -> Any:
+        if type(key) is not str:
+            return self._linear_lookup(key)
+
+        index = self._index
+        if index is None:
+            candidate_index: dict[str, Any] = {}
+            for candidate, value in self._items:
+                if type(candidate) is not str:
+                    return self._linear_lookup(key)
+                candidate_index.setdefault(candidate, value)
+            index = MappingProxyType(candidate_index)
+            object.__setattr__(self, "_index", index)
+        return index[key]
+
+    def _linear_lookup(self, key: str) -> Any:
         for candidate, value in self._items:
             if candidate == key:
                 return value
@@ -35,6 +53,9 @@ class FrozenJsonMapping(Mapping[str, Any]):
 
     def __repr__(self) -> str:
         return repr(dict(self._items))
+
+    def __getstate__(self) -> tuple[None, dict[str, Any]]:
+        return None, {"_items": self._items, "_index": None}
 
     def __deepcopy__(
         self,

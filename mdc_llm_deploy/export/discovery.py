@@ -12,7 +12,7 @@ from torch.fx import GraphModule
 
 from ..errors import UnsupportedPatternError
 from ..graph.fx.inspection import flatten_nodes, node_target
-from ..graph.fx.ownership import node_belongs_to
+from ..graph.fx.ownership import NodeOwnershipIndex, is_fqn_descendant
 from ..graph.metadata import FusionBoundary, TensorAbi
 from ..operators.contracts.onnx import MDC_ONNX_OPSET
 from ..placement.inputs import INPUT_DEVICES_PROPERTY, capture_input_devices
@@ -64,23 +64,25 @@ def _structural_module_kind(module: nn.Module) -> str | None:
     return None
 
 
-def _strict_fqn_parent(parent: str, child: str) -> bool:
-    return bool(parent) and child.startswith(f"{parent}.")
-
-
 def _resolve_boundary_overlaps(
     discovered: list[tuple[str, str, tuple[str, ...]]],
 ) -> tuple[FusionBoundary, ...]:
-    node_sets = [set(nodes) for _, _, nodes in discovered]
-    for index, (_, fqn, _) in enumerate(discovered):
-        for other_index in range(index + 1, len(discovered)):
-            overlap = node_sets[index] & node_sets[other_index]
-            if not overlap:
-                continue
+    owners_by_node: dict[str, list[int]] = {}
+    overlaps_by_boundary = [set[int]() for _ in discovered]
+    for index, (_, _, nodes) in enumerate(discovered):
+        for node in dict.fromkeys(nodes):
+            earlier_indexes = owners_by_node.setdefault(node, [])
+            for earlier_index in earlier_indexes:
+                overlaps_by_boundary[earlier_index].add(index)
+            earlier_indexes.append(index)
+
+    for index, later_indexes in enumerate(overlaps_by_boundary):
+        fqn = discovered[index][1]
+        for other_index in sorted(later_indexes):
             other_fqn = discovered[other_index][1]
             if not (
-                _strict_fqn_parent(fqn, other_fqn)
-                or _strict_fqn_parent(other_fqn, fqn)
+                is_fqn_descendant(other_fqn, fqn)
+                or is_fqn_descendant(fqn, other_fqn)
             ):
                 raise UnsupportedPatternError(
                     "Overlapping fusion boundaries must have a strict FQN "
@@ -108,11 +110,14 @@ def _discover_boundaries(
     """Discover semantic boundaries from module structure and FX ownership."""
     discovered: list[tuple[str, str, tuple[str, ...]]] = []
     graph_nodes = tuple(graph.graph.nodes)
+    ownership = NodeOwnershipIndex(graph_nodes)
     for fqn, module in model.named_modules():
         kind = _structural_module_kind(module)
         if kind is None:
             continue
-        owned = tuple(node.name for node in graph_nodes if node_belongs_to(node, fqn))
+        owned = tuple(
+            node.name for node in ownership.nodes_belonging_to(fqn)
+        )
         if owned:
             discovered.append((kind, fqn, owned))
     return _resolve_boundary_overlaps(discovered)

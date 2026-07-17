@@ -14,6 +14,7 @@ from torch.fx import GraphModule, symbolic_trace
 
 import mdc_llm_deploy.graph as graph
 import mdc_llm_deploy.graph.contract as graph_contract
+import mdc_llm_deploy.graph.lifecycle as graph_lifecycle
 from mdc_llm_deploy.errors import GraphStateError, UnsupportedPatternError
 from mdc_llm_deploy.graph.lifecycle import (
     GRAPH_METADATA_KEY,
@@ -489,6 +490,84 @@ def test_transaction_failure_leaves_graph_parameters_and_metadata_unchanged() ->
     assert torch.equal(graph.weight, original_weight)
     assert metadata(graph) is original_metadata
     assert graph(torch.ones(1)).item() == pytest.approx(2.0)
+
+
+def test_transaction_detach_base_exception_restores_shared_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DetachFailure(BaseException):
+        pass
+
+    graph = _graph()
+    graph.register_parameter("tied_weight", graph.weight)
+    failure = DetachFailure("detach failed")
+    original_code = graph.code
+    original_identity = id(graph.weight)
+    original_weight = graph.weight.detach().clone()
+    original_metadata = metadata(graph)
+    original_output = graph(torch.ones(1)).detach().clone()
+
+    def fail_detach(
+        journal: graph_lifecycle._TensorMutationJournal,
+        candidate: GraphModule,
+    ) -> None:
+        raise failure
+
+    monkeypatch.setattr(
+        graph_lifecycle._TensorMutationJournal,
+        "detach_candidate",
+        fail_detach,
+    )
+
+    def mutate(candidate: GraphModule) -> None:
+        with torch.no_grad():
+            candidate.weight.fill_(99.0)
+        set_metadata(
+            candidate,
+            replace(metadata(candidate), properties={"opset": 18, "revision": 2}),
+        )
+
+    with pytest.raises(DetachFailure) as captured:
+        transactional_update(graph, mutate)
+
+    assert captured.value is failure
+    assert graph.code == original_code
+    assert id(graph.weight) == original_identity
+    assert graph.tied_weight is graph.weight
+    assert torch.equal(graph.weight, original_weight)
+    assert metadata(graph) is original_metadata
+    assert torch.equal(graph(torch.ones(1)), original_output)
+
+
+def test_transaction_restore_failure_preserves_primary_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _graph()
+    primary = RuntimeError("primary mutation failure")
+    rollback = RuntimeError("unique rollback failure")
+
+    def fail_restore(journal: graph_lifecycle._TensorMutationJournal) -> None:
+        raise rollback
+
+    monkeypatch.setattr(
+        graph_lifecycle._TensorMutationJournal,
+        "restore",
+        fail_restore,
+    )
+
+    def mutate(candidate: GraphModule) -> None:
+        with torch.no_grad():
+            candidate.weight.fill_(99.0)
+        raise primary
+
+    with pytest.raises(RuntimeError) as captured:
+        transactional_update(graph, mutate)
+
+    assert captured.value is primary
+    assert any(
+        "rollback" in note.lower() and "unique rollback failure" in note
+        for note in getattr(captured.value, "__notes__", ())
+    )
 
 
 def test_transaction_does_not_deepcopy_unchanged_tensors(

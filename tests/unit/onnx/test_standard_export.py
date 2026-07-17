@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,9 @@ from mdc_llm_deploy.graph.lifecycle import (
 )
 from mdc_llm_deploy.onnx.export.standard import (
     _example_arguments,
+    _fold_rms_norm_initializers,
+    _InitializerAliasFoldPlan,
+    _rename_initializer_references,
     export_standard_onnx,
 )
 from mdc_llm_deploy.operators.contracts.onnx import MDC_ONNX_OPSET
@@ -84,6 +88,7 @@ def _standard_model() -> onnx.ModelProto:
             helper.make_node("MatMul", ["x", "onnx_first"], ["hidden"]),
             helper.make_node("Identity", ["onnx_first"], ["weight_copy"]),
             helper.make_node("MatMul", ["hidden", "onnx_second"], ["output"]),
+            helper.make_node("Identity", ["onnx_second"], ["second_weight_copy"]),
         ],
         "standard",
         [helper.make_tensor_value_info("x", TensorProto.FLOAT, (1, 2))],
@@ -91,6 +96,51 @@ def _standard_model() -> onnx.ModelProto:
         initializer=[first, second],
     )
     return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+
+
+def _rename_reference_model() -> onnx.ModelProto:
+    initializers = [
+        numpy_helper.from_array(np.ones(2, dtype=np.float32), name=name)
+        for name in ("a", "b", "c")
+    ]
+    graph = helper.make_graph(
+        [
+            helper.make_node("Identity", ["a"], ["declared"]),
+            helper.make_node("Identity", ["a"], ["a_copy"]),
+            helper.make_node("Identity", ["b"], ["b_copy"]),
+            helper.make_node("Identity", ["c"], ["c_copy"]),
+        ],
+        "rename_references",
+        [],
+        [helper.make_tensor_value_info("declared", TensorProto.FLOAT, (2,))],
+        initializer=initializers,
+        value_info=[
+            helper.make_tensor_value_info("a_copy", TensorProto.FLOAT, (2,))
+        ],
+    )
+    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+
+
+def _ordered_renames(
+    model: onnx.ModelProto,
+    specification: list[tuple[int, str, str]],
+) -> list[tuple[onnx.TensorProto, str, str]]:
+    return [
+        (model.graph.initializer[index], old_name, new_name)
+        for index, old_name, new_name in specification
+    ]
+
+
+def _reference_rename_initializer_references(
+    model: onnx.ModelProto,
+    renames: list[tuple[onnx.TensorProto, str, str]],
+) -> None:
+    for initializer, old_name, new_name in renames:
+        initializer.name = new_name
+        for node in model.graph.node:
+            for index, input_name in enumerate(node.input):
+                if input_name == old_name:
+                    node.input[index] = new_name
 
 
 def _unfolded_standard_model() -> onnx.ModelProto:
@@ -139,6 +189,183 @@ def _rms_standard_model() -> onnx.ModelProto:
         [helper.make_tensor_value_info("x", TensorProto.FLOAT, (1, 2))],
         [helper.make_tensor_value_info("output", TensorProto.FLOAT, (1, 2))],
         initializer=[weight],
+    )
+    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+
+
+def _reference_fold_initializer_alias(
+    model: onnx.ModelProto,
+    canonical_name: str,
+) -> str | None:
+    initializers = {item.name: item for item in model.graph.initializer}
+    if canonical_name in initializers:
+        return None
+    producers = {
+        output: node for node in model.graph.node for output in node.output
+    }
+    aliases: set[str] = set()
+    source = canonical_name
+    identities: list[onnx.NodeProto] = []
+    while source not in initializers:
+        producer = producers.get(source)
+        if (
+            producer is None
+            or producer.op_type != "Identity"
+            or len(producer.input) != 1
+            or len(producer.output) != 1
+        ):
+            raise OnnxExportError(
+                f"Parameter {canonical_name!r} is not backed by an initializer"
+            )
+        identities.append(producer)
+        aliases.add(source)
+        source = producer.input[0]
+    initializer = onnx.TensorProto()
+    initializer.CopyFrom(initializers[source])
+    initializer.name = canonical_name
+    model.graph.initializer.append(initializer)
+    identity_ids = {id(node) for node in identities}
+    for node in model.graph.node:
+        if id(node) in identity_ids:
+            continue
+        for index, input_name in enumerate(node.input):
+            if input_name in aliases:
+                node.input[index] = canonical_name
+    for identity in identities:
+        model.graph.node.remove(identity)
+    retained_values = [
+        item
+        for item in model.graph.value_info
+        if item.name not in aliases or item.name == canonical_name
+    ]
+    del model.graph.value_info[:]
+    model.graph.value_info.extend(retained_values)
+    return source
+
+
+def _reference_fold_rms_norm_initializers(
+    model: onnx.ModelProto,
+    metadata: GraphMetadata,
+) -> None:
+    alias_sources: set[str] = set()
+    for boundary in metadata.boundaries:
+        if boundary.kind == "rms_norm":
+            source = _reference_fold_initializer_alias(
+                model,
+                f"graph.{boundary.fqn}.weight",
+            )
+            if source is not None:
+                alias_sources.add(source)
+    used_inputs = {
+        input_name
+        for node in model.graph.node
+        for input_name in node.input
+        if input_name
+    }
+    retained_initializers = [
+        item
+        for item in model.graph.initializer
+        if item.name not in alias_sources or item.name in used_inputs
+    ]
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(retained_initializers)
+
+
+def _rms_metadata(*fqns: str) -> GraphMetadata:
+    value = _metadata()
+    return GraphMetadata(
+        schema_version=value.schema_version,
+        stage=value.stage,
+        model_kind=value.model_kind,
+        input_abi=value.input_abi,
+        output_abi=value.output_abi,
+        boundaries=tuple(
+            FusionBoundary("rms_norm", fqn, (f"node_{index}",))
+            for index, fqn in enumerate(fqns)
+        ),
+        sequence_length=value.sequence_length,
+        properties=value.properties,
+    )
+
+
+def _assert_rms_fold_matches_reference(
+    model: onnx.ModelProto,
+    metadata: GraphMetadata,
+) -> onnx.ModelProto:
+    reference = copy.deepcopy(model)
+    actual = copy.deepcopy(model)
+    _reference_fold_rms_norm_initializers(reference, metadata)
+    _fold_rms_norm_initializers(actual, metadata)
+    assert actual.SerializeToString(deterministic=True) == (
+        reference.SerializeToString(deterministic=True)
+    )
+    return actual
+
+
+def _independent_alias_model(*, shared_source: bool = False) -> onnx.ModelProto:
+    first_source = "shared" if shared_source else "source_first"
+    second_source = "shared" if shared_source else "source_second"
+    initializer_names = (
+        ("shared",) if shared_source else ("source_first", "source_second")
+    )
+    nodes = [
+        helper.make_node("Identity", [first_source], ["first_inner"], name="first_0"),
+        helper.make_node(
+            "Identity",
+            ["first_inner"],
+            ["graph.first.weight"],
+            name="first_1",
+        ),
+        helper.make_node("Add", ["x", "first_inner"], ["unrelated"]),
+        helper.make_node(
+            "Identity",
+            [second_source],
+            ["second_inner"],
+            name="second_0",
+        ),
+        helper.make_node(
+            "Identity",
+            ["second_inner"],
+            ["graph.second.weight"],
+            name="second_1",
+        ),
+        helper.make_node(
+            "Add",
+            ["graph.first.weight", "graph.first.weight"],
+            ["first_used"],
+        ),
+        helper.make_node(
+            "Identity",
+            ["second_inner"],
+            ["chain_external"],
+            name="external_identity",
+        ),
+        helper.make_node(
+            "Add",
+            ["graph.second.weight", "chain_external"],
+            ["output"],
+        ),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "independent_aliases",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, (2,))],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, (2,))],
+        initializer=[
+            numpy_helper.from_array(np.ones(2, dtype=np.float32), name=name)
+            for name in initializer_names
+        ],
+        value_info=[
+            helper.make_tensor_value_info(name, TensorProto.FLOAT, (2,))
+            for name in (
+                "first_inner",
+                "first_inner",
+                "graph.first.weight",
+                "unrelated",
+                "second_inner",
+                "graph.second.weight",
+            )
+        ],
     )
     return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
 
@@ -249,6 +476,7 @@ def test_standard_export_restores_initializer_fqns_and_all_references(
         ["x", "graph.first_weight"],
         ["graph.first_weight"],
         ["hidden", "graph.second_weight"],
+        ["graph.second_weight"],
     ]
     assert export_options["opset_version"] == MDC_ONNX_OPSET
     assert export_options["export_params"] is True
@@ -257,6 +485,265 @@ def test_standard_export_restores_initializer_fqns_and_all_references(
     assert export_options["training"] is torch.onnx.TrainingMode.PRESERVE
     assert export_options["dynamo"] is False
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "specification",
+    [
+        pytest.param([(0, "a", "b"), (1, "b", "a")], id="swap"),
+        pytest.param([(0, "a", "b"), (1, "b", "next")], id="chain"),
+        pytest.param([(0, "a", "first"), (0, "a", "second")], id="repeated-old"),
+        pytest.param([(0, "a", "same"), (1, "b", "same")], id="repeated-target"),
+        pytest.param([(0, "a", "c")], id="occupied-initializer"),
+        pytest.param([(0, "a", "declared")], id="occupied-declaration"),
+    ],
+)
+def test_initializer_reference_rename_conflicts_match_ordered_reference(
+    specification: list[tuple[int, str, str]],
+) -> None:
+    reference = _rename_reference_model()
+    actual = copy.deepcopy(reference)
+
+    _reference_rename_initializer_references(
+        reference,
+        _ordered_renames(reference, specification),
+    )
+    _rename_initializer_references(
+        actual,
+        _ordered_renames(actual, specification),
+    )
+
+    assert actual.SerializeToString(deterministic=True) == (
+        reference.SerializeToString(deterministic=True)
+    )
+
+
+def test_initializer_reference_rename_fast_path_matches_ordered_reference() -> None:
+    specification = [(0, "a", "first"), (1, "b", "second")]
+    reference = _rename_reference_model()
+    actual = copy.deepcopy(reference)
+
+    _reference_rename_initializer_references(
+        reference,
+        _ordered_renames(reference, specification),
+    )
+    _rename_initializer_references(
+        actual,
+        _ordered_renames(actual, specification),
+    )
+
+    assert actual.SerializeToString(deterministic=True) == (
+        reference.SerializeToString(deterministic=True)
+    )
+    onnx.checker.check_model(actual, full_check=True)
+
+
+@pytest.mark.parametrize("shared_source", [False, True])
+def test_rms_initializer_alias_fast_path_matches_frozen_reference(
+    shared_source: bool,
+) -> None:
+    model = _independent_alias_model(shared_source=shared_source)
+    metadata = _rms_metadata("first", "second")
+    assert (
+        _InitializerAliasFoldPlan.try_build(
+            model,
+            ("graph.first.weight", "graph.second.weight"),
+        )
+        is not None
+    )
+
+    actual = _assert_rms_fold_matches_reference(model, metadata)
+
+    assert [node.name for node in actual.graph.node] == [
+        "",
+        "",
+        "external_identity",
+        "",
+    ]
+    assert [item.name for item in actual.graph.value_info] == [
+        "graph.first.weight",
+        "unrelated",
+        "graph.second.weight",
+    ]
+    onnx.checker.check_model(actual, full_check=True)
+
+
+def test_rms_initializer_alias_duplicate_initializer_uses_last_wins_fallback() -> None:
+    model = _independent_alias_model()
+    model.graph.initializer.insert(
+        0,
+        numpy_helper.from_array(
+            np.zeros(2, dtype=np.float32),
+            name="source_first",
+        ),
+    )
+    assert (
+        _InitializerAliasFoldPlan.try_build(
+            model,
+            ("graph.first.weight", "graph.second.weight"),
+        )
+        is None
+    )
+    actual = _assert_rms_fold_matches_reference(
+        model,
+        _rms_metadata("first", "second"),
+    )
+    first = next(
+        item
+        for item in actual.graph.initializer
+        if item.name == "graph.first.weight"
+    )
+    np.testing.assert_array_equal(
+        numpy_helper.to_array(first),
+        np.ones(2, dtype=np.float32),
+    )
+
+
+def test_rms_initializer_alias_duplicate_producer_preserves_earlier_node() -> None:
+    model = _independent_alias_model()
+    model.graph.node.insert(
+        0,
+        helper.make_node(
+            "Identity",
+            ["source_first"],
+            ["graph.first.weight"],
+            name="earlier_duplicate",
+        ),
+    )
+    assert (
+        _InitializerAliasFoldPlan.try_build(
+            model,
+            ("graph.first.weight", "graph.second.weight"),
+        )
+        is None
+    )
+    actual = _assert_rms_fold_matches_reference(
+        model,
+        _rms_metadata("first", "second"),
+    )
+    assert "earlier_duplicate" in [node.name for node in actual.graph.node]
+
+
+@pytest.mark.parametrize(
+    ("fqns", "fails"),
+    [
+        (("first", "second"), False),
+        (("second", "first"), True),
+    ],
+)
+def test_rms_initializer_shared_chain_falls_back_in_boundary_order(
+    fqns: tuple[str, str],
+    fails: bool,
+) -> None:
+    source = numpy_helper.from_array(
+        np.ones(2, dtype=np.float32),
+        name="source",
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node("Identity", ["source"], ["shared"]),
+            helper.make_node(
+                "Identity",
+                ["shared"],
+                ["graph.first.weight"],
+            ),
+            helper.make_node(
+                "Identity",
+                ["graph.first.weight"],
+                ["graph.second.weight"],
+            ),
+            helper.make_node("Add", ["graph.second.weight", "x"], ["output"]),
+        ],
+        "shared_chain",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, (2,))],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, (2,))],
+        initializer=[source],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    assert (
+        _InitializerAliasFoldPlan.try_build(
+            model,
+            tuple(f"graph.{fqn}.weight" for fqn in fqns),
+        )
+        is None
+    )
+    metadata = _rms_metadata(*fqns)
+    if not fails:
+        _assert_rms_fold_matches_reference(model, metadata)
+        return
+
+    reference = copy.deepcopy(model)
+    actual = copy.deepcopy(model)
+    with pytest.raises(OnnxExportError) as reference_error:
+        _reference_fold_rms_norm_initializers(reference, metadata)
+    with pytest.raises(OnnxExportError) as actual_error:
+        _fold_rms_norm_initializers(actual, metadata)
+    assert str(actual_error.value) == str(reference_error.value)
+    assert actual.SerializeToString(deterministic=True) == (
+        reference.SerializeToString(deterministic=True)
+    )
+
+
+def test_rms_initializer_existing_canonical_no_op_matches_reference() -> None:
+    model = _independent_alias_model()
+    model.graph.initializer.append(
+        numpy_helper.from_array(
+            np.full(2, 3.0, dtype=np.float32),
+            name="graph.first.weight",
+        )
+    )
+    _assert_rms_fold_matches_reference(
+        model,
+        _rms_metadata("first", "second"),
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_node",
+    [
+        pytest.param(None, id="missing-producer"),
+        pytest.param(
+            helper.make_node("Add", ["x", "x"], ["graph.invalid.weight"]),
+            id="non-identity",
+        ),
+        pytest.param(
+            helper.make_node(
+                "Identity",
+                ["source_invalid", "x"],
+                ["graph.invalid.weight"],
+            ),
+            id="invalid-arity",
+        ),
+    ],
+)
+def test_rms_initializer_failure_preserves_reference_partial_mutation(
+    invalid_node: onnx.NodeProto | None,
+) -> None:
+    model = _independent_alias_model()
+    if invalid_node is not None:
+        model.graph.node.append(invalid_node)
+        if invalid_node.op_type == "Identity":
+            model.graph.initializer.append(
+                numpy_helper.from_array(
+                    np.ones(2, dtype=np.float32),
+                    name="source_invalid",
+                )
+            )
+    metadata = _rms_metadata("first", "invalid")
+    reference = copy.deepcopy(model)
+    actual = copy.deepcopy(model)
+
+    with pytest.raises(OnnxExportError) as reference_error:
+        _reference_fold_rms_norm_initializers(reference, metadata)
+    with pytest.raises(OnnxExportError) as actual_error:
+        _fold_rms_norm_initializers(actual, metadata)
+
+    assert type(actual_error.value) is type(reference_error.value)
+    assert str(actual_error.value) == str(reference_error.value)
+    assert actual_error.value.__cause__ is reference_error.value.__cause__ is None
+    assert actual.SerializeToString(deterministic=True) == (
+        reference.SerializeToString(deterministic=True)
+    )
 
 
 def test_standard_export_folds_linear_transposes_without_jit_constant_folding(

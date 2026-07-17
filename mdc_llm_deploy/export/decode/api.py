@@ -118,7 +118,17 @@ def convert_to_decode(graph: GraphModule) -> GraphModule:
 
         _rewrite_position_nodes(candidate, value.sequence_length)
         _rewrite_rotary_cache(candidate, value.sequence_length)
-        _remove_prefill_causal_mask(candidate)
+        attention_nodes = frozenset(
+            node
+            for boundary in value.boundaries
+            if boundary.kind == "attention"
+            for node in boundary.nodes
+        )
+        _remove_prefill_causal_mask(
+            candidate,
+            attention_nodes=attention_nodes,
+            sequence_length=value.sequence_length,
+        )
         _rewrite_static_shapes(candidate, value.sequence_length)
         candidate.graph.eliminate_dead_code()
         set_metadata(
@@ -126,6 +136,4 @@ def convert_to_decode(graph: GraphModule) -> GraphModule:
             build_decode_metadata(candidate, value),
         )
 
-    updated = transactional_update(graph, mutate)
-    updated.recompile()
-    return updated
+    return transactional_update(graph, mutate)

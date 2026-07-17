@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import copy
 import hashlib
+from collections.abc import Iterator
 
 import pytest
 import torch
+from torch.fx import Graph, GraphModule
 
 import mdc_llm_deploy.quantization.materialization as quantization_materialization
 from mdc_llm_deploy.errors import QuantizationConfigError
 from mdc_llm_deploy.export import export
-from mdc_llm_deploy.graph.lifecycle import GraphStage, metadata
+from mdc_llm_deploy.graph.lifecycle import (
+    GraphMetadata,
+    GraphStage,
+    TensorAbi,
+    metadata,
+    set_metadata,
+)
 from mdc_llm_deploy.quantization import (
     calculate_qparams,
     oneshot,
@@ -26,6 +34,10 @@ from mdc_llm_deploy.quantization.algorithms.math import (
 )
 from mdc_llm_deploy.quantization.calibration import collect_calibration_samples
 from mdc_llm_deploy.quantization.config import QuantizationConfig
+from mdc_llm_deploy.quantization.planning import (
+    CalibrationPlan,
+    plan_calibration,
+)
 from tests.support.models.qwen3 import dense_model, moe_model
 
 pytestmark = pytest.mark.integration
@@ -143,6 +155,70 @@ def test_minmax_linear_materializes_independent_reference() -> None:
     assert "gptq" not in value.properties
     assert value.properties["activation_qparams"]["lm_head"]["bits"] == 8
     assert len(value.properties["quantized_integer_sha256"]["lm_head"]) == 64
+
+
+def test_materialization_captures_candidate_parameters_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _graph()
+    config = QuantizationConfig.load(
+        "configs/quantization/minmax-linear-w8a8.json"
+    )
+    plan = plan_quantization(graph, config)
+    capture_calls = 0
+    snapshot_calls = 0
+    capture_active = False
+    original_capture = (
+        quantization_materialization.MaterializationContext.capture
+    )
+    original_named_parameters = GraphModule.named_parameters
+
+    def capture_spy(
+        cls: type[quantization_materialization.MaterializationContext],
+        candidate: GraphModule,
+    ) -> quantization_materialization.MaterializationContext:
+        del cls
+        nonlocal capture_active, capture_calls
+        capture_calls += 1
+        capture_active = True
+        try:
+            return original_capture(candidate)
+        finally:
+            capture_active = False
+
+    def named_parameters_spy(
+        self: GraphModule,
+        prefix: str = "",
+        recurse: bool = True,
+        remove_duplicate: bool = True,
+    ) -> Iterator[tuple[str, torch.nn.Parameter]]:
+        nonlocal snapshot_calls
+        if capture_active:
+            assert remove_duplicate is False
+            snapshot_calls += 1
+        return original_named_parameters(
+            self,
+            prefix=prefix,
+            recurse=recurse,
+            remove_duplicate=remove_duplicate,
+        )
+
+    monkeypatch.setattr(
+        quantization_materialization.MaterializationContext,
+        "capture",
+        classmethod(capture_spy),
+    )
+    monkeypatch.setattr(
+        GraphModule,
+        "named_parameters",
+        named_parameters_spy,
+    )
+
+    oneshot(graph, config, [_inputs()])
+
+    assert len(plan) > 1
+    assert capture_calls == 1
+    assert snapshot_calls == 1
 
 
 def test_attention_and_moe_materialization_contracts() -> None:
@@ -434,6 +510,64 @@ def _tied_minmax_config() -> dict[str, object]:
     }
 
 
+def _tied_moe_minmax_config() -> dict[str, object]:
+    return {
+        "modifiers": [
+            {
+                "type": "minmax",
+                "include": ["experts.0", "experts.1"],
+                "moe": {
+                    "weight": {
+                        "bits": 8,
+                        "granularity": "per_tensor",
+                        "symmetric": True,
+                    }
+                },
+            }
+        ]
+    }
+
+
+def _tied_ordinary_moe_graph() -> GraphModule:
+    root = torch.nn.Module()
+    root.add_module(
+        "experts",
+        torch.nn.ModuleList(
+            [
+                torch.nn.Linear(4, 4, bias=False),
+                torch.nn.Linear(4, 4, bias=False),
+            ]
+        ),
+    )
+    root.experts[1].weight = root.experts[0].weight
+    graph = Graph()
+    value = graph.placeholder("input_ids")
+    first_weight = graph.get_attr("experts.0.weight")
+    first = graph.call_function(
+        torch.ops.aten.linear.default,
+        (value, first_weight, None),
+    )
+    second_weight = graph.get_attr("experts.1.weight")
+    second = graph.call_function(
+        torch.ops.aten.linear.default,
+        (value, second_weight, None),
+    )
+    graph.output(graph.call_function(torch.ops.aten.add.Tensor, (first, second)))
+    module = GraphModule(root, graph)
+    set_metadata(
+        module,
+        GraphMetadata(
+            schema_version=1,
+            stage=GraphStage.FLOAT_PREFILL,
+            model_kind="moe",
+            input_abi=(TensorAbi("input_ids", "float32", (1, 4)),),
+            output_abi=(TensorAbi("output", "float32", (1, 4)),),
+            sequence_length=4,
+        ),
+    )
+    return module
+
+
 def test_oneshot_materializes_tied_parameter_once_and_preserves_aliases() -> None:
     class TiedLinearModel(torch.nn.Module):
         def __init__(self) -> None:
@@ -456,6 +590,28 @@ def test_oneshot_materializes_tied_parameter_once_and_preserves_aliases() -> Non
     assert graph.first.weight.device == before_device
     assert {target.fqn for target in metadata(graph).quantized_targets} == {
         "second"
+    }
+
+
+def test_minmax_tied_ordinary_moe_needs_no_calibration_samples() -> None:
+    graph = _tied_ordinary_moe_graph()
+    config = QuantizationConfig.load(_tied_moe_minmax_config())
+    plan = plan_quantization(graph, config)
+    inputs = {"input_ids": torch.arange(4, dtype=torch.float32).reshape(1, 4)}
+
+    assert {target.fqn for target in plan} == {"experts.0", "experts.1"}
+    assert plan_calibration(plan).required_fqns == frozenset()
+
+    same = oneshot(graph, config, [inputs])
+
+    assert same is graph
+    assert (
+        graph.get_submodule("experts.0").weight
+        is graph.get_submodule("experts.1").weight
+    )
+    assert {target.fqn for target in metadata(graph).quantized_targets} == {
+        "experts.0",
+        "experts.1",
     }
 
 
@@ -482,7 +638,11 @@ def test_oneshot_aggregates_each_target_on_its_resident_device() -> None:
         "input_ids": torch.arange(4, device="cuda:0").reshape(1, 4)
     }
     graph = export(ResidentLinearModel().eval(), inputs)
-    samples = collect_calibration_samples(graph, [inputs, inputs])
+    samples = collect_calibration_samples(
+        graph,
+        [inputs, inputs],
+        CalibrationPlan(frozenset({"first", "second"})),
+    )
 
     assert samples["first"].device == torch.device("cuda:0")
     assert samples["second"].device == torch.device("cuda:1")

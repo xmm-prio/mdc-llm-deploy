@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 
 import onnx
 
@@ -18,36 +21,67 @@ CUSTOM_OPS = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _QuantizedTargetScan:
+    initializers: Mapping[str, onnx.TensorProto]
+    producers: Mapping[str, onnx.NodeProto]
+    moe_nodes: tuple[onnx.NodeProto, ...]
+    attention_nodes: tuple[onnx.NodeProto, ...]
+    dequant_nodes: tuple[onnx.NodeProto, ...]
+
+    @classmethod
+    def collect(cls, model: onnx.ModelProto) -> _QuantizedTargetScan:
+        """Collect immutable inputs for quantized target classification."""
+        initializers: dict[str, onnx.TensorProto] = {}
+        for initializer in model.graph.initializer:
+            initializers[initializer.name] = initializer
+
+        producers: dict[str, onnx.NodeProto] = {}
+        moe_nodes: list[onnx.NodeProto] = []
+        attention_nodes: list[onnx.NodeProto] = []
+        dequant_nodes: list[onnx.NodeProto] = []
+        candidates = {
+            "MoeExpert": moe_nodes,
+            "FusedInferAttentionScore": attention_nodes,
+            "AscendDequant": dequant_nodes,
+        }
+        for node in model.graph.node:
+            for output in node.output:
+                if output:
+                    producers[output] = node
+            candidate_nodes = candidates.get(node.op_type)
+            if candidate_nodes is not None:
+                candidate_nodes.append(node)
+
+        return cls(
+            initializers=MappingProxyType(initializers),
+            producers=MappingProxyType(producers),
+            moe_nodes=tuple(moe_nodes),
+            attention_nodes=tuple(attention_nodes),
+            dequant_nodes=tuple(dequant_nodes),
+        )
+
+
 def quantized_target_families(
     model: onnx.ModelProto,
 ) -> frozenset[str]:
     """Infer quantized target families from validated graph topology."""
-    initializers = {
-        item.name: item for item in model.graph.initializer
-    }
-    producers = {
-        output: node
-        for node in model.graph.node
-        for output in node.output
-        if output
-    }
+    scan = _QuantizedTargetScan.collect(model)
     result: set[str] = set()
-    moe_nodes = [
-        node
-        for node in model.graph.node
-        if node.op_type == "MoeExpert"
-    ]
     quantized_moe_nodes = [
         node
-        for node in moe_nodes
+        for node in scan.moe_nodes
         if (
             len(node.input) > 4
             and bool(node.input[4])
-            and (weight := initializers.get(node.input[3])) is not None
+            and (weight := scan.initializers.get(node.input[3])) is not None
             and weight.data_type == onnx.TensorProto.INT8
         )
     ]
-    if quantized_moe_nodes and len(quantized_moe_nodes) != len(moe_nodes):
+    if (
+        quantized_moe_nodes
+        and len(quantized_moe_nodes) != len(scan.moe_nodes)
+    ):
         raise OnnxExportError(
             "MoeExpert quantization coverage is inconsistent"
         )
@@ -68,14 +102,9 @@ def quantized_target_families(
         AttentionInput.KEY_ROPE_ANTIQUANT_SCALE,
         AttentionInput.DEQUANT_SCALE_QUERY,
     )
-    attention_nodes = [
-        node
-        for node in model.graph.node
-        if node.op_type == "FusedInferAttentionScore"
-    ]
     quantized_attention_nodes = [
         node
-        for node in attention_nodes
+        for node in scan.attention_nodes
         if any(
             index < len(node.input) and bool(node.input[index])
             for index in attention_quantization_inputs
@@ -83,24 +112,24 @@ def quantized_target_families(
     ]
     if (
         quantized_attention_nodes
-        and len(quantized_attention_nodes) != len(attention_nodes)
+        and len(quantized_attention_nodes) != len(scan.attention_nodes)
     ):
         raise OnnxExportError(
             "Attention quantization coverage is inconsistent"
         )
     if quantized_attention_nodes:
         result.add("attention")
-    for node in model.graph.node:
-        if node.op_type != "AscendDequant" or not node.input:
+    for node in scan.dequant_nodes:
+        if not node.input:
             continue
-        accumulator = producers.get(node.input[0])
+        accumulator = scan.producers.get(node.input[0])
         if (
             accumulator is None
             or accumulator.op_type != "MatMul"
             or not accumulator.input
         ):
             continue
-        quantizer = producers.get(accumulator.input[0])
+        quantizer = scan.producers.get(accumulator.input[0])
         if (
             quantizer is not None
             and quantizer.op_type == "NPUAscendQuantV2"

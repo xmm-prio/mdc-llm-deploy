@@ -143,7 +143,33 @@ def test_inline_failure_restores_previous_external_pair(
     assert _weight_value(target) == 1.0
 
 
-def test_snapshot_failure_does_not_change_targets(
+def test_link_snapshot_failure_falls_back_to_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "model.onnx"
+    data_target = tmp_path / "model.onnx.data"
+    commit_validated_onnx(_model(1.0), target, external_data=True)
+
+    def link(
+        source: Path,
+        destination: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        raise PermissionError("link snapshot failed")
+
+    monkeypatch.setattr(artifact_io.os, "link", link)
+
+    commit_validated_onnx(_model(2.0), target, external_data=True)
+
+    assert target.is_file()
+    assert data_target.is_file()
+    assert _weight_value(target) == 2.0
+    assert not any(path.name.startswith(".model") for path in tmp_path.iterdir())
+
+
+def test_copy_snapshots_restore_previous_external_pair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -152,24 +178,81 @@ def test_snapshot_failure_does_not_change_targets(
     commit_validated_onnx(_model(1.0), target, external_data=True)
     original_model = target.read_bytes()
     original_data = data_target.read_bytes()
-    replace_calls = 0
 
-    def link(source: Path, destination: Path) -> None:
-        raise OSError("snapshot failed")
+    def link(
+        source: Path,
+        destination: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        raise OSError("link snapshot failed")
+
+    monkeypatch.setattr(artifact_io.os, "link", link)
+    _fail_model_publication_once(monkeypatch, target)
+
+    with pytest.raises(OnnxExportError, match="model publication failed"):
+        commit_validated_onnx(_model(2.0), target, external_data=True)
+
+    assert target.read_bytes() == original_model
+    assert data_target.read_bytes() == original_data
+    assert _weight_value(target) == 1.0
+    assert not any(path.name.startswith(".model") for path in tmp_path.iterdir())
+
+
+def test_partial_copy_snapshot_failure_does_not_start_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "model.onnx"
+    data_target = tmp_path / "model.onnx.data"
+    commit_validated_onnx(_model(1.0), target, external_data=True)
+    original_model = target.read_bytes()
+    original_data = data_target.read_bytes()
+    real_copy2 = artifact_io.shutil.copy2
+    copy_calls = 0
+    replace_calls = 0
+    copy_error = OSError("copy snapshot failed")
+
+    def link(
+        source: Path,
+        destination: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        raise OSError("link snapshot failed")
+
+    def copy2(
+        source: Path,
+        destination: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> str:
+        nonlocal copy_calls
+        copy_calls += 1
+        if copy_calls == 2:
+            raise copy_error
+        return real_copy2(source, destination, follow_symlinks=follow_symlinks)
 
     def replace(source: Path, destination: Path) -> None:
         nonlocal replace_calls
         replace_calls += 1
 
     monkeypatch.setattr(artifact_io.os, "link", link)
+    monkeypatch.setattr(artifact_io.shutil, "copy2", copy2)
     monkeypatch.setattr(artifact_io.os, "replace", replace)
 
-    with pytest.raises(OnnxExportError, match="snapshot failed"):
+    with pytest.raises(
+        OnnxExportError,
+        match=r"link snapshot failed.*copy snapshot failed",
+    ) as raised:
         commit_validated_onnx(_model(2.0), target, external_data=True)
 
+    assert raised.value.__cause__ is copy_error
     assert replace_calls == 0
     assert target.read_bytes() == original_model
     assert data_target.read_bytes() == original_data
+    assert _weight_value(target) == 1.0
+    assert not any(path.name.startswith(".model") for path in tmp_path.iterdir())
 
 
 def test_rollback_failure_reports_both_errors(

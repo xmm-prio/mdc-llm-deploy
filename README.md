@@ -48,7 +48,8 @@ prefill 和 decode ONNX 都只公开 `logits` 输出。decode KV 缓存由调用
 
 - `AutoExportModel.from_pretrained(source, export_config, *, dtype=torch.float16, revision=None, local_files_only=False)`
 从本地目录或 Hugging Face Hub 加载单文件或分片 safetensors，并按 checkpoint 自动选择
-Qwen3 Dense 或 Qwen3-MoE。
+Qwen3 Dense 或 Qwen3-MoE。只有已存在目录会按本地源处理；已存在的非目录路径会抛出
+`ValueError`，其他值按 Hugging Face Hub 仓库 ID 解析。
 - `ExportModelConfig(sequence_length, mask_mode="causal")`
 固定序列长度、RoPE cache 和 mask 语义。`mask_mode` 仅接受 `"causal"` 或 `"none"`；
 ONNX API 不再单独接收 mask 参数。

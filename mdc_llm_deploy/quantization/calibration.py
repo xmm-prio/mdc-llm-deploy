@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -11,8 +13,58 @@ from torch.fx import GraphModule, Interpreter, Node
 
 from ..errors import QuantizationConfigError
 from ..graph.fx.inspection import linear_weight_name
-from ..graph.fx.ownership import node_belongs_to
+from ..graph.fx.ownership import NodeOwnershipIndex
 from ..graph.lifecycle import metadata
+from .planning import CalibrationPlan
+
+
+def _first_owner_by_node(
+    index: NodeOwnershipIndex,
+    nodes: tuple[Node, ...],
+    candidates: tuple[str, ...],
+) -> dict[Node, str | None]:
+    owners = dict.fromkeys(nodes)
+    for candidate in candidates:
+        for node in index.nodes_belonging_to(candidate):
+            if owners[node] is None:
+                owners[node] = candidate
+    return owners
+
+
+@dataclass(frozen=True, slots=True)
+class _CalibrationOwnershipSnapshot:
+    """Resolved calibration ownership for one immutable graph execution phase."""
+
+    attention_by_node: Mapping[Node, str | None]
+    moe_by_node: Mapping[Node, str | None]
+
+    @classmethod
+    def capture(
+        cls,
+        graph: GraphModule,
+        attention_fqns: tuple[str, ...],
+        moe_fqns: tuple[str, ...],
+    ) -> _CalibrationOwnershipSnapshot:
+        """Resolve ordered calibration owners once for all graph executions."""
+        nodes = tuple(
+            node for node in graph.graph.nodes if node.op == "call_function"
+        )
+        index = NodeOwnershipIndex(nodes)
+        attention = _first_owner_by_node(index, nodes, attention_fqns)
+        moe = _first_owner_by_node(index, nodes, moe_fqns)
+        if len(moe_fqns) == 1:
+            fallback = moe_fqns[0]
+            for node in nodes:
+                if (
+                    node.target
+                    == torch.ops.mdc_llm_deploy.moe_expert.default
+                    and moe[node] is None
+                ):
+                    moe[node] = fallback
+        return cls(
+            attention_by_node=MappingProxyType(attention),
+            moe_by_node=MappingProxyType(moe),
+        )
 
 
 class _CalibrationInterpreter(Interpreter):
@@ -21,27 +73,19 @@ class _CalibrationInterpreter(Interpreter):
     def __init__(
         self,
         graph: GraphModule,
-        attention_fqns: tuple[str, ...],
-        moe_fqns: tuple[str, ...] = (),
+        required_fqns: frozenset[str],
+        ownership: _CalibrationOwnershipSnapshot,
     ) -> None:
         super().__init__(graph, garbage_collect_values=True)
-        self.attention_fqns = attention_fqns
-        self.moe_fqns = moe_fqns
+        self.required_fqns = required_fqns
+        self.ownership = ownership
         self.samples: dict[str, list[Tensor]] = {}
 
     def _record(self, name: str, value: Any) -> None:
+        if name not in self.required_fqns:
+            return
         if isinstance(value, Tensor) and value.is_floating_point():
             self.samples.setdefault(name, []).append(value.detach())
-
-    def _attention_fqn(self, node: Node) -> str | None:
-        return next(
-            (
-                fqn
-                for fqn in self.attention_fqns
-                if node_belongs_to(node, fqn)
-            ),
-            None,
-        )
 
     def run_node(self, node: Node) -> Any:
         """Execute one node and retain only quantization boundary tensors."""
@@ -49,6 +93,7 @@ class _CalibrationInterpreter(Interpreter):
         result = super().run_node(node)
         if node.op != "call_function":
             return result
+        attention_fqn = self.ownership.attention_by_node.get(node)
         weight_name = linear_weight_name(node)
         if weight_name is not None:
             fqn = weight_name.removesuffix(".weight")
@@ -58,10 +103,8 @@ class _CalibrationInterpreter(Interpreter):
                 "k_proj": "key",
                 "v_proj": "value",
             }.get(fqn.rsplit(".", 1)[-1])
-            attention_fqn = self._attention_fqn(node)
             if edge is not None and attention_fqn is not None:
                 self._record(f"{attention_fqn}.{edge}", result)
-        attention_fqn = self._attention_fqn(node)
         if (
             attention_fqn is not None
             and node.target == torch.ops.aten.mul.Tensor
@@ -74,16 +117,8 @@ class _CalibrationInterpreter(Interpreter):
         if (
             node.target
             == torch.ops.mdc_llm_deploy.moe_expert.default
-            and self.moe_fqns
         ):
-            owner = next(
-                (
-                    fqn
-                    for fqn in self.moe_fqns
-                    if node_belongs_to(node, fqn)
-                ),
-                self.moe_fqns[0] if len(self.moe_fqns) == 1 else None,
-            )
+            owner = self.ownership.moe_by_node.get(node)
             if owner is not None:
                 self._record(f"{owner}.expert_weights", args[0])
         return result
@@ -92,6 +127,7 @@ class _CalibrationInterpreter(Interpreter):
 def collect_calibration_samples(
     graph: GraphModule,
     dataloader: Iterable[Mapping[str, Tensor]],
+    plan: CalibrationPlan,
 ) -> dict[str, Tensor]:
     """Validate calibration batches and collect quantization-boundary samples."""
     graph_metadata = metadata(graph)
@@ -110,6 +146,7 @@ def collect_calibration_samples(
         if boundary.kind == "moe"
     )
     captured: dict[str, list[Tensor]] = {}
+    ownership: _CalibrationOwnershipSnapshot | None = None
     observed = 0
     for batch in dataloader:
         if not isinstance(batch, Mapping):
@@ -141,12 +178,18 @@ def collect_calibration_samples(
                 raise QuantizationConfigError(
                     f"Calibration value {name!r} contains NaN or Inf"
                 )
-        recorder = _CalibrationInterpreter(
-            graph,
-            attention_fqns,
-            moe_fqns,
-        )
         try:
+            if ownership is None:
+                ownership = _CalibrationOwnershipSnapshot.capture(
+                    graph,
+                    attention_fqns,
+                    moe_fqns,
+                )
+            recorder = _CalibrationInterpreter(
+                graph,
+                plan.required_fqns,
+                ownership,
+            )
             with torch.inference_mode():
                 recorder.run(*(batch[name] for name in expected))
         except Exception as error:

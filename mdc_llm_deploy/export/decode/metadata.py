@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from torch import Tensor
-from torch.fx import GraphModule
+from torch.fx import GraphModule, Node
 
 from ...errors import GraphStateError
 from ...graph.fx.inspection import node_target
@@ -20,7 +20,12 @@ def build_decode_metadata(
     value: GraphMetadata,
 ) -> GraphMetadata:
     """Build metadata matching a rewritten one-token decode graph."""
-    live_nodes = {node.name for node in candidate.graph.nodes}
+    live_nodes: set[str] = set()
+    placeholder_nodes: dict[str, Node] = {}
+    for node in candidate.graph.nodes:
+        live_nodes.add(node.name)
+        if node.op == "placeholder":
+            placeholder_nodes.setdefault(node.name, node)
     boundaries = tuple(
         replace(
             boundary,
@@ -107,14 +112,8 @@ def build_decode_metadata(
     cache_devices: dict[str, str] = {}
     for layer_id in range(len(cache_outputs) // 2):
         for edge in ("key", "value"):
-            node = next(
-                (
-                    item
-                    for item in candidate.graph.nodes
-                    if item.op == "placeholder"
-                    and item.name == f"past_{layer_id}_{edge}"
-                ),
-                None,
+            node = placeholder_nodes.get(
+                f"past_{layer_id}_{edge}"
             )
             tensor = node.meta.get("val") if node is not None else None
             if not isinstance(tensor, Tensor):

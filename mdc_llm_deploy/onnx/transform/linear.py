@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -20,8 +21,129 @@ from .support import (
     model_types,
     offset_initializer,
     scale_initializer,
-    unique_name,
 )
+
+
+@dataclass
+class _LinearLoweringContext:
+    """Maintain call-local indexes for quantized linear graph mutations."""
+
+    model: onnx.ModelProto
+    _initializers_by_name: dict[str, onnx.TensorProto]
+    _linear_nodes_by_weight: dict[str, list[onnx.NodeProto]]
+    _types: dict[str, tuple[int, tuple[int, ...]]]
+    _names: set[str]
+
+    @classmethod
+    def from_model(cls, model: onnx.ModelProto) -> _LinearLoweringContext:
+        """Build indexes with the graph's existing lookup semantics."""
+        initializers_by_name: dict[str, onnx.TensorProto] = {}
+        names: set[str] = set()
+        for item in model.graph.initializer:
+            initializers_by_name.setdefault(item.name, item)
+            names.add(item.name)
+
+        linear_nodes_by_weight: dict[str, list[onnx.NodeProto]] = {}
+        for node in model.graph.node:
+            weight_name = cls._linear_weight_name(node)
+            if weight_name is not None:
+                linear_nodes_by_weight.setdefault(weight_name, []).append(node)
+            names.update(node.output)
+        names.update(item.name for item in model.graph.input)
+        return cls(
+            model=model,
+            _initializers_by_name=initializers_by_name,
+            _linear_nodes_by_weight=linear_nodes_by_weight,
+            _types=model_types(model),
+            _names=names,
+        )
+
+    @staticmethod
+    def _linear_weight_name(node: onnx.NodeProto) -> str | None:
+        if node.op_type not in {"Gemm", "MatMul"} or len(node.input) < 2:
+            return None
+        return str(node.input[1])
+
+    @property
+    def types(self) -> dict[str, tuple[int, tuple[int, ...]]]:
+        """Return the synchronized static type index."""
+        return self._types
+
+    def first_initializer(self, name: str) -> onnx.TensorProto | None:
+        """Return the first initializer with the requested name."""
+        return self._initializers_by_name.get(name)
+
+    def linear_nodes(self, weight_name: str) -> list[onnx.NodeProto]:
+        """Return matching standard linear nodes in graph order."""
+        return self._linear_nodes_by_weight.get(weight_name, [])
+
+    def unique_name(self, base: str) -> str:
+        """Allocate and reserve the smallest available value name."""
+        if base not in self._names:
+            self._names.add(base)
+            return base
+        index = 1
+        while f"{base}.{index}" in self._names:
+            index += 1
+        result = f"{base}.{index}"
+        self._names.add(result)
+        return result
+
+    def _record_initializer(self, tensor: onnx.TensorProto) -> None:
+        self._names.add(tensor.name)
+        self._types[tensor.name] = (tensor.data_type, tuple(tensor.dims))
+        self._initializers_by_name.setdefault(tensor.name, tensor)
+
+    def record_appended_initializer(self) -> None:
+        """Synchronize an initializer appended by a construction helper."""
+        self._record_initializer(self.model.graph.initializer[-1])
+
+    def append_initializer(self, tensor: onnx.TensorProto) -> None:
+        """Append an initializer and synchronize all affected indexes."""
+        self.model.graph.initializer.append(tensor)
+        self._record_initializer(self.model.graph.initializer[-1])
+
+    def append_value(
+        self,
+        name: str,
+        dtype: int,
+        shape: tuple[int, ...],
+    ) -> None:
+        """Append static value metadata and synchronize its type."""
+        append_value(self.model, name, dtype, shape)
+        self._types[name] = (dtype, shape)
+
+    def replace_node(
+        self,
+        node: onnx.NodeProto,
+        replacement: list[onnx.NodeProto],
+    ) -> None:
+        """Replace one node and synchronize node and name indexes."""
+        nodes = list(self.model.graph.node)
+        index = nodes.index(node)
+        nodes[index : index + 1] = replacement
+        del self.model.graph.node[:]
+        self.model.graph.node.extend(nodes)
+
+        weight_name = self._linear_weight_name(node)
+        if weight_name is not None:
+            bucket = self._linear_nodes_by_weight[weight_name]
+            self._linear_nodes_by_weight[weight_name] = [
+                item for item in bucket if item is not node
+            ]
+        inserted = self.model.graph.node[index : index + len(replacement)]
+        for offset, item in enumerate(inserted):
+            replacement_weight = self._linear_weight_name(item)
+            if replacement_weight is not None:
+                prior_count = sum(
+                    self._linear_weight_name(candidate) == replacement_weight
+                    for candidate in nodes[: index + offset]
+                )
+                self._linear_nodes_by_weight.setdefault(
+                    replacement_weight,
+                    [],
+                ).insert(prior_count, item)
+            self._names.update(item.output)
 
 
 def _linear_weight_array(
@@ -44,26 +166,18 @@ def _linear_weight_array(
 
 
 def _replace_linear(
-    model: onnx.ModelProto,
+    context: _LinearLoweringContext,
     value: GraphMetadata,
     target: QuantizedTarget,
 ) -> None:
+    model = context.model
     weight_name = f"graph.{target.fqn}.weight"
-    weight = next(
-        (item for item in model.graph.initializer if item.name == weight_name),
-        None,
-    )
+    weight = context.first_initializer(weight_name)
     if weight is None:
         raise OnnxExportError(
             f"Cannot locate ONNX weight for linear target {target.fqn!r}"
         )
-    matches = [
-        node
-        for node in model.graph.node
-        if node.op_type in {"Gemm", "MatMul"}
-        and len(node.input) >= 2
-        and node.input[1] == weight_name
-    ]
+    matches = context.linear_nodes(weight_name)
     if len(matches) != 1:
         raise OnnxExportError(
             f"Linear target {target.fqn!r} maps to "
@@ -74,7 +188,7 @@ def _replace_linear(
         raise OnnxExportError(
             f"Linear node for {target.fqn!r} has an invalid ABI"
         )
-    types = model_types(model)
+    types = context.types
     source = node.input[0]
     array = _linear_weight_array(node, weight)
     source_shape: tuple[int, ...]
@@ -83,20 +197,16 @@ def _replace_linear(
         query_length = value.sequence_length if value.stage.is_prefill else 1
         source_shape = (1, query_length, array.shape[0])
         output_shape = (1, query_length, array.shape[1])
-        append_value(
-            model,
+        context.append_value(
             source,
             weight.data_type,
             source_shape,
         )
-        append_value(
-            model,
+        context.append_value(
             node.output[0],
             weight.data_type,
             output_shape,
         )
-        types[source] = (weight.data_type, source_shape)
-        types[node.output[0]] = (weight.data_type, output_shape)
     output_dtype, output_shape = types[node.output[0]]
     source_dtype = types.get(source, (output_dtype, ()))[0]
     source_shape = types.get(
@@ -148,26 +258,30 @@ def _replace_linear(
         activation,
         inverse=True,
         dtype=parameter_dtype,
+        name_allocator=context.unique_name,
     )
+    context.record_appended_initializer()
     quant_offset = offset_initializer(
         model,
         f"{prefix}.quant_offset",
         activation,
         dtype=parameter_dtype,
+        name_allocator=context.unique_name,
     )
-    packed_name = unique_name(model, f"{prefix}.weight")
-    model.graph.initializer.append(initializer(packed_name, packed))
+    context.record_appended_initializer()
+    packed_name = context.unique_name(f"{prefix}.weight")
+    context.append_initializer(initializer(packed_name, packed))
     combined = (
         weight_scales * float(activation.scale[0])
     ).astype(np.float32)
     dequant_scale = combined.view(np.uint32).astype(np.uint64)
-    dequant_scale_name = unique_name(model, f"{prefix}.dequant_scale")
-    model.graph.initializer.append(
+    dequant_scale_name = context.unique_name(f"{prefix}.dequant_scale")
+    context.append_initializer(
         initializer(dequant_scale_name, dequant_scale)
     )
 
-    quantized = unique_name(model, f"{prefix}.quantized")
-    accumulator = unique_name(model, f"{prefix}.accumulator")
+    quantized = context.unique_name(f"{prefix}.quantized")
+    accumulator = context.unique_name(f"{prefix}.accumulator")
     original_output = node.output[0]
     has_bias = (
         node.op_type == "Gemm"
@@ -175,7 +289,7 @@ def _replace_linear(
         and bool(node.input[2])
     )
     dequantized = (
-        unique_name(model, f"{prefix}.dequantized")
+        context.unique_name(f"{prefix}.dequantized")
         if has_bias
         else original_output
     )
@@ -213,16 +327,12 @@ def _replace_linear(
                 name=f"{prefix}.bias",
             )
         )
-    append_value(model, quantized, TensorProto.INT8, source_shape)
-    append_value(model, accumulator, TensorProto.INT32, output_shape)
+    context.append_value(quantized, TensorProto.INT8, source_shape)
+    context.append_value(accumulator, TensorProto.INT32, output_shape)
     if has_bias:
-        append_value(model, dequantized, output_dtype, output_shape)
+        context.append_value(dequantized, output_dtype, output_shape)
 
-    nodes = list(model.graph.node)
-    index = nodes.index(node)
-    nodes[index : index + 1] = replacement
-    del model.graph.node[:]
-    model.graph.node.extend(nodes)
+    context.replace_node(node, replacement)
 
 
 def append_quantized_linears(
@@ -235,8 +345,10 @@ def append_quantized_linears(
         for item in value.quantized_targets
         if item.target_type == "linear"
     ]
-    for target in targets:
-        _replace_linear(model, value, target)
+    if targets:
+        context = _LinearLoweringContext.from_model(model)
+        for target in targets:
+            _replace_linear(context, value, target)
     used_inputs = {
         name
         for node in model.graph.node

@@ -294,6 +294,99 @@ def test_loader_reads_indexed_safetensors_shards(tmp_path: Path) -> None:
     assert set(state) == {"left", "right"}
 
 
+@pytest.mark.parametrize("as_string", [False, True], ids=["path", "str"])
+def test_checkpoint_resolver_uses_existing_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    as_string: bool,
+) -> None:
+    import huggingface_hub
+
+    def fail_snapshot_download(**kwargs: object) -> str:
+        pytest.fail(f"unexpected Hub download: {kwargs}")
+
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        fail_snapshot_download,
+    )
+    source: str | Path = str(tmp_path) if as_string else tmp_path
+
+    resolved = resolve_checkpoint(source)
+
+    assert resolved == tmp_path.resolve()
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["config.json", "model.safetensors", "notes.txt"],
+)
+@pytest.mark.parametrize("as_string", [False, True], ids=["path", "str"])
+def test_checkpoint_resolver_rejects_existing_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    as_string: bool,
+) -> None:
+    import huggingface_hub
+
+    def fail_snapshot_download(**kwargs: object) -> str:
+        pytest.fail(f"unexpected Hub download: {kwargs}")
+
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        fail_snapshot_download,
+    )
+    candidate = tmp_path / filename
+    candidate.touch()
+    source: str | Path = str(candidate) if as_string else candidate
+
+    with pytest.raises(ValueError) as exc_info:
+        resolve_checkpoint(source)
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == (
+        f"Local checkpoint source must be a directory: {Path(source)}"
+    )
+
+
+def test_checkpoint_resolver_treats_missing_path_as_hub_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import huggingface_hub
+
+    calls: list[dict[str, object]] = []
+
+    def fake_snapshot_download(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr(
+        huggingface_hub,
+        "snapshot_download",
+        fake_snapshot_download,
+    )
+    source = tmp_path / "missing-checkpoint"
+
+    resolved = resolve_checkpoint(
+        source,
+        revision="missing-revision",
+        local_files_only=True,
+    )
+
+    assert resolved == tmp_path
+    assert calls == [
+        {
+            "repo_id": str(source),
+            "revision": "missing-revision",
+            "allow_patterns": ["*.json", "*.safetensors"],
+            "local_files_only": True,
+        }
+    ]
+
+
 def test_checkpoint_resolver_uses_hub_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

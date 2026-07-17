@@ -53,27 +53,31 @@ def _linear_weight_names(graph: GraphModule) -> frozenset[str]:
     )
 
 
-def _linear_parameters(graph: GraphModule) -> tuple[str, ...]:
-    linear_weights = _linear_weight_names(graph)
-    return tuple(
-        name
-        for name, parameter in graph.named_parameters(remove_duplicate=False)
-        if name in linear_weights and parameter.ndim == 2 and not _is_moe_parameter(name)
-    )
+@dataclass(frozen=True, slots=True)
+class _ParameterDiscovery:
+    """Immutable parameter names discovered for one planning call."""
 
+    linear: tuple[str, ...]
+    moe: tuple[str, ...]
 
-def _moe_parameters(graph: GraphModule) -> tuple[str, ...]:
-    linear_weights = _linear_weight_names(graph)
-    return tuple(
-        name
-        for name, parameter in graph.named_parameters(remove_duplicate=False)
-        if parameter.ndim == 2
-        and _is_moe_parameter(name)
-        and (
-            name in linear_weights
-            or name.endswith(".expert_weights")
-        )
-    )
+    @classmethod
+    def capture(cls, graph: GraphModule) -> _ParameterDiscovery:
+        """Discover linear and MoE parameters in one parameter enumeration."""
+        linear_weights = _linear_weight_names(graph)
+        linear: list[str] = []
+        moe: list[str] = []
+        for name, parameter in graph.named_parameters(remove_duplicate=False):
+            if parameter.ndim != 2:
+                continue
+            if _is_moe_parameter(name):
+                if (
+                    name in linear_weights
+                    or name.endswith(".expert_weights")
+                ):
+                    moe.append(name)
+            elif name in linear_weights:
+                linear.append(name)
+        return cls(linear=tuple(linear), moe=tuple(moe))
 
 
 def _append_parameter_targets(
@@ -184,11 +188,24 @@ def plan_quantization(
 ) -> tuple[TargetPlan, ...]:
     """Build a deterministic, overlap-free target plan."""
     result: list[TargetPlan] = []
-    linear = _linear_parameters(graph)
-    moe = _moe_parameters(graph)
+    discovery = _ParameterDiscovery.capture(graph)
     for index, modifier in enumerate(config.modifiers):
-        _append_parameter_targets(result, linear, "linear", modifier, index, config)
-        _append_parameter_targets(result, moe, "moe", modifier, index, config)
+        _append_parameter_targets(
+            result,
+            discovery.linear,
+            "linear",
+            modifier,
+            index,
+            config,
+        )
+        _append_parameter_targets(
+            result,
+            discovery.moe,
+            "moe",
+            modifier,
+            index,
+            config,
+        )
         _append_attention_targets(result, graph, modifier, index, config)
     ownership: dict[str, int] = {}
     for target in result:

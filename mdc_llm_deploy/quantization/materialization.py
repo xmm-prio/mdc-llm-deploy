@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -31,19 +32,35 @@ class MaterializationResult:
     integer_sha256: str | None
 
 
-def _parameter(
-    candidate: GraphModule,
-    target: TargetPlan,
-) -> Tensor | None:
-    if target.parameter_name is None:
-        return None
-    parameters = dict(candidate.named_parameters(remove_duplicate=False))
-    try:
-        return parameters[target.parameter_name]
-    except KeyError as error:
-        raise QuantizationConfigError(
-            f"Target parameter disappeared: {target.parameter_name}"
-        ) from error
+@dataclass(frozen=True, slots=True)
+class MaterializationContext:
+    """Candidate-local inputs captured before materialization writes.
+
+    The parameter mapping is an initial snapshot used once per planned alias
+    group. It does not expose parameters registered during materialization.
+    """
+
+    candidate: GraphModule
+    parameters: Mapping[str, Tensor]
+
+    @classmethod
+    def capture(cls, candidate: GraphModule) -> MaterializationContext:
+        """Capture the candidate parameter registry before the first write."""
+        parameters = dict(
+            candidate.named_parameters(remove_duplicate=False)
+        )
+        return cls(candidate, MappingProxyType(parameters))
+
+    def parameter(self, target: TargetPlan) -> Tensor | None:
+        """Resolve one initial plan target without refreshing the snapshot."""
+        if target.parameter_name is None:
+            return None
+        try:
+            return self.parameters[target.parameter_name]
+        except KeyError as error:
+            raise QuantizationConfigError(
+                f"Target parameter disappeared: {target.parameter_name}"
+            ) from error
 
 
 def _required_sample(
@@ -86,7 +103,7 @@ def _activation_parameters(
 
 
 def _materialize_weight(
-    candidate: GraphModule,
+    context: MaterializationContext,
     parameter: Tensor,
     target: TargetPlan,
     calibration: Mapping[str, Tensor],
@@ -151,7 +168,7 @@ def _materialize_weight(
         and target.parameter_name.endswith(".expert_weights")
     ):
         module_name = target.parameter_name.rsplit(".", 1)[0]
-        module = candidate.get_submodule(module_name)
+        module = context.candidate.get_submodule(module_name)
         expert_count = int(parameter.shape[0])
         samples = _required_sample(calibration, target.fqn)
         _require_same_device(
@@ -204,7 +221,7 @@ def _materialize_weight(
             ),
         )
         scale_name = f"{module_name}.quant_scales"
-        for node in candidate.graph.nodes:
+        for node in context.candidate.graph.nodes:
             if (
                 node.op != "call_function"
                 or node.target
@@ -219,8 +236,8 @@ def _materialize_weight(
                 != target.parameter_name
             ):
                 continue
-            with candidate.graph.inserting_before(node):
-                scale_node = candidate.graph.get_attr(scale_name)
+            with context.candidate.graph.inserting_before(node):
+                scale_node = context.candidate.graph.get_attr(scale_name)
             arguments = list(node.args)
             arguments.extend([None] * (6 - len(arguments)))
             arguments[4] = scale_node
@@ -272,12 +289,12 @@ def _integer_sha256(
 
 
 def materialize_target(
-    candidate: GraphModule,
+    context: MaterializationContext,
     target: TargetPlan,
     calibration: Mapping[str, Tensor],
 ) -> MaterializationResult:
     """Apply one target plan and return its immutable contract data."""
-    parameter = _parameter(candidate, target)
+    parameter = context.parameter(target)
     spec = target.weight or target.activation
     if spec is None:
         raise QuantizationConfigError(
@@ -288,7 +305,7 @@ def materialize_target(
     intermediate_scales: tuple[float, ...] | None = None
     if parameter is not None and target.weight is not None:
         result, fallback_reason, intermediate_scales = _materialize_weight(
-            candidate,
+            context,
             parameter,
             target,
             calibration,
@@ -334,11 +351,11 @@ def materialize_target(
 
 
 def materialize_alias_group(
-    candidate: GraphModule,
+    context: MaterializationContext,
     targets: tuple[TargetPlan, ...],
     calibration: Mapping[str, Tensor],
 ) -> tuple[MaterializationResult, ...]:
-    """Materialize one shared parameter once and describe every selected alias."""
+    """Materialize one initial alias group without refreshing its parameter."""
     if not targets:
         return ()
     representative = targets[0]
@@ -348,7 +365,12 @@ def materialize_alias_group(
         and representative.parameter_name is not None
         and (
             representative.algorithm == "gptq"
-            or representative.target_type == "moe"
+            or (
+                representative.target_type == "moe"
+                and representative.parameter_name.endswith(
+                    ".expert_weights"
+                )
+            )
         )
     ):
         samples = tuple(
@@ -362,7 +384,7 @@ def materialize_alias_group(
             )
         group_calibration[representative.fqn] = torch.cat(samples)
     first = materialize_target(
-        candidate,
+        context,
         representative,
         group_calibration,
     )

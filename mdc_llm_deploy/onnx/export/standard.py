@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -170,6 +171,62 @@ def _fold_linear_weight_transposes(model: onnx.ModelProto) -> None:
     model.graph.initializer.extend(retained)
 
 
+def _rename_initializer_references(
+    model: onnx.ModelProto,
+    renames: list[tuple[onnx.TensorProto, str, str]],
+) -> None:
+    """Rename initializers and references with a safe single-scan fast path."""
+    old_names = [old_name for _, old_name, _ in renames]
+    new_names = [new_name for _, _, new_name in renames]
+    old_name_set = set(old_names)
+    occupied_names = {
+        initializer.name
+        for initializer in model.graph.initializer
+        if initializer.name not in old_name_set
+    }
+    occupied_names.update(
+        value.name
+        for value in (
+            *model.graph.input,
+            *model.graph.output,
+            *model.graph.value_info,
+        )
+    )
+    occupied_names.update(
+        output_name
+        for node in model.graph.node
+        for output_name in node.output
+        if output_name
+    )
+    use_fast_path = (
+        len(old_name_set) == len(old_names)
+        and len(set(new_names)) == len(new_names)
+        and all(
+            new_name == old_name or new_name not in old_name_set
+            for _, old_name, new_name in renames
+        )
+        and not occupied_names.intersection(new_names)
+    )
+    if use_fast_path:
+        replacements = {
+            old_name: new_name for _, old_name, new_name in renames
+        }
+        for initializer, _, new_name in renames:
+            initializer.name = new_name
+        for node in model.graph.node:
+            for index, input_name in enumerate(node.input):
+                if input_name in replacements:
+                    node.input[index] = replacements[input_name]
+        return
+
+    for initializer, old_name, new_name in renames:
+        initializer.name = new_name
+        for node in model.graph.node:
+            for index, input_name in enumerate(node.input):
+                if input_name == old_name:
+                    node.input[index] = new_name
+
+
 def _restore_linear_initializer_names(
     model: onnx.ModelProto,
     graph: GraphModule,
@@ -196,13 +253,21 @@ def _restore_linear_initializer_names(
         raise OnnxExportError(
             "Cannot map ATen linear parameters to standard ONNX initializers"
         )
-    for parameter_name, old_name in zip(parameter_names, onnx_weight_names, strict=True):
-        new_name = f"graph.{parameter_name}"
-        initializers[old_name].name = new_name
-        for node in model.graph.node:
-            for index, input_name in enumerate(node.input):
-                if input_name == old_name:
-                    node.input[index] = new_name
+    _rename_initializer_references(
+        model,
+        [
+            (
+                initializers[old_name],
+                old_name,
+                f"graph.{parameter_name}",
+            )
+            for parameter_name, old_name in zip(
+                parameter_names,
+                onnx_weight_names,
+                strict=True,
+            )
+        ],
+    )
 
 
 def _fold_initializer_alias(
@@ -256,17 +321,166 @@ def _fold_initializer_alias(
     return source
 
 
+@dataclass(frozen=True)
+class _InitializerAliasFold:
+    canonical_name: str
+    source_initializer: onnx.TensorProto
+    aliases: frozenset[str]
+    identity_indices: frozenset[int]
+
+
+@dataclass(frozen=True)
+class _InitializerAliasFoldPlan:
+    folds: tuple[_InitializerAliasFold, ...]
+
+    @classmethod
+    def try_build(
+        cls,
+        model: onnx.ModelProto,
+        canonical_names: tuple[str, ...],
+    ) -> _InitializerAliasFoldPlan | None:
+        """Build a plan only when all alias folds are independent."""
+        if len(set(canonical_names)) != len(canonical_names):
+            return None
+
+        initializers: dict[str, onnx.TensorProto] = {}
+        for initializer in model.graph.initializer:
+            if initializer.name in initializers:
+                return None
+            initializers[initializer.name] = initializer
+
+        producers: dict[str, tuple[int, onnx.NodeProto]] = {}
+        for node_index, node in enumerate(model.graph.node):
+            for output_name in node.output:
+                if not output_name:
+                    continue
+                if output_name in producers:
+                    return None
+                producers[output_name] = (node_index, node)
+
+        folds: list[_InitializerAliasFold] = []
+        no_op_names: set[str] = set()
+        for canonical_name in canonical_names:
+            if canonical_name in initializers:
+                no_op_names.add(canonical_name)
+                continue
+
+            aliases: set[str] = set()
+            identity_indices: set[int] = set()
+            visited: set[str] = set()
+            source = canonical_name
+            while source not in initializers:
+                if source in visited:
+                    return None
+                visited.add(source)
+                produced = producers.get(source)
+                if produced is None:
+                    return None
+                node_index, producer = produced
+                if (
+                    producer.op_type != "Identity"
+                    or len(producer.input) != 1
+                    or len(producer.output) != 1
+                ):
+                    return None
+                aliases.add(source)
+                identity_indices.add(node_index)
+                source = producer.input[0]
+
+            folds.append(
+                _InitializerAliasFold(
+                    canonical_name=canonical_name,
+                    source_initializer=initializers[source],
+                    aliases=frozenset(aliases),
+                    identity_indices=frozenset(identity_indices),
+                )
+            )
+
+        all_aliases: set[str] = set()
+        all_identity_indices: set[int] = set()
+        canonical_set = set(canonical_names)
+        for fold in folds:
+            if (
+                all_aliases.intersection(fold.aliases)
+                or all_identity_indices.intersection(fold.identity_indices)
+                or fold.aliases.intersection(no_op_names)
+                or fold.source_initializer.name in canonical_set
+            ):
+                return None
+            all_aliases.update(fold.aliases)
+            all_identity_indices.update(fold.identity_indices)
+
+        for fold in folds:
+            other_aliases = all_aliases.difference(fold.aliases)
+            for node_index in fold.identity_indices:
+                if model.graph.node[node_index].input[0] in other_aliases:
+                    return None
+
+        return cls(tuple(folds))
+
+    def apply(self, model: onnx.ModelProto) -> set[str]:
+        """Apply all independent alias folds in bulk."""
+        replacements: dict[str, str] = {}
+        removed_node_indices: set[int] = set()
+        alias_sources: set[str] = set()
+        canonical_names = {fold.canonical_name for fold in self.folds}
+
+        for fold in self.folds:
+            initializer = onnx.TensorProto()
+            initializer.CopyFrom(fold.source_initializer)
+            initializer.name = fold.canonical_name
+            model.graph.initializer.append(initializer)
+            replacements.update(
+                dict.fromkeys(fold.aliases, fold.canonical_name)
+            )
+            removed_node_indices.update(fold.identity_indices)
+            alias_sources.add(fold.source_initializer.name)
+
+        for node_index, node in enumerate(model.graph.node):
+            if node_index in removed_node_indices:
+                continue
+            for input_index, input_name in enumerate(node.input):
+                replacement = replacements.get(input_name)
+                if replacement is not None:
+                    node.input[input_index] = replacement
+
+        retained_nodes = [
+            node
+            for node_index, node in enumerate(model.graph.node)
+            if node_index not in removed_node_indices
+        ]
+        del model.graph.node[:]
+        model.graph.node.extend(retained_nodes)
+
+        retained_values = [
+            item
+            for item in model.graph.value_info
+            if item.name not in replacements or item.name in canonical_names
+        ]
+        del model.graph.value_info[:]
+        model.graph.value_info.extend(retained_values)
+        return alias_sources
+
+
 def _fold_rms_norm_initializers(
     model: onnx.ModelProto,
     metadata: GraphMetadata,
 ) -> None:
     """Make every RmsNorm weight a direct canonical initializer."""
-    alias_sources: set[str] = set()
-    for boundary in metadata.boundaries:
-        if boundary.kind == "rms_norm":
+    canonical_names = tuple(
+        f"graph.{boundary.fqn}.weight"
+        for boundary in metadata.boundaries
+        if boundary.kind == "rms_norm"
+    )
+    plan = _InitializerAliasFoldPlan.try_build(model, canonical_names)
+    if plan is not None:
+        alias_sources = plan.apply(model)
+    else:
+        alias_sources = set()
+        for canonical_name in canonical_names:
             source = _fold_initializer_alias(
                 model,
-                f"graph.{boundary.fqn}.weight",
+                canonical_name,
             )
             if source is not None:
                 alias_sources.add(source)

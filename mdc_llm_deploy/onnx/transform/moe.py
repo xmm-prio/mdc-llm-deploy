@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 import numpy as np
 import onnx
@@ -17,8 +18,32 @@ from .support import (
     append_value,
     initializer,
     model_types,
-    unique_name,
 )
+
+
+@dataclass(slots=True)
+class _MoeAdaptationContext:
+    _names: set[str]
+
+    @classmethod
+    def from_model(cls, model: onnx.ModelProto) -> _MoeAdaptationContext:
+        """Capture names occupied at the start of one adaptation call."""
+        names = {item.name for item in model.graph.initializer}
+        names.update(item.name for item in model.graph.input)
+        names.update(
+            output for node in model.graph.node for output in node.output
+        )
+        return cls(names)
+
+    def unique_name(self, base: str) -> str:
+        """Reserve and return the first available value name."""
+        result = base
+        index = 1
+        while result in self._names:
+            result = f"{base}.{index}"
+            index += 1
+        self._names.add(result)
+        return result
 
 
 def _intermediate_scales(
@@ -71,6 +96,7 @@ def adapt_quantized_moe(
         item.name: item for item in model.graph.initializer
     }
     types = model_types(model)
+    context = _MoeAdaptationContext.from_model(model)
     for node, target in zip(nodes, targets, strict=True):
         if len(node.input) < 5:
             raise OnnxExportError(
@@ -111,10 +137,7 @@ def adapt_quantized_moe(
                 projection_scales[:, 2],
             )
         ).reshape(-1)
-        scale_name = unique_name(
-            model,
-            f"{node.name}.atc_scales",
-        )
+        scale_name = context.unique_name(f"{node.name}.atc_scales")
         model.graph.initializer.append(
             initializer(scale_name, combined)
         )
@@ -156,11 +179,11 @@ def adapt_quantized_moe(
             source_shape,
             activation,
             f"{node.name}.input_quant",
+            name_allocator=context.unique_name,
         )
         if ids_dtype != TensorProto.INT16:
-            cast_output = unique_name(
-                model,
-                f"{node.name}.topk_ids_int16",
+            cast_output = context.unique_name(
+                f"{node.name}.topk_ids_int16"
             )
             model.graph.node.append(
                 helper.make_node(

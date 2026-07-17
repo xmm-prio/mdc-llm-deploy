@@ -10,6 +10,7 @@ from onnx import helper
 from torch.fx import GraphModule
 
 from ..errors import OnnxExportError
+from ..graph.fx.ownership import is_fqn_descendant
 from ..graph.lifecycle import metadata
 from ..graph.metadata import GraphMetadata
 from ..operators.contracts.onnx import MDC_ONNX_OPSET
@@ -65,7 +66,7 @@ def _lower(
             boundary
             for boundary in value.boundaries
             if boundary.kind == "rope"
-            and boundary.fqn.startswith(f"{attention.fqn}.")
+            and is_fqn_descendant(boundary.fqn, attention.fqn)
         )
         if len(ropes) != 1:
             raise OnnxExportError(

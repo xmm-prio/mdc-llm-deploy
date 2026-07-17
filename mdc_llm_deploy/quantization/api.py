@@ -14,13 +14,17 @@ from ..graph.metadata import GraphStage
 from ..placement import capture_placement
 from .calibration import collect_calibration_samples
 from .config import QuantizationConfig
-from .materialization import MaterializationResult, materialize_alias_group
+from .materialization import (
+    MaterializationContext,
+    MaterializationResult,
+    materialize_alias_group,
+)
 from .placement import (
     group_alias_targets,
     restore_parameter_aliases,
     validate_quantized_placement,
 )
-from .planning import TargetPlan, plan_quantization
+from .planning import TargetPlan, plan_calibration, plan_quantization
 
 
 def oneshot(
@@ -38,16 +42,22 @@ def oneshot(
     plan = plan_quantization(graph, parsed)
     if not plan:
         raise QuantizationConfigError("Quantization selectors matched no targets")
+    calibration_plan = plan_calibration(plan)
     placement = capture_placement(graph)
     groups = group_alias_targets(graph, plan)
-    calibration = collect_calibration_samples(graph, calibration_dataloader)
+    calibration = collect_calibration_samples(
+        graph,
+        calibration_dataloader,
+        calibration_plan,
+    )
 
     def mutate(candidate: GraphModule) -> None:
         current = metadata(candidate)
+        context = MaterializationContext.capture(candidate)
         paired: list[tuple[TargetPlan, MaterializationResult]] = []
         for group in groups:
             results = materialize_alias_group(
-                candidate,
+                context,
                 group.targets,
                 calibration,
             )

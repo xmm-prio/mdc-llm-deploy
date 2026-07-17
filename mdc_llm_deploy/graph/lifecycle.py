@@ -204,10 +204,16 @@ def transactional_update(graph: T, mutator: Callable[[T], None]) -> T:
     try:
         with journal:
             mutator(candidate)
-    except BaseException:
-        journal.restore()
+        journal.detach_candidate(candidate)
+    except BaseException as error:
+        try:
+            journal.restore()
+        except BaseException as rollback_error:
+            error.add_note(
+                "Graph tensor rollback failed; original graph state may be incomplete "
+                f"or unknown: {type(rollback_error).__name__}: {rollback_error}"
+            )
         raise
-    journal.detach_candidate(candidate)
     candidate.graph.lint()  # type: ignore[no-untyped-call]
     candidate.recompile()
     validate_graph(candidate)
