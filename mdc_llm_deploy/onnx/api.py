@@ -15,7 +15,7 @@ from ..graph.lifecycle import metadata
 from ..graph.metadata import GraphMetadata
 from ..operators.contracts.onnx import MDC_ONNX_OPSET
 from .export.artifacts import commit_validated_onnx
-from .export.standard import export_standard_onnx
+from .export.standard import build_standard_onnx
 from .transform.attention import (
     MaskMode as MaskMode,
 )
@@ -131,7 +131,7 @@ def onnx_export(
     if target.suffix.lower() != ".onnx":
         raise OnnxExportError("output_path must use .onnx suffix")
     target.parent.mkdir(parents=True, exist_ok=True)
-    standard = export_standard_onnx(graph, value, target.parent)
+    standard = build_standard_onnx(graph, value, target.parent)
     model = _lower(standard, value, mask_mode)
     validate_mdc_model(model)
     return commit_validated_onnx(

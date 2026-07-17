@@ -179,6 +179,45 @@ def test_multiple_targets_replace_original_positions_and_cleanup_weights() -> No
     assert "auxiliary" in initializer_names
 
 
+def test_multiple_targets_pack_each_canonical_weight_identity() -> None:
+    model = _linear_model(("first", "second"))
+    initializers = {item.name: item for item in model.graph.initializer}
+    initializers["graph.first.weight"].CopyFrom(
+        numpy_helper.from_array(
+            np.array([[0.25, -0.5], [0.75, 1.0]], dtype=np.float16),
+            name="graph.first.weight",
+        )
+    )
+    initializers["graph.second.weight"].CopyFrom(
+        numpy_helper.from_array(
+            np.array([[-1.0, 1.5], [2.0, -2.5]], dtype=np.float16),
+            name="graph.second.weight",
+        )
+    )
+
+    linear.append_quantized_linears(
+        model,
+        _metadata(
+            _target("second", scale=(0.5,)),
+            _target("first", scale=(0.25,)),
+        ),
+    )
+
+    packed = {
+        item.name: numpy_helper.to_array(item)
+        for item in model.graph.initializer
+        if item.name in {"mdc.linear.first.weight", "mdc.linear.second.weight"}
+    }
+    np.testing.assert_array_equal(
+        packed["mdc.linear.first.weight"],
+        np.array([[1, -2], [3, 4]], dtype=np.int8),
+    )
+    np.testing.assert_array_equal(
+        packed["mdc.linear.second.weight"],
+        np.array([[-2, 3], [4, -5]], dtype=np.int8),
+    )
+
+
 def test_gemm_bias_allocates_seven_names_and_appends_add(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
