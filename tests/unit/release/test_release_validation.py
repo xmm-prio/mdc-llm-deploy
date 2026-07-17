@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -23,7 +22,9 @@ from mdc_llm_deploy.capabilities import (
 from mdc_llm_deploy.errors import OnnxExportError
 from mdc_llm_deploy.graph.metadata import GraphStage
 from mdc_llm_deploy.onnx.validation.metadata import ValidatedMetadata
+from mdc_llm_deploy.onnx.validation.model import ValidatedMdcArtifact
 from mdc_llm_deploy.onnx.validation.topology import (
+    QuantizationTopologyEvidence,
     quantized_target_families,
     validate_custom_node_reachability,
     validate_graph_topology,
@@ -131,34 +132,23 @@ def _stub_validation_layers(
 ) -> None:
     monkeypatch.setattr(
         release_validation,
-        "validate_serialized_model",
-        lambda path: model,
-    )
-    monkeypatch.setattr(
-        release_validation,
-        "validate_metadata",
-        lambda value: metadata,
-    )
-    monkeypatch.setattr(
-        release_validation,
-        "validate_graph_topology",
-        lambda value, mask_mode: Counter(
-            {
-                "FusedInferAttentionScore": 2,
-                "ApplyRotaryPosEmb": 2,
-                "NPURmsNorm": 1,
-            }
+        "load_validated_mdc_artifact",
+        lambda path: ValidatedMdcArtifact(
+            model=model,
+            metadata=metadata,
+            topology=QuantizationTopologyEvidence(
+                operator_counts=tuple(
+                    sorted(
+                        {
+                            "FusedInferAttentionScore": 2,
+                            "ApplyRotaryPosEmb": 2,
+                            "NPURmsNorm": 1,
+                        }.items()
+                    )
+                ),
+                observed_quantized_targets=observed_targets,
+            ),
         ),
-    )
-    monkeypatch.setattr(
-        release_validation,
-        "validate_custom_node_reachability",
-        lambda value, properties: None,
-    )
-    monkeypatch.setattr(
-        release_validation,
-        "quantized_target_families",
-        lambda value: observed_targets,
     )
 
 

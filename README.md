@@ -40,6 +40,9 @@ decode 输入增加每层 `past.N.key/value`。
 - `onnx_export(graph, output_path, *, external_data=True) -> onnx.ModelProto`
 将 FX 图转换并校验为 MDC ONNX。路径必须以 `.onnx` 结尾；默认同时写入
 `<output_path>.data`，设置 `external_data=False` 可将权重内嵌到模型文件。
+- `standard_onnx_export(graph, output_path, *, external_data=True) -> onnx.ModelProto`
+将带合法图元数据的模型无关 FX 图导出为标准 ONNX，不执行 MDC lowering、不写入
+`mdc.*` 属性，也不保证产物可部署到 MDC。适用于通用算子小图和标准 ONNX 工具链。
 
 prefill 和 decode ONNX 都只公开 `logits` 输出。decode KV 缓存由调用方通过
 `past.N.key/value` 输入提供。

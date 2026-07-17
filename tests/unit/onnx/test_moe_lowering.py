@@ -232,12 +232,15 @@ def test_cast_condition_uses_initial_type_snapshot(
         assert adapted.input[1] == "topk_ids"
 
 
-def test_multiple_targets_keep_sorted_pairing_and_share_reservations() -> None:
+def test_multiple_targets_keep_sorted_pairing_and_share_quantizer() -> None:
     model = _model(2, duplicate_node_names=True)
 
     moe.adapt_quantized_moe(model, _metadata("layer.z", "layer.a"))
 
     experts = [node for node in model.graph.node if node.op_type == "MoeExpert"]
+    quantizers = [
+        node for node in model.graph.node if node.op_type == "NPUAscendQuantV2"
+    ]
     first_scales = numpy_helper.to_array(
         next(item for item in model.graph.initializer if item.name == experts[0].input[4])
     )
@@ -248,12 +251,33 @@ def test_multiple_targets_keep_sorted_pairing_and_share_reservations() -> None:
     assert experts[1].input[4] == "moe.atc_scales.1"
     np.testing.assert_array_equal(first_scales[[3, 7]], [1.0, 1.0])
     np.testing.assert_array_equal(second_scales[[3, 7]], [2.0, 2.0])
-    assert [node.op_type for node in model.graph.node[-4:]] == [
+    assert len(quantizers) == 1
+    assert experts[0].input[0] == experts[1].input[0] == quantizers[0].output[0]
+    assert [node.op_type for node in model.graph.node[-3:]] == [
         "NPUAscendQuantV2",
         "Cast",
-        "NPUAscendQuantV2",
         "Cast",
     ]
+
+
+def test_multiple_targets_with_different_qparams_do_not_share_quantizer() -> None:
+    model = _model(2)
+
+    moe.adapt_quantized_moe(
+        model,
+        _metadata(
+            "layer.a",
+            "layer.b",
+            activation_scales={"layer.a": 0.125, "layer.b": 0.25},
+        ),
+    )
+
+    experts = [node for node in model.graph.node if node.op_type == "MoeExpert"]
+    quantizers = [
+        node for node in model.graph.node if node.op_type == "NPUAscendQuantV2"
+    ]
+    assert len(quantizers) == 2
+    assert experts[0].input[0] != experts[1].input[0]
 
 
 def test_failure_keeps_prior_target_and_current_prefix_only() -> None:
@@ -362,19 +386,19 @@ def test_adaptation_builds_one_context_and_skips_default_name_scans(
     model = _model(3)
     builds = 0
     allocations: list[str] = []
-    real_from_model = moe._MoeAdaptationContext.from_model.__func__
-    real_unique_name = moe._MoeAdaptationContext.unique_name
+    real_from_model = support.OnnxLoweringContext.from_model
+    real_unique_name = support.OnnxLoweringContext.unique_name
 
     def counted_from_model(
-        cls: type[moe._MoeAdaptationContext],
+        cls: type[support.OnnxLoweringContext],
         value: onnx.ModelProto,
-    ) -> moe._MoeAdaptationContext:
+    ) -> support.OnnxLoweringContext:
         nonlocal builds
         builds += 1
-        return real_from_model(cls, value)
+        return real_from_model(value)
 
     def counted_unique_name(
-        context: moe._MoeAdaptationContext,
+        context: support.OnnxLoweringContext,
         base: str,
     ) -> str:
         allocations.append(base)
@@ -384,12 +408,12 @@ def test_adaptation_builds_one_context_and_skips_default_name_scans(
         raise AssertionError(f"default unique_name called for {base}")
 
     monkeypatch.setattr(
-        moe._MoeAdaptationContext,
+        support.OnnxLoweringContext,
         "from_model",
         classmethod(counted_from_model),
     )
     monkeypatch.setattr(
-        moe._MoeAdaptationContext,
+        support.OnnxLoweringContext,
         "unique_name",
         counted_unique_name,
     )
@@ -401,7 +425,7 @@ def test_adaptation_builds_one_context_and_skips_default_name_scans(
     )
 
     assert builds == 1
-    assert len(allocations) == 15
+    assert len(allocations) == 9
     assert allocations[:5] == [
         "moe.0.atc_scales",
         "moe.0.input_quant.scale",
@@ -409,3 +433,31 @@ def test_adaptation_builds_one_context_and_skips_default_name_scans(
         "moe.0.input_quant.output",
         "moe.0.topk_ids_int16",
     ]
+
+
+def test_adaptation_accepts_shared_lowering_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _model(2)
+    context = support.OnnxLoweringContext.from_model(model)
+
+    def reject_context_build(
+        cls: type[support.OnnxLoweringContext],
+        value: onnx.ModelProto,
+    ) -> support.OnnxLoweringContext:
+        raise AssertionError("unexpected lowering context build")
+
+    monkeypatch.setattr(
+        support.OnnxLoweringContext,
+        "from_model",
+        classmethod(reject_context_build),
+    )
+
+    moe.adapt_quantized_moe(
+        model,
+        _metadata("layer.a", "layer.b"),
+        context,
+    )
+
+    experts = [node for node in model.graph.node if node.op_type == "MoeExpert"]
+    assert experts[0].input[0] == experts[1].input[0]

@@ -5,13 +5,17 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import onnx
 
 from ...errors import OnnxExportError
-from ..validation.model import validate_serialized_model
+from ..validation.model import (
+    load_validated_mdc_artifact,
+    validate_serialized_standard_model,
+)
 
 
 @dataclass(frozen=True)
@@ -88,11 +92,12 @@ def _commit_publication(
         raise
 
 
-def commit_validated_onnx(
+def _commit_validated_onnx(
     model: onnx.ModelProto,
     target: Path,
     *,
     external_data: bool,
+    validate_serialized: Callable[[str], object],
 ) -> onnx.ModelProto:
     """Validate temporary artifacts and atomically replace final paths."""
     data_target = target.with_name(f"{target.name}.data")
@@ -116,7 +121,7 @@ def commit_validated_onnx(
                 )
             else:
                 onnx.save_model(model, temporary_model)
-            validate_serialized_model(str(temporary_model))
+            validate_serialized(str(temporary_model))
             if external_data:
                 members = (
                     _PublicationMember(
@@ -138,4 +143,34 @@ def commit_validated_onnx(
         raise OnnxExportError(f"ONNX export failed: {error}") from error
 
 
-__all__ = ["commit_validated_onnx"]
+def commit_standard_onnx(
+    model: onnx.ModelProto,
+    target: Path,
+    *,
+    external_data: bool,
+) -> onnx.ModelProto:
+    """Atomically publish a validated standard ONNX artifact."""
+    return _commit_validated_onnx(
+        model,
+        target,
+        external_data=external_data,
+        validate_serialized=validate_serialized_standard_model,
+    )
+
+
+def commit_mdc_onnx(
+    model: onnx.ModelProto,
+    target: Path,
+    *,
+    external_data: bool,
+) -> onnx.ModelProto:
+    """Atomically publish a validated MDC ONNX artifact."""
+    return _commit_validated_onnx(
+        model,
+        target,
+        external_data=external_data,
+        validate_serialized=load_validated_mdc_artifact,
+    )
+
+
+__all__ = ["commit_mdc_onnx", "commit_standard_onnx"]

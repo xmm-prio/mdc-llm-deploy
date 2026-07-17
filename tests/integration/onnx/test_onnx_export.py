@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 
@@ -13,6 +14,8 @@ from onnx.reference import ReferenceEvaluator
 from torch import nn
 from torch.fx import Graph, GraphModule
 
+import mdc_llm_deploy.onnx.api as onnx_api
+from mdc_llm_deploy.errors import OnnxExportError
 from mdc_llm_deploy.export import convert_to_decode, export
 from mdc_llm_deploy.graph.lifecycle import (
     GraphMetadata,
@@ -22,9 +25,10 @@ from mdc_llm_deploy.graph.lifecycle import (
     metadata,
     set_metadata,
 )
-from mdc_llm_deploy.onnx import onnx_export
+from mdc_llm_deploy.onnx import onnx_export, standard_onnx_export
 from mdc_llm_deploy.onnx.export.standard import build_standard_onnx
 from mdc_llm_deploy.onnx.transform.linear import append_quantized_linears
+from mdc_llm_deploy.onnx.validation.model import validate_mdc_model
 from mdc_llm_deploy.quantization import oneshot
 from tests.support.models.qwen3 import dense_model, moe_model
 
@@ -33,7 +37,13 @@ pytestmark = pytest.mark.integration
 
 def test_model_independent_small_operator_graph_exports(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    def reject_mdc_validation(model: onnx.ModelProto) -> None:
+        del model
+        raise AssertionError("standard export must not use MDC validation")
+
+    monkeypatch.setattr(onnx_api, "validate_mdc_model", reject_mdc_validation)
     fx_graph = Graph()
     value = fx_graph.placeholder("value")
     result = fx_graph.call_function(torch.ops.aten.relu.default, (value,))
@@ -52,11 +62,37 @@ def test_model_independent_small_operator_graph_exports(
         ),
     )
 
-    model = onnx_export(graph, tmp_path / "small.onnx")
+    model = standard_onnx_export(graph, tmp_path / "small.onnx")
 
     assert [item.name for item in model.graph.input] == ["value"]
     assert [item.name for item in model.graph.output] == ["result"]
     assert any(node.op_type == "Relu" for node in model.graph.node)
+    assert not any(
+        item.key.startswith("mdc.") for item in model.metadata_props
+    )
+    assert not any(
+        node.op_type
+        in {
+            "NPURmsNorm",
+            "ApplyRotaryPosEmb",
+            "FusedInferAttentionScore",
+            "NPUAscendQuantV2",
+            "AscendDequant",
+            "MoeExpert",
+        }
+        for node in model.graph.node
+    )
+    onnx.checker.check_model(model, full_check=True)
+
+    def fail_build(*args: object, **kwargs: object) -> onnx.ModelProto:
+        raise AssertionError("standard export must not start")
+
+    monkeypatch.setattr(onnx_api, "build_standard_onnx", fail_build)
+    with pytest.raises(
+        OnnxExportError,
+        match="Missing fusion boundaries: attention",
+    ):
+        onnx_export(graph, tmp_path / "invalid-mdc.onnx")
 
 
 def test_two_linear_weights_keep_content_identity_through_lowering(
@@ -140,6 +176,39 @@ def _graph(
     )
 
 
+def test_mdc_export_rejects_unsupported_rms_epsilon_before_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _graph()
+    value = metadata(graph)
+    set_metadata(
+        graph,
+        replace(
+            value,
+            properties={
+                **value.properties,
+                "rms_norm_epsilon": 1e-5,
+            },
+        ),
+    )
+    build_called = False
+
+    def fail_build(*args: object, **kwargs: object) -> onnx.ModelProto:
+        nonlocal build_called
+        build_called = True
+        raise AssertionError("standard export must not start")
+
+    monkeypatch.setattr(onnx_api, "build_standard_onnx", fail_build)
+
+    with pytest.raises(
+        OnnxExportError,
+        match="require RmsNorm epsilon=1e-6",
+    ):
+        onnx_export(graph, tmp_path / "unsupported-epsilon.onnx")
+    assert not build_called
+
+
 def _tensor_devices(graph: GraphModule) -> dict[str, torch.device]:
     return {
         **{name: value.device for name, value in graph.named_parameters()},
@@ -191,7 +260,7 @@ def test_cuda_linear_legacy_export_preserves_numerics(
     target = tmp_path / "cuda-linear.onnx"
     before_devices = _tensor_devices(graph)
 
-    model = onnx_export(graph, target, external_data=False)
+    model = standard_onnx_export(graph, target, external_data=False)
 
     assert _tensor_devices(graph) == before_devices
     assert before_devices == {"weight": device}
@@ -213,6 +282,60 @@ def test_cuda_linear_legacy_export_preserves_numerics(
     )[0]
 
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_w8a8_qkv_linears_share_one_activation_quantizer(
+    tmp_path: Path,
+) -> None:
+    inputs = {"input_ids": torch.arange(4).reshape(1, 4)}
+    graph = export(dense_model(4), inputs)
+    oneshot(
+        graph,
+        "configs/quantization/minmax-linear-w8a8.json",
+        [inputs],
+    )
+
+    model = onnx_export(
+        graph,
+        tmp_path / "shared-qkv.onnx",
+        external_data=False,
+    )
+
+    qkv = [
+        next(
+            node
+            for node in model.graph.node
+            if node.name
+            == f"mdc.linear.model.layers.0.self_attn.{projection}.matmul"
+        )
+        for projection in ("q_proj", "k_proj", "v_proj")
+    ]
+    assert len({node.input[0] for node in qkv}) == 1
+    producer = next(
+        node
+        for node in model.graph.node
+        if qkv[0].input[0] in node.output
+    )
+    assert producer.op_type == "NPUAscendQuantV2"
+    repeated = onnx_export(
+        graph,
+        tmp_path / "shared-qkv-repeated.onnx",
+        external_data=False,
+    )
+    assert [
+        (node.name, node.op_type, tuple(node.input), tuple(node.output))
+        for node in repeated.graph.node
+    ] == [
+        (node.name, node.op_type, tuple(node.input), tuple(node.output))
+        for node in model.graph.node
+    ]
+    assert [
+        (item.name, item.data_type, tuple(item.dims))
+        for item in repeated.graph.initializer
+    ] == [
+        (item.name, item.data_type, tuple(item.dims))
+        for item in model.graph.initializer
+    ]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
@@ -267,11 +390,18 @@ def test_onnx_semantics_come_from_model_config(
     target = tmp_path / f"{mask_mode}.onnx"
 
     model = onnx_export(_graph(mask_mode=mask_mode), target)
+    validated = validate_mdc_model(model)
 
     assert target.is_file()
     assert (tmp_path / f"{mask_mode}.onnx.data").is_file()
     assert [item.name for item in model.graph.input] == ["input_ids"]
     assert [item.name for item in model.graph.output] == ["logits"]
+    assert validated.stage == GraphStage.FLOAT_PREFILL.value
+    assert validated.mask_mode == (
+        "masked" if mask_mode == "causal" else "maskless"
+    )
+    assert validated.algorithms == {"fp16"}
+    assert validated.targets == {"fp16"}
     onnx.load(target, load_external_data=True)
 
 

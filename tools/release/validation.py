@@ -17,17 +17,9 @@ from mdc_llm_deploy.capabilities import (
 )
 from mdc_llm_deploy.errors import OnnxExportError
 from mdc_llm_deploy.graph.metadata import GraphStage
-from mdc_llm_deploy.onnx.validation.metadata import (
-    ValidatedMetadata,
-    validate_metadata,
-)
+from mdc_llm_deploy.onnx.validation.metadata import ValidatedMetadata
 from mdc_llm_deploy.onnx.validation.model import (
-    validate_serialized_model,
-)
-from mdc_llm_deploy.onnx.validation.topology import (
-    quantized_target_families,
-    validate_custom_node_reachability,
-    validate_graph_topology,
+    load_validated_mdc_artifact,
 )
 
 
@@ -233,14 +225,14 @@ def _validate_release_artifact(
     path: str | Path,
     capability: Capability,
 ) -> ReleaseValidationEvidence:
-    model = validate_serialized_model(str(path))
-    metadata = validate_metadata(model)
-    counts = validate_graph_topology(model, capability.mask_mode.value)
-    validate_custom_node_reachability(model, metadata.properties)
+    artifact = load_validated_mdc_artifact(str(path))
+    model = artifact.model
+    metadata = artifact.metadata
+    counts = Counter(dict(artifact.topology.operator_counts))
     _validate_metadata_contract(metadata, capability)
     _validate_io_contract(model, capability, _CONTRACT)
     _validate_operator_contract(counts, capability)
-    observed_targets = quantized_target_families(model)
+    observed_targets = artifact.topology.observed_quantized_targets
     expected_observed = (
         frozenset()
         if capability.algorithm is Algorithm.FP16

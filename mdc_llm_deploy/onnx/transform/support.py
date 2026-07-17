@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import replace
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import onnx
@@ -19,6 +19,9 @@ from ...graph.metadata.quantization import (
 from ..inspection import (
     optional_static_shape as static_shape,
 )
+
+if TYPE_CHECKING:
+    from .quantization import QuantizationRegistry
 
 FLOAT_ONNX_DTYPES: set[int] = {
     int(TensorProto.FLOAT16),
@@ -36,6 +39,204 @@ _ONNX_DTYPES = {
     "bool": TensorProto.BOOL,
 }
 _NP_FLOAT32 = np.dtype(np.float32)
+
+
+@dataclass
+class OnnxLoweringContext:
+    """Maintain deterministic indexes for one ONNX lowering call."""
+
+    model: onnx.ModelProto
+    _names: set[str]
+    _node_names: set[str]
+    _types: dict[str, tuple[int, tuple[int, ...]]]
+    _initializers_by_name: dict[str, onnx.TensorProto]
+    _graph_output_sources: dict[str, str] = field(default_factory=dict)
+    _quantization: QuantizationRegistry | None = field(default=None, init=False)
+
+    @classmethod
+    def from_model(cls, model: onnx.ModelProto) -> OnnxLoweringContext:
+        """Build call-local indexes from the current graph."""
+        names = {item.name for item in model.graph.initializer}
+        names.update(item.name for item in model.graph.input)
+        names.update(output for node in model.graph.node for output in node.output)
+        return cls(
+            model=model,
+            _names=names,
+            _node_names={node.name for node in model.graph.node if node.name},
+            _types=model_types(model),
+            _initializers_by_name={
+                item.name: item for item in reversed(model.graph.initializer)
+            },
+        )
+
+    @property
+    def types(self) -> dict[str, tuple[int, tuple[int, ...]]]:
+        """Return the synchronized static type index."""
+        return self._types
+
+    def type_of(
+        self,
+        name: str,
+    ) -> tuple[int, tuple[int, ...]] | None:
+        """Return a type, refreshing values added by another lowering pass."""
+        result = self._types.get(name)
+        if result is not None:
+            return result
+        result = model_types(self.model).get(name)
+        if result is not None:
+            self._types[name] = result
+            self._names.add(name)
+        return result
+
+    @property
+    def quantization(self) -> QuantizationRegistry:
+        """Return the quantization registry owned by this lowering call."""
+        if self._quantization is None:
+            from .quantization import QuantizationRegistry
+
+            self._quantization = QuantizationRegistry(self)
+        return self._quantization
+
+    def first_initializer(self, name: str) -> onnx.TensorProto | None:
+        """Return the initializer currently indexed by name."""
+        return self._initializers_by_name.get(name)
+
+    def unique_name(self, base: str) -> str:
+        """Allocate and reserve the smallest available value name."""
+        result = base
+        index = 1
+        while result in self._names:
+            result = f"{base}.{index}"
+            index += 1
+        self._names.add(result)
+        return result
+
+    def unique_node_name(self, base: str) -> str:
+        """Allocate and reserve the smallest available node name."""
+        result = base
+        index = 1
+        while result in self._node_names:
+            result = f"{base}.{index}"
+            index += 1
+        self._node_names.add(result)
+        return result
+
+    def append_initializer(self, tensor: onnx.TensorProto) -> str:
+        """Append an initializer and synchronize all indexes."""
+        self.model.graph.initializer.append(tensor)
+        stored = self.model.graph.initializer[-1]
+        self._names.add(stored.name)
+        self._types[stored.name] = (stored.data_type, tuple(stored.dims))
+        self._initializers_by_name[stored.name] = stored
+        return str(stored.name)
+
+    def replace_initializers(
+        self,
+        tensors: list[onnx.TensorProto],
+    ) -> None:
+        """Replace graph initializers and rebuild synchronized indexes."""
+        previous_names = set(self._initializers_by_name)
+        del self.model.graph.initializer[:]
+        self.model.graph.initializer.extend(tensors)
+        self._initializers_by_name = {
+            item.name: item for item in reversed(self.model.graph.initializer)
+        }
+        for name in previous_names - self._initializers_by_name.keys():
+            self._types.pop(name, None)
+        for item in self.model.graph.initializer:
+            self._names.add(item.name)
+            self._types[item.name] = (item.data_type, tuple(item.dims))
+
+    def append_value(
+        self,
+        name: str,
+        dtype: int,
+        shape: tuple[int, ...],
+    ) -> None:
+        """Append static value metadata and synchronize its type."""
+        append_value(self.model, name, dtype, shape)
+        self._names.add(name)
+        self._types[name] = (dtype, shape)
+
+    def rebind_graph_output(
+        self,
+        output_name: str,
+        *,
+        output_dtype: int = TensorProto.INT8,
+    ) -> str:
+        """Move a graph output's producer to a stable internal value.
+
+        Call this before requesting its quantizer. The returned internal value
+        is the source passed to ``request_quant`` and ``output_name`` is the
+        preferred output name.
+        """
+        previous = self._graph_output_sources.get(output_name)
+        if previous is not None:
+            return previous
+        output = next(
+            (item for item in self.model.graph.output if item.name == output_name),
+            None,
+        )
+        if output is None:
+            raise OnnxExportError(f"Graph output {output_name!r} does not exist")
+        source_type = self._types.get(output_name)
+        if source_type is None:
+            raise OnnxExportError(f"Graph output {output_name!r} has no static type")
+        producer = next(
+            (
+                node
+                for node in self.model.graph.node
+                if output_name in node.output
+            ),
+            None,
+        )
+        if producer is None:
+            raise OnnxExportError(f"Graph output {output_name!r} has no producer")
+
+        internal = self.unique_name(f"{output_name}.float")
+        for index, name in enumerate(producer.output):
+            if name == output_name:
+                producer.output[index] = internal
+        for node in self.model.graph.node:
+            if node is producer:
+                continue
+            for index, name in enumerate(node.input):
+                if name == output_name:
+                    node.input[index] = internal
+        for item in self.model.graph.value_info:
+            if item.name == output_name:
+                item.name = internal
+
+        source_dtype, source_shape = source_type
+        if not any(
+            item.name == internal for item in self.model.graph.value_info
+        ):
+            append_value(self.model, internal, source_dtype, source_shape)
+        self._types[internal] = source_type
+        self._types[output_name] = (output_dtype, source_shape)
+        output.type.tensor_type.elem_type = output_dtype
+        self._graph_output_sources[output_name] = internal
+        return internal
+
+    def request_quant(
+        self,
+        source: str,
+        target: QuantizedTarget,
+        *,
+        axis: int,
+        output_dtype: int = TensorProto.INT8,
+        preferred_output: str | None = None,
+        name: str | None = None,
+    ) -> str:
+        """Return one shared quantized value for an effective contract."""
+        return self.quantization.request_quant(
+            source,
+            target,
+            axis=axis,
+            output_dtype=output_dtype,
+            preferred_output=preferred_output,
+            name=name,
+        )
 
 
 def initializer(name: str, value: NDArray[Any]) -> onnx.TensorProto:

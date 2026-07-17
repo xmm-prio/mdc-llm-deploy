@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any, Literal
 
 import numpy as np
@@ -25,7 +24,7 @@ from ..inspection import (
 )
 from .cleanup import producer_map, replace_nodes
 from .support import (
-    append_quant,
+    OnnxLoweringContext,
     append_value,
     initializer,
     model_types,
@@ -35,32 +34,6 @@ from .support import (
 )
 
 MaskMode = Literal["masked", "maskless"]
-
-
-@dataclass(slots=True)
-class _AttentionLoweringContext:
-    _names: set[str]
-
-    @classmethod
-    def from_model(
-        cls,
-        model: onnx.ModelProto,
-    ) -> _AttentionLoweringContext:
-        names = {item.name for item in model.graph.initializer}
-        names.update(item.name for item in model.graph.input)
-        names.update(output for node in model.graph.node for output in node.output)
-        return cls(names)
-
-    def unique_name(self, base: str) -> str:
-        if base not in self._names:
-            result = base
-        else:
-            index = 1
-            while f"{base}.{index}" in self._names:
-                index += 1
-            result = f"{base}.{index}"
-        self._names.add(result)
-        return result
 
 
 def _target(
@@ -264,82 +237,22 @@ def _product_scale_initializer(
     return result
 
 
-def _quantize_graph_output(
-    model: onnx.ModelProto,
-    output: onnx.ValueInfoProto,
-    shape: tuple[int, ...],
-    target: QuantizedTarget,
-    name: str,
-    *,
-    name_allocator: Callable[[str], str],
-) -> str:
-    original = output.name
-    source_dtype = output.type.tensor_type.elem_type
-    internal = name_allocator(f"{original}.float")
-    producer = next(
-        (node for node in model.graph.node if original in node.output),
-        None,
-    )
-    if producer is None:
-        raise OnnxExportError(f"Cache output {original!r} has no producer")
-    for index, produced in enumerate(producer.output):
-        if produced == original:
-            producer.output[index] = internal
-    for node in model.graph.node:
-        if node is producer:
-            continue
-        for index, consumed in enumerate(node.input):
-            if consumed == original:
-                node.input[index] = internal
-    for item in model.graph.value_info:
-        if item.name == original:
-            item.name = internal
-    if not any(item.name == internal for item in model.graph.value_info):
-        append_value(model, internal, source_dtype, shape)
-    output.type.tensor_type.elem_type = TensorProto.INT8
-    parameter_dtype: np.dtype[Any] = np.dtype(
-        np.float16 if source_dtype == TensorProto.FLOAT16 else np.float32
-    )
-    scale = scale_initializer(
-        model,
-        f"{name}.scale",
-        target,
-        inverse=True,
-        dtype=parameter_dtype,
-        name_allocator=name_allocator,
-    )
-    offset = offset_initializer(
-        model,
-        f"{name}.offset",
-        target,
-        dtype=parameter_dtype,
-        name_allocator=name_allocator,
-    )
-    axis = -2 if target.granularity == "per_token" else -1
-    quant = helper.make_node(
-        "NPUAscendQuantV2",
-        [internal, scale, offset],
-        [original],
-        name=name,
-        axis=axis,
-        dtype=2,
-    )
-    nodes = list(model.graph.node)
-    producer_index = nodes.index(producer)
-    nodes.insert(producer_index + 1, quant)
-    del model.graph.node[:]
-    model.graph.node.extend(nodes)
-    return original
-
-
 def lower_rope_attention(
     model: onnx.ModelProto,
     value: GraphMetadata,
     mask_mode: MaskMode,
     *,
     layer_id: int = 0,
+    context: OnnxLoweringContext | None = None,
 ) -> None:
     """Replace FQN-anchored Tiny RoPE and attention standard subgraphs."""
+    lowering_context = (
+        context
+        if context is not None
+        else OnnxLoweringContext.from_model(model)
+    )
+    if lowering_context.model is not model:
+        raise ValueError("Lowering context belongs to a different ONNX model")
     try:
         dimensions = AttentionDimensions.from_properties(
             value.properties
@@ -359,7 +272,7 @@ def lower_rope_attention(
     if not is_fqn_descendant(rope_fqn, attention_fqn):
         raise OnnxExportError("RoPE boundary is not owned by the attention boundary")
 
-    types = model_types(model)
+    types = lowering_context.types
     producers = producer_map(model)
     consumers = _consumer_map(model)
     query_projection = _single_weighted_node(model, f"{attention_fqn}.q_proj", {"Gemm", "MatMul"})
@@ -504,12 +417,11 @@ def lower_rope_attention(
     query_bnsd = query_transpose.output[0]
     query_bnsd_shape = (1, heads, query_sequence, head_dim)
     if query_bnsd not in types:
-        append_value(model, query_bnsd, query_dtype, query_bnsd_shape)
+        lowering_context.append_value(query_bnsd, query_dtype, query_bnsd_shape)
     key_shape_full = static_shape(key_output)
     value_shape_full = static_shape(value_output)
     if key_shape_full is None or value_shape_full is None:
         raise OnnxExportError("Attention cache outputs lack static type metadata")
-    context = _AttentionLoweringContext.from_model(model)
     key_input = key_output.name
     value_input = value_output.name
     key_target = _target(value, "key", attention_fqn)
@@ -518,31 +430,39 @@ def lower_rope_attention(
     score_target = _target(value, "score", attention_fqn)
     quant_name = f"mdc.attention.{attention_fqn}"
     if query_target is not None:
-        query_bnsd = append_quant(
-            model,
+        query_bnsd = lowering_context.request_quant(
             query_bnsd,
-            query_bnsd_shape,
             query_target,
-            f"{quant_name}.query_quant",
-            name_allocator=context.unique_name,
+            axis=-2 if query_target.granularity == "per_token" else -1,
+            name=f"{quant_name}.query_quant",
         )
     if key_target is not None and key_output.type.tensor_type.elem_type != TensorProto.INT8:
-        key_input = _quantize_graph_output(
-            model,
-            key_output,
-            key_shape_full,
+        key_source = lowering_context.rebind_graph_output(key_output.name)
+        key_input = lowering_context.request_quant(
+            key_source,
             key_target,
-            f"{quant_name}.key_quant",
-            name_allocator=context.unique_name,
+            axis=-2 if key_target.granularity == "per_token" else -1,
+            preferred_output=key_output.name,
+            name=f"{quant_name}.key_quant",
+        )
+        lowering_context.append_value(
+            key_input,
+            TensorProto.INT8,
+            key_shape_full,
         )
     if value_target is not None and value_output.type.tensor_type.elem_type != TensorProto.INT8:
-        value_input = _quantize_graph_output(
-            model,
-            value_output,
-            value_shape_full,
+        value_source = lowering_context.rebind_graph_output(value_output.name)
+        value_input = lowering_context.request_quant(
+            value_source,
             value_target,
-            f"{quant_name}.value_quant",
-            name_allocator=context.unique_name,
+            axis=-2 if value_target.granularity == "per_token" else -1,
+            preferred_output=value_output.name,
+            name=f"{quant_name}.value_quant",
+        )
+        lowering_context.append_value(
+            value_input,
+            TensorProto.INT8,
+            value_shape_full,
         )
 
     inputs = [""] * ATTENTION_INPUT_COUNT
@@ -558,7 +478,7 @@ def lower_rope_attention(
                 k=1,
             )
         )
-        mask_name = context.unique_name("mdc.attention.mask")
+        mask_name = lowering_context.unique_name("mdc.attention.mask")
         model.graph.initializer.append(initializer(mask_name, mask))
         inputs[AttentionInput.ATTEN_MASK] = mask_name
     if query_target is not None and key_target is not None:
@@ -567,7 +487,7 @@ def lower_rope_attention(
             "mdc.attention.dequant_scale1",
             query_target,
             key_target,
-            name_allocator=context.unique_name,
+            name_allocator=lowering_context.unique_name,
         )
     if score_target is not None:
         inputs[AttentionInput.QUANT_SCALE1] = scale_initializer(
@@ -575,7 +495,7 @@ def lower_rope_attention(
             "mdc.attention.quant_scale1",
             score_target,
             inverse=True,
-            name_allocator=context.unique_name,
+            name_allocator=lowering_context.unique_name,
         )
     if score_target is not None and value_target is not None:
         inputs[AttentionInput.DEQUANT_SCALE2] = _product_scale_initializer(
@@ -583,7 +503,7 @@ def lower_rope_attention(
             "mdc.attention.dequant_scale2",
             score_target,
             value_target,
-            name_allocator=context.unique_name,
+            name_allocator=lowering_context.unique_name,
         )
     if key_target is not None:
         inputs[AttentionInput.KEY_ANTIQUANT_SCALE] = scale_initializer(
@@ -591,14 +511,14 @@ def lower_rope_attention(
             "mdc.attention.key_antiquant_scale",
             key_target,
             inverse=False,
-            name_allocator=context.unique_name,
+            name_allocator=lowering_context.unique_name,
         )
         if not key_target.symmetric:
             inputs[AttentionInput.KEY_ANTIQUANT_OFFSET] = offset_initializer(
                 model,
                 "mdc.attention.key_antiquant_offset",
                 key_target,
-                name_allocator=context.unique_name,
+                name_allocator=lowering_context.unique_name,
             )
     if value_target is not None:
         inputs[AttentionInput.VALUE_ANTIQUANT_SCALE] = scale_initializer(
@@ -606,14 +526,14 @@ def lower_rope_attention(
             "mdc.attention.value_antiquant_scale",
             value_target,
             inverse=False,
-            name_allocator=context.unique_name,
+            name_allocator=lowering_context.unique_name,
         )
         if not value_target.symmetric:
             inputs[AttentionInput.VALUE_ANTIQUANT_OFFSET] = offset_initializer(
                 model,
                 "mdc.attention.value_antiquant_offset",
                 value_target,
-                name_allocator=context.unique_name,
+                name_allocator=lowering_context.unique_name,
             )
     if query_target is not None:
         inputs[AttentionInput.DEQUANT_SCALE_QUERY] = scale_initializer(
@@ -621,9 +541,9 @@ def lower_rope_attention(
             "mdc.attention.dequant_scale_query",
             query_target,
             inverse=False,
-            name_allocator=context.unique_name,
+            name_allocator=lowering_context.unique_name,
         )
-    lse = context.unique_name("mdc.attention.lse")
+    lse = lowering_context.unique_name("mdc.attention.lse")
     attention_output = standard_attention.output[0]
     attention_attributes: dict[str, Any] = dict(RELEASE_ATTENTION_ATTRIBUTES)
     rope_node = helper.make_node(
@@ -657,5 +577,9 @@ def lower_rope_attention(
         },
     )
     if attention_output not in types:
-        append_value(model, attention_output, query_dtype, query_bnsd_shape)
-    append_value(model, lse, TensorProto.FLOAT, (1,))
+        lowering_context.append_value(
+            attention_output,
+            query_dtype,
+            query_bnsd_shape,
+        )
+    lowering_context.append_value(lse, TensorProto.FLOAT, (1,))

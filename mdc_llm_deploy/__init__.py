@@ -25,7 +25,7 @@ if TYPE_CHECKING:
         Qwen3MoeConfig,
         Qwen3MoeForCausalLM,
     )
-    from .onnx.api import onnx_export
+    from .onnx.api import onnx_export, standard_onnx_export
     from .quantization import oneshot
 
 __version__ = "0.1.0"
@@ -48,6 +48,7 @@ __all__ = [
     "export",
     "oneshot",
     "onnx_export",
+    "standard_onnx_export",
 ]
 
 _LAZY_EXPORTS = {
@@ -61,6 +62,10 @@ _LAZY_EXPORTS = {
     "export": ("mdc_llm_deploy.export", "export"),
     "oneshot": ("mdc_llm_deploy.quantization", "oneshot"),
     "onnx_export": ("mdc_llm_deploy.onnx.api", "onnx_export"),
+    "standard_onnx_export": (
+        "mdc_llm_deploy.onnx.api",
+        "standard_onnx_export",
+    ),
 }
 
 

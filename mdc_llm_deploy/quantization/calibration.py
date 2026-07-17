@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -67,60 +67,167 @@ class _CalibrationOwnershipSnapshot:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _CalibrationBoundaryMap:
+    """Map actual FX tensor value nodes to calibration target FQNs."""
+
+    targets_by_node: Mapping[Node, tuple[str, ...]]
+    nodes_by_target: Mapping[str, tuple[Node, ...]]
+
+    @classmethod
+    def capture(
+        cls,
+        graph: GraphModule,
+        required_fqns: frozenset[str],
+        ownership: _CalibrationOwnershipSnapshot,
+    ) -> _CalibrationBoundaryMap:
+        """Resolve calibration targets onto graph tensor-value nodes."""
+        targets_by_node: dict[Node, list[str]] = {}
+        nodes_by_target: dict[str, list[Node]] = {
+            fqn: [] for fqn in required_fqns
+        }
+
+        def bind(node: object, target: str) -> None:
+            if target not in required_fqns or not isinstance(node, Node):
+                return
+            target_nodes = nodes_by_target[target]
+            if node in target_nodes:
+                return
+            target_nodes.append(node)
+            targets_by_node.setdefault(node, []).append(target)
+
+        for node in graph.graph.nodes:
+            if node.op != "call_function":
+                continue
+            attention_fqn = ownership.attention_by_node.get(node)
+            weight_name = linear_weight_name(node)
+            if weight_name is not None:
+                fqn = weight_name.removesuffix(".weight")
+                if node.args:
+                    bind(node.args[0], fqn)
+                edge = {
+                    "q_proj": "query",
+                    "k_proj": "key",
+                    "v_proj": "value",
+                }.get(fqn.rsplit(".", 1)[-1])
+                if edge is not None and attention_fqn is not None:
+                    bind(node, f"{attention_fqn}.{edge}")
+            if (
+                attention_fqn is not None
+                and node.target == torch.ops.aten.mul.Tensor
+                and any(
+                    isinstance(argument, (float, int))
+                    for argument in node.args
+                )
+            ):
+                value = node.meta.get("val")
+                shape = getattr(value, "shape", None)
+                if (
+                    shape is None
+                    or (
+                        len(shape) == 4
+                        and shape[-2] == shape[-1]
+                    )
+                ):
+                    bind(node, f"{attention_fqn}.score")
+            if (
+                node.target
+                == torch.ops.mdc_llm_deploy.moe_expert.default
+            ):
+                owner = ownership.moe_by_node.get(node)
+                if owner is not None and node.args:
+                    bind(node.args[0], f"{owner}.expert_weights")
+        return cls(
+            targets_by_node=MappingProxyType(
+                {
+                    node: tuple(targets)
+                    for node, targets in targets_by_node.items()
+                }
+            ),
+            nodes_by_target=MappingProxyType(
+                {
+                    target: tuple(nodes)
+                    for target, nodes in nodes_by_target.items()
+                }
+            ),
+        )
+
+
+class CalibrationSamples(Mapping[str, Tensor]):
+    """Aggregated boundary samples with a backward-compatible FQN view."""
+
+    def __init__(
+        self,
+        by_node: Mapping[Node, Tensor],
+        nodes_by_target: Mapping[str, tuple[Node, ...]],
+    ) -> None:
+        self._by_node = MappingProxyType(dict(by_node))
+        self._nodes_by_target = MappingProxyType(dict(nodes_by_target))
+        self._target_cache: dict[str, Tensor] = {}
+
+    def __iter__(self) -> Iterator[str]:
+        return (
+            target
+            for target, nodes in self._nodes_by_target.items()
+            if nodes
+        )
+
+    def __len__(self) -> int:
+        return sum(bool(nodes) for nodes in self._nodes_by_target.values())
+
+    def __getitem__(self, target: str) -> Tensor:
+        nodes = self._nodes_by_target[target]
+        if not nodes:
+            raise KeyError(target)
+        cached = self._target_cache.get(target)
+        if cached is not None:
+            return cached
+        values = tuple(self._by_node[node] for node in nodes)
+        value = values[0] if len(values) == 1 else torch.cat(values)
+        self._target_cache[target] = value
+        return value
+
+    def sample_items(self, target: str) -> tuple[tuple[Node, Tensor], ...]:
+        """Return stable boundary identities and samples for one target."""
+        try:
+            nodes = self._nodes_by_target[target]
+            return tuple((node, self._by_node[node]) for node in nodes)
+        except KeyError as error:
+            raise KeyError(target) from error
+
+    def boundary_key(self, target: str) -> tuple[Node, ...]:
+        """Return graph boundary identity used for qparam caching."""
+        try:
+            nodes = self._nodes_by_target[target]
+        except KeyError as error:
+            raise KeyError(target) from error
+        if not nodes:
+            raise KeyError(target)
+        return nodes
+
+
 class _CalibrationInterpreter(Interpreter):
-    """Capture actual linear inputs and attention edges from one FX execution."""
+    """Capture each actual FX tensor boundary once per graph execution."""
 
     def __init__(
         self,
         graph: GraphModule,
-        required_fqns: frozenset[str],
-        ownership: _CalibrationOwnershipSnapshot,
+        boundaries: _CalibrationBoundaryMap,
     ) -> None:
         super().__init__(graph, garbage_collect_values=True)
-        self.required_fqns = required_fqns
-        self.ownership = ownership
-        self.samples: dict[str, list[Tensor]] = {}
+        self.boundaries = boundaries
+        self.samples: dict[Node, Tensor] = {}
 
-    def _record(self, name: str, value: Any) -> None:
-        if name not in self.required_fqns:
+    def _record(self, node: Node, value: Any) -> None:
+        if node not in self.boundaries.targets_by_node:
             return
         if isinstance(value, Tensor) and value.is_floating_point():
-            self.samples.setdefault(name, []).append(value.detach())
+            self.samples[node] = value.detach()
 
     def run_node(self, node: Node) -> Any:
         """Execute one node and retain only quantization boundary tensors."""
-        args, _ = self.fetch_args_kwargs_from_env(node)
         result = super().run_node(node)
-        if node.op != "call_function":
-            return result
-        attention_fqn = self.ownership.attention_by_node.get(node)
-        weight_name = linear_weight_name(node)
-        if weight_name is not None:
-            fqn = weight_name.removesuffix(".weight")
-            self._record(fqn, args[0])
-            edge = {
-                "q_proj": "query",
-                "k_proj": "key",
-                "v_proj": "value",
-            }.get(fqn.rsplit(".", 1)[-1])
-            if edge is not None and attention_fqn is not None:
-                self._record(f"{attention_fqn}.{edge}", result)
-        if (
-            attention_fqn is not None
-            and node.target == torch.ops.aten.mul.Tensor
-            and isinstance(result, Tensor)
-            and result.ndim == 4
-            and result.shape[-2] == result.shape[-1]
-            and any(isinstance(argument, (float, int)) for argument in args)
-        ):
-            self._record(f"{attention_fqn}.score", result)
-        if (
-            node.target
-            == torch.ops.mdc_llm_deploy.moe_expert.default
-        ):
-            owner = self.ownership.moe_by_node.get(node)
-            if owner is not None:
-                self._record(f"{owner}.expert_weights", args[0])
+        self._record(node, result)
         return result
 
 
@@ -128,7 +235,7 @@ def collect_calibration_samples(
     graph: GraphModule,
     dataloader: Iterable[Mapping[str, Tensor]],
     plan: CalibrationPlan,
-) -> dict[str, Tensor]:
+) -> CalibrationSamples:
     """Validate calibration batches and collect quantization-boundary samples."""
     graph_metadata = metadata(graph)
     expected = tuple(item.name for item in graph_metadata.input_abi)
@@ -145,8 +252,8 @@ def collect_calibration_samples(
         for boundary in graph_metadata.boundaries
         if boundary.kind == "moe"
     )
-    captured: dict[str, list[Tensor]] = {}
-    ownership: _CalibrationOwnershipSnapshot | None = None
+    captured: dict[Node, list[Tensor]] = {}
+    boundaries: _CalibrationBoundaryMap | None = None
     observed = 0
     for batch in dataloader:
         if not isinstance(batch, Mapping):
@@ -179,16 +286,20 @@ def collect_calibration_samples(
                     f"Calibration value {name!r} contains NaN or Inf"
                 )
         try:
-            if ownership is None:
+            if boundaries is None:
                 ownership = _CalibrationOwnershipSnapshot.capture(
                     graph,
                     attention_fqns,
                     moe_fqns,
                 )
+                boundaries = _CalibrationBoundaryMap.capture(
+                    graph,
+                    plan.required_fqns,
+                    ownership,
+                )
             recorder = _CalibrationInterpreter(
                 graph,
-                plan.required_fqns,
-                ownership,
+                boundaries,
             )
             with torch.inference_mode():
                 recorder.run(*(batch[name] for name in expected))
@@ -196,26 +307,29 @@ def collect_calibration_samples(
             raise QuantizationConfigError(
                 f"Calibration graph execution failed: {error}"
             ) from error
-        for fqn, values in recorder.samples.items():
-            captured.setdefault(fqn, []).extend(values)
+        for node, value in recorder.samples.items():
+            captured.setdefault(node, []).append(value)
         observed += 1
     if observed == 0:
         raise QuantizationConfigError(
             "Calibration dataloader must yield at least one batch"
         )
+    if boundaries is None:
+        raise RuntimeError("Calibration boundaries were not captured")
     try:
-        aggregated: dict[str, Tensor] = {}
-        for fqn, values in captured.items():
+        aggregated: dict[Node, Tensor] = {}
+        for node, values in captured.items():
             devices = {value.device for value in values}
             if len(devices) != 1:
+                targets = boundaries.targets_by_node[node]
                 raise QuantizationConfigError(
-                    f"Calibration samples for {fqn!r} span devices "
+                    f"Calibration samples for {targets!r} span devices "
                     f"{sorted(str(device) for device in devices)}"
                 )
-            aggregated[fqn] = torch.cat(
+            aggregated[node] = torch.cat(
                 tuple(value.reshape(-1, value.shape[-1]) for value in values)
             )
-        return aggregated
+        return CalibrationSamples(aggregated, boundaries.nodes_by_target)
     except QuantizationConfigError:
         raise
     except Exception as error:

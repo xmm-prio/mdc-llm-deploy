@@ -170,11 +170,16 @@ GPTQ 字段只允许用于 `type` 为 `gptq` 的 modifier。
 
 配置包必须保持无 torch 依赖，使工具和未加载模型运行时的部署环境也能执行配置校验。
 
+激活校准边界、跨 target 样本共享和 ONNX Quant 去重由
+[激活边界量化共享](activation-quantization.md) 定义，不属于配置解析职责。
+
 ## 配置校验与能力校验边界
 
 - `config` 只判断 JSON 结构、字段类型和算法内在冲突，不读取模型，不根据后端能力删改配置。
 - planner 完成 FQN 发现、选择器应用和 modifier 重叠检查。
 - engine 在候选图上物化 `QuantizedTarget`，写入 algorithm、target、位宽、粒度、scale、zero point、配置指纹和限定回退原因。
 - `graph.validate_metadata` 对物化结果执行跨模块约束，并调用集中能力矩阵检查 model/algorithm/target/phase；矩阵外组合立即失败。
-- mask mode 和请求产物在导出入口通过同一能力矩阵检查。GPTQ 无论 linear 或 moe 都只具有 FX 能力，不得进入 ONNX/ATC。
+- mask mode 和请求产物在 MDC ONNX/ATC 导出入口通过同一能力矩阵检查。标准 ONNX
+  入口不声明后端能力。GPTQ 无论 linear 或 moe 都只具有 FX 能力，不得进入 MDC
+  ONNX/ATC。
 - 只有候选图通过 FX lint、重编译、metadata、ABI、能力和量化参数全部检查后，事务才以一次状态替换提交。任一步失败，原图代码、参数和 metadata 均保持不变。

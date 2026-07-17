@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import Tensor
@@ -42,6 +42,10 @@ class MaterializationContext:
 
     candidate: GraphModule
     parameters: Mapping[str, Tensor]
+    activation_parameters: dict[
+        tuple[object, ActivationSpec | WeightSpec],
+        tuple[Tensor, Tensor],
+    ] = field(default_factory=dict)
 
     @classmethod
     def capture(cls, candidate: GraphModule) -> MaterializationContext:
@@ -102,11 +106,49 @@ def _activation_parameters(
     )
 
 
+def _sample_items(
+    calibration: Mapping[str, Tensor],
+    fqn: str,
+) -> tuple[tuple[object, Tensor], ...]:
+    resolver = getattr(calibration, "sample_items", None)
+    if callable(resolver):
+        return cast(tuple[tuple[object, Tensor], ...], resolver(fqn))
+    return ((fqn, _required_sample(calibration, fqn)),)
+
+
+def _boundary_key(
+    calibration: Mapping[str, Tensor],
+    fqn: str,
+) -> object:
+    resolver = getattr(calibration, "boundary_key", None)
+    if callable(resolver):
+        return resolver(fqn)
+    return fqn
+
+
+def _cached_activation_parameters(
+    context: MaterializationContext,
+    calibration: Mapping[str, Tensor],
+    target: TargetPlan,
+    spec: ActivationSpec | WeightSpec,
+) -> tuple[Tensor, Tensor]:
+    key = (_boundary_key(calibration, target.fqn), spec)
+    cached = context.activation_parameters.get(key)
+    if cached is None:
+        cached = _activation_parameters(
+            _required_sample(calibration, target.fqn),
+            spec,
+        )
+        context.activation_parameters[key] = cached
+    return cached
+
+
 def _materialize_weight(
     context: MaterializationContext,
     parameter: Tensor,
     target: TargetPlan,
     calibration: Mapping[str, Tensor],
+    sample: Tensor | None = None,
 ) -> tuple[QuantizedTensor, str | None, tuple[float, ...] | None]:
     if target.weight is None:
         raise QuantizationConfigError(
@@ -127,7 +169,11 @@ def _materialize_weight(
             raise QuantizationConfigError(
                 "GPTQ does not support packed MoeExpert weights"
             )
-        samples = _required_sample(calibration, target.fqn)
+        samples = (
+            _required_sample(calibration, target.fqn)
+            if sample is None
+            else sample
+        )
         _require_same_device(
             parameter,
             samples,
@@ -170,7 +216,11 @@ def _materialize_weight(
         module_name = target.parameter_name.rsplit(".", 1)[0]
         module = context.candidate.get_submodule(module_name)
         expert_count = int(parameter.shape[0])
-        samples = _required_sample(calibration, target.fqn)
+        samples = (
+            _required_sample(calibration, target.fqn)
+            if sample is None
+            else sample
+        )
         _require_same_device(
             parameter,
             samples,
@@ -254,13 +304,16 @@ def _materialize_weight(
 
 
 def _activation_metadata(
+    context: MaterializationContext,
     target: TargetPlan,
     calibration: Mapping[str, Tensor],
 ) -> dict[str, Any] | None:
     if target.activation is None:
         return None
-    scale, zero_point = _activation_parameters(
-        _required_sample(calibration, target.fqn),
+    scale, zero_point = _cached_activation_parameters(
+        context,
+        calibration,
+        target,
         target.activation,
     )
     return {
@@ -292,6 +345,8 @@ def materialize_target(
     context: MaterializationContext,
     target: TargetPlan,
     calibration: Mapping[str, Tensor],
+    *,
+    weight_sample: Tensor | None = None,
 ) -> MaterializationResult:
     """Apply one target plan and return its immutable contract data."""
     parameter = context.parameter(target)
@@ -309,15 +364,19 @@ def materialize_target(
             parameter,
             target,
             calibration,
+            weight_sample,
         )
         scale = result.scale
         zero_point = result.zero_point
     else:
-        scale, zero_point = _activation_parameters(
-            _required_sample(calibration, target.fqn),
+        scale, zero_point = _cached_activation_parameters(
+            context,
+            calibration,
+            target,
             spec,
         )
     activation_qparams = _activation_metadata(
+        context,
         target,
         calibration,
     )
@@ -359,7 +418,7 @@ def materialize_alias_group(
     if not targets:
         return ()
     representative = targets[0]
-    group_calibration = dict(calibration)
+    weight_sample: Tensor | None = None
     if (
         len(targets) > 1
         and representative.parameter_name is not None
@@ -373,24 +432,28 @@ def materialize_alias_group(
             )
         )
     ):
-        samples = tuple(
-            _required_sample(calibration, target.fqn) for target in targets
-        )
+        unique_samples: dict[object, Tensor] = {}
+        for target in targets:
+            for boundary, sample in _sample_items(calibration, target.fqn):
+                unique_samples.setdefault(boundary, sample)
+        samples = tuple(unique_samples.values())
         devices = {sample.device for sample in samples}
         if len(devices) != 1:
             raise QuantizationConfigError(
                 "Aliased calibration targets span devices: "
                 f"{sorted(str(device) for device in devices)}"
             )
-        group_calibration[representative.fqn] = torch.cat(samples)
+        weight_sample = samples[0] if len(samples) == 1 else torch.cat(samples)
     first = materialize_target(
         context,
         representative,
-        group_calibration,
+        calibration,
+        weight_sample=weight_sample,
     )
     results = [first]
     for target in targets[1:]:
         activation_qparams = _activation_metadata(
+            context,
             target,
             calibration,
         )

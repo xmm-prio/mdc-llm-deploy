@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import onnx
@@ -85,7 +86,7 @@ def _linear_model(
             )
         )
         node_inputs = [source, weight_name]
-        attributes: dict[str, int] = {}
+        attributes: dict[str, Any] = {}
         if bias:
             bias_name = f"bias.{index}"
             node_inputs.append(bias_name)
@@ -155,14 +156,14 @@ def test_multiple_targets_replace_original_positions_and_cleanup_weights() -> No
     )
 
     assert _node_names(model) == [
-        "mdc.linear.second.quant",
         "mdc.linear.second.matmul",
         "mdc.linear.second.dequant",
         "padding",
-        "mdc.linear.first.quant",
         "mdc.linear.first.matmul",
         "mdc.linear.first.dequant",
         "keep",
+        "mdc.linear.first.quant",
+        "mdc.linear.second.quant",
     ]
     assert [
         sum(node.op_type == op_type for node in model.graph.node)
@@ -177,6 +178,50 @@ def test_multiple_targets_replace_original_positions_and_cleanup_weights() -> No
     assert "graph.second.weight" not in initializer_names
     assert "graph.keep.weight" in initializer_names
     assert "auxiliary" in initializer_names
+
+
+def test_shared_source_and_contract_reuse_quantizer() -> None:
+    model = _linear_model(("first", "second"))
+    model.graph.node[1].input[0] = "source.0"
+    context = support.OnnxLoweringContext.from_model(model)
+
+    linear.append_quantized_linears(
+        model,
+        _metadata(_target("first"), _target("second")),
+        context,
+    )
+
+    quant_nodes = [
+        node for node in model.graph.node if node.op_type == "NPUAscendQuantV2"
+    ]
+    matmuls = [node for node in model.graph.node if node.op_type == "MatMul"]
+    assert len(quant_nodes) == 1
+    assert len(matmuls) == 2
+    assert {node.input[0] for node in matmuls} == {quant_nodes[0].output[0]}
+    assert sum(node.op_type == "AscendDequant" for node in model.graph.node) == 2
+
+
+def test_shared_source_with_different_contracts_keeps_quantizers_distinct() -> None:
+    model = _linear_model(("first", "second"))
+    model.graph.node[1].input[0] = "source.0"
+    context = support.OnnxLoweringContext.from_model(model)
+
+    linear.append_quantized_linears(
+        model,
+        _metadata(
+            _target("first", scale=(0.25,)),
+            _target("second", scale=(0.5,)),
+        ),
+        context,
+    )
+
+    quant_nodes = [
+        node for node in model.graph.node if node.op_type == "NPUAscendQuantV2"
+    ]
+    matmuls = [node for node in model.graph.node if node.op_type == "MatMul"]
+    assert len(quant_nodes) == 2
+    assert len({node.input[0] for node in matmuls}) == 2
+    assert sum(node.op_type == "AscendDequant" for node in model.graph.node) == 2
 
 
 def test_multiple_targets_pack_each_canonical_weight_identity() -> None:
@@ -218,7 +263,7 @@ def test_multiple_targets_pack_each_canonical_weight_identity() -> None:
     )
 
 
-def test_gemm_bias_allocates_seven_names_and_appends_add(
+def test_gemm_bias_allocates_target_names_and_appends_add(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = _linear_model(("projection",), op_type="Gemm", bias=True)
@@ -242,28 +287,25 @@ def test_gemm_bias_allocates_seven_names_and_appends_add(
 
     prefix = "mdc.linear.projection"
     assert allocated == [
-        f"{prefix}.quant_scale",
-        f"{prefix}.quant_offset",
         f"{prefix}.weight",
         f"{prefix}.dequant_scale",
-        f"{prefix}.quantized",
         f"{prefix}.accumulator",
         f"{prefix}.dequantized",
     ]
     assert [node.op_type for node in model.graph.node] == [
-        "NPUAscendQuantV2",
         "MatMul",
         "AscendDequant",
         "Add",
+        "NPUAscendQuantV2",
     ]
-    assert model.graph.node[-2].output == [f"{prefix}.dequantized"]
-    assert model.graph.node[-1].input == [f"{prefix}.dequantized", "bias.0"]
-    assert model.graph.node[-1].output == ["output.0"]
+    assert model.graph.node[1].output == [f"{prefix}.dequantized"]
+    assert model.graph.node[2].input == [f"{prefix}.dequantized", "bias.0"]
+    assert model.graph.node[2].output == ["output.0"]
 
 
 def test_name_allocation_uses_only_original_occupancy_categories() -> None:
     model = _linear_model(("projection",))
-    base = "mdc.linear.projection.quant_scale"
+    base = "mdc.linear.projection.quant.scale"
     model.graph.initializer.append(
         numpy_helper.from_array(np.ones((1,), dtype=np.float32), name=base)
     )
@@ -376,7 +418,7 @@ def test_context_registers_replacement_bucket_in_graph_order() -> None:
 
 def test_new_value_type_is_visible_to_later_target() -> None:
     model = _linear_model(("first", "second"))
-    model.graph.node[1].input[0] = "mdc.linear.first.quantized"
+    model.graph.node[1].input[0] = "mdc.linear.first.quant.output"
 
     with pytest.raises(
         OnnxExportError,
@@ -458,23 +500,36 @@ def test_missing_output_type_appends_metadata_before_activation_error() -> None:
     ] == before_nodes
 
 
-def test_offset_failure_preserves_appended_scale_only(
+def test_registry_offset_failure_preserves_appended_scale_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = _linear_model(("projection",))
     before_nodes = [node.SerializeToString() for node in model.graph.node]
+    appends = 0
+    real_append = support.OnnxLoweringContext.append_initializer
 
-    def fail_offset(*args: object, **kwargs: object) -> str:
-        raise RuntimeError("offset sentinel")
+    def fail_offset(
+        context: support.OnnxLoweringContext,
+        tensor: onnx.TensorProto,
+    ) -> str:
+        nonlocal appends
+        appends += 1
+        if appends == 2:
+            raise RuntimeError("offset sentinel")
+        return real_append(context, tensor)
 
-    monkeypatch.setattr(linear, "offset_initializer", fail_offset)
+    monkeypatch.setattr(
+        support.OnnxLoweringContext,
+        "append_initializer",
+        fail_offset,
+    )
 
     with pytest.raises(RuntimeError, match="offset sentinel"):
         linear.append_quantized_linears(model, _metadata(_target("projection")))
 
     assert [item.name for item in model.graph.initializer] == [
         "graph.projection.weight",
-        "mdc.linear.projection.quant_scale",
+        "mdc.linear.projection.quant.scale",
     ]
     assert not model.graph.value_info[-1].name.startswith("mdc.linear.")
     assert [
@@ -533,7 +588,7 @@ def test_multiple_targets_build_types_once_and_skip_default_name_scan(
 ) -> None:
     model = _linear_model(("first", "second", "third"))
     calls = 0
-    real_model_types = linear.model_types
+    real_model_types = support.model_types
 
     def counted_model_types(
         value: onnx.ModelProto,
@@ -548,7 +603,7 @@ def test_multiple_targets_build_types_once_and_skip_default_name_scan(
     ) -> str:
         raise AssertionError(f"default unique_name called for {base}")
 
-    monkeypatch.setattr(linear, "model_types", counted_model_types)
+    monkeypatch.setattr(support, "model_types", counted_model_types)
     monkeypatch.setattr(support, "unique_name", reject_default_name_scan)
 
     linear.append_quantized_linears(

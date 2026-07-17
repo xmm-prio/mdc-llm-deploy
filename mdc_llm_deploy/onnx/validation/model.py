@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import onnx
 
 from ...errors import OnnxExportError
 from ...operators.contracts.attention import ATTENTION_INPUT_COUNT
 from ...operators.contracts.onnx import MDC_ONNX_DOMAIN, MDC_ONNX_OPSET
 from ...operators.contracts.schema import OPERATOR_SCHEMAS
+from .metadata import ValidatedMetadata, validate_metadata
+from .topology import (
+    QuantizationTopologyEvidence,
+    validate_quantization_topology,
+)
 
 _CUSTOM_SCHEMAS = {
     schema.onnx_name: schema for schema in OPERATOR_SCHEMAS.values()
@@ -21,6 +28,15 @@ _REQUIRED_INPUTS = {
     "AscendDequant": 2,
     "MoeExpert": 4,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedMdcArtifact:
+    """Validated serialized MDC ONNX model and metadata."""
+
+    model: onnx.ModelProto
+    metadata: ValidatedMetadata
+    topology: QuantizationTopologyEvidence
 
 
 def _validate_names(model: onnx.ModelProto) -> None:
@@ -60,7 +76,20 @@ def _validate_custom_nodes(model: onnx.ModelProto) -> None:
             )
 
 
-def validate_mdc_model(model: onnx.ModelProto) -> None:
+def validate_standard_model(model: onnx.ModelProto) -> None:
+    """Validate a standard ONNX model without MDC dialect assumptions."""
+    if not isinstance(model, onnx.ModelProto):
+        raise TypeError("model must be onnx.ModelProto")
+    if model.ir_version <= 0:
+        raise OnnxExportError("ONNX IR version must be positive")
+    _validate_names(model)
+    try:
+        onnx.checker.check_model(model, full_check=True)
+    except Exception as error:
+        raise OnnxExportError(f"ONNX checker failed: {error}") from error
+
+
+def validate_mdc_model_structure(model: onnx.ModelProto) -> None:
     """Validate protobuf structure, I/O, opset, and custom schemas."""
     if not isinstance(model, onnx.ModelProto):
         raise TypeError("model must be onnx.ModelProto")
@@ -73,23 +102,50 @@ def validate_mdc_model(model: onnx.ModelProto) -> None:
         raise OnnxExportError("ONNX imports an unsupported operator domain")
     _validate_names(model)
     _validate_custom_nodes(model)
-    try:
-        if not any(
-            node.op_type in _CUSTOM_SCHEMAS for node in model.graph.node
-        ):
-            onnx.checker.check_model(model, full_check=True)
-    except Exception as error:
-        raise OnnxExportError(f"ONNX checker failed: {error}") from error
+    if not any(node.op_type in _CUSTOM_SCHEMAS for node in model.graph.node):
+        validate_standard_model(model)
 
 
-def validate_serialized_model(path: str) -> onnx.ModelProto:
-    """Load external data and validate serialized ONNX artifacts."""
+def validate_mdc_model(model: onnx.ModelProto) -> ValidatedMetadata:
+    """Validate a complete in-memory MDC ONNX artifact."""
+    validate_mdc_model_structure(model)
+    metadata = validate_metadata(model)
+    validate_quantization_topology(model, metadata)
+    return metadata
+
+
+def _load_serialized_model(path: str) -> onnx.ModelProto:
     try:
-        model = onnx.load(path, load_external_data=True)
+        return onnx.load(path, load_external_data=True)
     except Exception as error:
         raise OnnxExportError(f"Cannot read ONNX protobuf: {error}") from error
-    validate_mdc_model(model)
+
+
+def validate_serialized_standard_model(path: str) -> onnx.ModelProto:
+    """Load external data and validate a serialized standard ONNX artifact."""
+    model = _load_serialized_model(path)
+    validate_standard_model(model)
     return model
 
 
-__all__ = ["validate_mdc_model", "validate_serialized_model"]
+def load_validated_mdc_artifact(path: str) -> ValidatedMdcArtifact:
+    """Load external data and validate a complete MDC ONNX artifact."""
+    model = _load_serialized_model(path)
+    validate_mdc_model_structure(model)
+    metadata = validate_metadata(model)
+    topology = validate_quantization_topology(model, metadata)
+    return ValidatedMdcArtifact(
+        model=model,
+        metadata=metadata,
+        topology=topology,
+    )
+
+
+__all__ = [
+    "ValidatedMdcArtifact",
+    "load_validated_mdc_artifact",
+    "validate_mdc_model",
+    "validate_mdc_model_structure",
+    "validate_serialized_standard_model",
+    "validate_standard_model",
+]

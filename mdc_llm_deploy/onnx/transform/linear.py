@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 import onnx
@@ -15,12 +14,9 @@ from ...graph.metadata import GraphMetadata, QuantizedTarget
 from ..inspection import decoded_node_attributes
 from .support import (
     FLOAT_ONNX_DTYPES,
+    OnnxLoweringContext,
     activation_target,
-    append_value,
     initializer,
-    model_types,
-    offset_initializer,
-    scale_initializer,
 )
 
 
@@ -28,34 +24,28 @@ from .support import (
 class _LinearLoweringContext:
     """Maintain call-local indexes for quantized linear graph mutations."""
 
-    model: onnx.ModelProto
-    _initializers_by_name: dict[str, onnx.TensorProto]
+    lowering: OnnxLoweringContext
     _linear_nodes_by_weight: dict[str, list[onnx.NodeProto]]
-    _types: dict[str, tuple[int, tuple[int, ...]]]
-    _names: set[str]
 
     @classmethod
     def from_model(cls, model: onnx.ModelProto) -> _LinearLoweringContext:
         """Build indexes with the graph's existing lookup semantics."""
-        initializers_by_name: dict[str, onnx.TensorProto] = {}
-        names: set[str] = set()
-        for item in model.graph.initializer:
-            initializers_by_name.setdefault(item.name, item)
-            names.add(item.name)
+        return cls.from_lowering(OnnxLoweringContext.from_model(model))
 
+    @classmethod
+    def from_lowering(
+        cls,
+        lowering: OnnxLoweringContext,
+    ) -> _LinearLoweringContext:
+        """Build linear indexes around a shared lowering context."""
         linear_nodes_by_weight: dict[str, list[onnx.NodeProto]] = {}
-        for node in model.graph.node:
+        for node in lowering.model.graph.node:
             weight_name = cls._linear_weight_name(node)
             if weight_name is not None:
                 linear_nodes_by_weight.setdefault(weight_name, []).append(node)
-            names.update(node.output)
-        names.update(item.name for item in model.graph.input)
         return cls(
-            model=model,
-            _initializers_by_name=initializers_by_name,
+            lowering=lowering,
             _linear_nodes_by_weight=linear_nodes_by_weight,
-            _types=model_types(model),
-            _names=names,
         )
 
     @staticmethod
@@ -65,13 +55,18 @@ class _LinearLoweringContext:
         return str(node.input[1])
 
     @property
+    def model(self) -> onnx.ModelProto:
+        """Return the model owned by the shared lowering context."""
+        return self.lowering.model
+
+    @property
     def types(self) -> dict[str, tuple[int, tuple[int, ...]]]:
         """Return the synchronized static type index."""
-        return self._types
+        return self.lowering.types
 
     def first_initializer(self, name: str) -> onnx.TensorProto | None:
         """Return the first initializer with the requested name."""
-        return self._initializers_by_name.get(name)
+        return self.lowering.first_initializer(name)
 
     def linear_nodes(self, weight_name: str) -> list[onnx.NodeProto]:
         """Return matching standard linear nodes in graph order."""
@@ -79,29 +74,11 @@ class _LinearLoweringContext:
 
     def unique_name(self, base: str) -> str:
         """Allocate and reserve the smallest available value name."""
-        if base not in self._names:
-            self._names.add(base)
-            return base
-        index = 1
-        while f"{base}.{index}" in self._names:
-            index += 1
-        result = f"{base}.{index}"
-        self._names.add(result)
-        return result
-
-    def _record_initializer(self, tensor: onnx.TensorProto) -> None:
-        self._names.add(tensor.name)
-        self._types[tensor.name] = (tensor.data_type, tuple(tensor.dims))
-        self._initializers_by_name.setdefault(tensor.name, tensor)
-
-    def record_appended_initializer(self) -> None:
-        """Synchronize an initializer appended by a construction helper."""
-        self._record_initializer(self.model.graph.initializer[-1])
+        return self.lowering.unique_name(base)
 
     def append_initializer(self, tensor: onnx.TensorProto) -> None:
         """Append an initializer and synchronize all affected indexes."""
-        self.model.graph.initializer.append(tensor)
-        self._record_initializer(self.model.graph.initializer[-1])
+        self.lowering.append_initializer(tensor)
 
     def append_value(
         self,
@@ -110,8 +87,7 @@ class _LinearLoweringContext:
         shape: tuple[int, ...],
     ) -> None:
         """Append static value metadata and synchronize its type."""
-        append_value(self.model, name, dtype, shape)
-        self._types[name] = (dtype, shape)
+        self.lowering.append_value(name, dtype, shape)
 
     def replace_node(
         self,
@@ -143,7 +119,6 @@ class _LinearLoweringContext:
                     replacement_weight,
                     [],
                 ).insert(prior_count, item)
-            self._names.update(item.output)
 
 
 def _linear_weight_array(
@@ -170,7 +145,6 @@ def _replace_linear(
     value: GraphMetadata,
     target: QuantizedTarget,
 ) -> None:
-    model = context.model
     weight_name = f"graph.{target.fqn}.weight"
     weight = context.first_initializer(weight_name)
     if weight is None:
@@ -213,6 +187,8 @@ def _replace_linear(
         source,
         (source_dtype, (*output_shape[:-1], array.shape[0])),
     )[1]
+    if context.lowering.type_of(source) is None:
+        context.append_value(source, source_dtype, source_shape)
     if source_dtype not in FLOAT_ONNX_DTYPES or output_dtype != source_dtype:
         raise OnnxExportError(
             f"Linear target {target.fqn!r} has unsupported dtypes"
@@ -249,26 +225,12 @@ def _replace_linear(
         )
 
     prefix = f"mdc.linear.{target.fqn}"
-    parameter_dtype: np.dtype[Any] = np.dtype(
-        np.float16 if source_dtype == TensorProto.FLOAT16 else np.float32
-    )
-    quant_scale = scale_initializer(
-        model,
-        f"{prefix}.quant_scale",
+    quantized = context.lowering.request_quant(
+        source,
         activation,
-        inverse=True,
-        dtype=parameter_dtype,
-        name_allocator=context.unique_name,
+        axis=-1,
+        name=f"{prefix}.quant",
     )
-    context.record_appended_initializer()
-    quant_offset = offset_initializer(
-        model,
-        f"{prefix}.quant_offset",
-        activation,
-        dtype=parameter_dtype,
-        name_allocator=context.unique_name,
-    )
-    context.record_appended_initializer()
     packed_name = context.unique_name(f"{prefix}.weight")
     context.append_initializer(initializer(packed_name, packed))
     combined = (
@@ -280,7 +242,6 @@ def _replace_linear(
         initializer(dequant_scale_name, dequant_scale)
     )
 
-    quantized = context.unique_name(f"{prefix}.quantized")
     accumulator = context.unique_name(f"{prefix}.accumulator")
     original_output = node.output[0]
     has_bias = (
@@ -294,14 +255,6 @@ def _replace_linear(
         else original_output
     )
     replacement = [
-        helper.make_node(
-            "NPUAscendQuantV2",
-            [source, quant_scale, quant_offset],
-            [quantized],
-            name=f"{prefix}.quant",
-            axis=-1,
-            dtype=2,
-        ),
         helper.make_node(
             "MatMul",
             [quantized, packed_name],
@@ -327,7 +280,6 @@ def _replace_linear(
                 name=f"{prefix}.bias",
             )
         )
-    context.append_value(quantized, TensorProto.INT8, source_shape)
     context.append_value(accumulator, TensorProto.INT32, output_shape)
     if has_bias:
         context.append_value(dequantized, output_dtype, output_shape)
@@ -338,17 +290,21 @@ def _replace_linear(
 def append_quantized_linears(
     model: onnx.ModelProto,
     value: GraphMetadata,
+    context: OnnxLoweringContext | None = None,
 ) -> None:
     """Replace all FQN-matched linear targets with MDC W8A8 chains."""
+    lowering = context or OnnxLoweringContext.from_model(model)
+    if lowering.model is not model:
+        raise ValueError("Lowering context belongs to a different ONNX model")
     targets = [
         item
         for item in value.quantized_targets
         if item.target_type == "linear"
     ]
     if targets:
-        context = _LinearLoweringContext.from_model(model)
+        linear_context = _LinearLoweringContext.from_lowering(lowering)
         for target in targets:
-            _replace_linear(context, value, target)
+            _replace_linear(linear_context, value, target)
     used_inputs = {
         name
         for node in model.graph.node
@@ -360,5 +316,4 @@ def append_quantized_linears(
         for item in model.graph.initializer
         if item.name in used_inputs or not item.name.startswith("graph.")
     ]
-    del model.graph.initializer[:]
-    model.graph.initializer.extend(retained)
+    lowering.replace_initializers(retained)

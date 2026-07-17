@@ -25,6 +25,9 @@ from mdc_llm_deploy.onnx import api, onnx_export
 from mdc_llm_deploy.onnx.transform import (
     attention as attention_lowering,
 )
+from mdc_llm_deploy.onnx.transform.cleanup import producer_map
+from mdc_llm_deploy.onnx.transform.support import OnnxLoweringContext
+from mdc_llm_deploy.operators.contracts.attention import AttentionInput
 from mdc_llm_deploy.quantization import oneshot
 from tests.support.models.qwen3 import dense_model
 
@@ -163,7 +166,7 @@ def test_api_lower_selects_only_strict_attention_descendant_rope(
     monkeypatch.setattr(
         api,
         "lower_rope_attention",
-        lambda model, value, mask_mode, *, layer_id: lowered.append(
+        lambda model, value, mask_mode, *, layer_id, context: lowered.append(
             value.boundaries
         ),
     )
@@ -238,7 +241,7 @@ def test_api_preserves_attention_lowering_order() -> None:
         ("value_info", "value"),
     ],
 )
-def test_attention_context_matches_graph_name_occupancy(
+def test_attention_uses_shared_context_graph_name_occupancy(
     occupied_by: str,
     expected: str,
 ) -> None:
@@ -258,14 +261,12 @@ def test_attention_context_matches_graph_name_occupancy(
             helper.make_tensor_value_info("value", TensorProto.FLOAT, (1,))
         )
 
-    context = attention_lowering._AttentionLoweringContext.from_model(
-        helper.make_model(graph)
-    )
+    context = OnnxLoweringContext.from_model(helper.make_model(graph))
 
     assert context.unique_name("value") == expected
 
 
-def test_attention_context_reserves_each_name_and_uses_smallest_suffix() -> None:
+def test_attention_shared_context_reserves_smallest_suffix() -> None:
     model = helper.make_model(
         helper.make_graph(
             [
@@ -278,16 +279,13 @@ def test_attention_context_reserves_each_name_and_uses_smallest_suffix() -> None
             [],
         )
     )
-    context = attention_lowering._AttentionLoweringContext.from_model(model)
+    context = OnnxLoweringContext.from_model(model)
 
     assert context.unique_name("value") == "value.2"
     assert context.unique_name("value") == "value.4"
 
 
-def test_quantized_attention_uses_one_private_context_per_layer(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
+def _quantized_attention_graph() -> torch.fx.GraphModule:
     inputs = {"input_ids": torch.arange(4).reshape(1, 4)}
     graph = export(dense_model(4, layers=2), inputs)
     oneshot(
@@ -295,67 +293,107 @@ def test_quantized_attention_uses_one_private_context_per_layer(
         "configs/quantization/minmax-attention-a8.json",
         [inputs],
     )
-    default_names: list[str] = []
-    contexts: list[attention_lowering._AttentionLoweringContext] = []
-    real_unique_name = attention_lowering.unique_name
-    real_from_model = attention_lowering._AttentionLoweringContext.from_model.__func__
+    return graph
 
-    def counted_unique_name(model: onnx.ModelProto, base: str) -> str:
-        default_names.append(base)
-        return real_unique_name(model, base)
 
-    def counted_from_model(
-        cls: type[attention_lowering._AttentionLoweringContext],
-        model: onnx.ModelProto,
-    ) -> attention_lowering._AttentionLoweringContext:
-        context = real_from_model(cls, model)
-        contexts.append(context)
-        return context
-
-    monkeypatch.setattr(attention_lowering, "unique_name", counted_unique_name)
-    monkeypatch.setattr(
-        attention_lowering._AttentionLoweringContext,
-        "from_model",
-        classmethod(counted_from_model),
-    )
-
+def test_quantized_attention_lowering_is_deterministic(
+    tmp_path: Path,
+) -> None:
+    graph = _quantized_attention_graph()
     first = onnx_export(graph, tmp_path / "first.onnx", external_data=False)
-    first_contexts = tuple(contexts)
-    contexts.clear()
     second = onnx_export(graph, tmp_path / "second.onnx", external_data=False)
 
-    assert len(first_contexts) == len(contexts) == 2
-    assert all(
-        left is not right
-        for left, right in zip(first_contexts, contexts, strict=True)
-    )
-    assert default_names
-    assert all(name.startswith("mdc.rms_norm.") for name in default_names)
     assert hashlib.sha256(
         first.SerializeToString(deterministic=True)
     ).digest() == hashlib.sha256(
         second.SerializeToString(deterministic=True)
     ).digest()
+
+
+def test_quantized_attention_accepts_one_shared_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    graph = _quantized_attention_graph()
+    real_lower = attention_lowering.lower_rope_attention
+    observed: list[OnnxLoweringContext] = []
+
+    def lower_with_shared_context(
+        model: onnx.ModelProto,
+        value: GraphMetadata,
+        mask_mode: attention_lowering.MaskMode,
+        *,
+        layer_id: int,
+        context: OnnxLoweringContext,
+    ) -> None:
+        observed.append(context)
+        real_lower(
+            model,
+            value,
+            mask_mode,
+            layer_id=layer_id,
+            context=context,
+        )
+
+    monkeypatch.setattr(api, "lower_rope_attention", lower_with_shared_context)
+
+    model = onnx_export(graph, tmp_path / "shared.onnx", external_data=False)
+
+    assert len(observed) == 2
+    assert observed[0] is observed[1]
     attention_nodes = [
-        node for node in first.graph.node if node.op_type == "FusedInferAttentionScore"
+        node for node in model.graph.node if node.op_type == "FusedInferAttentionScore"
     ]
-    assert len(attention_nodes) == 2
-    initializer_names = [item.name for item in first.graph.initializer]
-    for base in (
-        "mdc.attention.mask",
-        "mdc.attention.dequant_scale1",
-        "mdc.attention.quant_scale1",
-        "mdc.attention.dequant_scale2",
-        "mdc.attention.key_antiquant_scale",
-        "mdc.attention.value_antiquant_scale",
-        "mdc.attention.dequant_scale_query",
-    ):
-        assert base in initializer_names
-        assert f"{base}.1" in initializer_names
     assert [node.output[1] for node in attention_nodes] == [
         "mdc.attention.lse",
         "mdc.attention.lse.1",
     ]
+
+
+def test_quantized_cache_graph_outputs_keep_abi(
+    tmp_path: Path,
+) -> None:
+    model = onnx_export(
+        _quantized_attention_graph(),
+        tmp_path / "graph_outputs.onnx",
+        external_data=False,
+    )
+
+    specifications = {
+        item.name: item
+        for item in (*model.graph.output, *model.graph.value_info)
+    }
+    quantizers = {
+        node.output[0]: node
+        for node in model.graph.node
+        if node.op_type == "NPUAscendQuantV2"
+        and node.output
+        and node.output[0].startswith("present.")
+    }
+    cache_names = {
+        f"present.{layer_id}.{edge}"
+        for layer_id in range(2)
+        for edge in ("key", "value")
+    }
+
+    assert quantizers.keys() == cache_names
+    for cache_name in cache_names:
+        assert (
+            specifications[cache_name].type.tensor_type.elem_type
+            == TensorProto.INT8
+        )
+        assert quantizers[cache_name].input[0].startswith(f"{cache_name}.float")
+    attention_nodes = [
+        node for node in model.graph.node if node.op_type == "FusedInferAttentionScore"
+    ]
+    assert {
+        node.input[index]
+        for node in attention_nodes
+        for index in (
+            AttentionInput.KEY,
+            AttentionInput.VALUE,
+        )
+    } == cache_names
 
 
 def test_lower_rms_norms_builds_producer_index_once(
@@ -366,7 +404,7 @@ def test_lower_rms_norms_builds_producer_index_once(
         reverse_boundaries=True,
     )
     original_names = [node.name for node in model.graph.node]
-    real_producer_map = attention_lowering.producer_map
+    real_producer_map = producer_map
     calls = 0
 
     def counted_producer_map(value: onnx.ModelProto) -> dict[str, onnx.NodeProto]:
@@ -374,7 +412,10 @@ def test_lower_rms_norms_builds_producer_index_once(
         calls += 1
         return real_producer_map(value)
 
-    monkeypatch.setattr(attention_lowering, "producer_map", counted_producer_map)
+    monkeypatch.setattr(
+        "mdc_llm_deploy.onnx.transform.attention.producer_map",
+        counted_producer_map,
+    )
 
     attention_lowering.lower_rms_norms(model, metadata)
 

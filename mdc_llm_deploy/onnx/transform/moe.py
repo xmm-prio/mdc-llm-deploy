@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 
 import numpy as np
 import onnx
@@ -13,37 +12,10 @@ from onnx import TensorProto, helper, numpy_helper
 from ...errors import OnnxExportError
 from ...graph.metadata import GraphMetadata
 from .support import (
+    OnnxLoweringContext,
     activation_target,
-    append_quant,
-    append_value,
     initializer,
-    model_types,
 )
-
-
-@dataclass(slots=True)
-class _MoeAdaptationContext:
-    _names: set[str]
-
-    @classmethod
-    def from_model(cls, model: onnx.ModelProto) -> _MoeAdaptationContext:
-        """Capture names occupied at the start of one adaptation call."""
-        names = {item.name for item in model.graph.initializer}
-        names.update(item.name for item in model.graph.input)
-        names.update(
-            output for node in model.graph.node for output in node.output
-        )
-        return cls(names)
-
-    def unique_name(self, base: str) -> str:
-        """Reserve and return the first available value name."""
-        result = base
-        index = 1
-        while result in self._names:
-            result = f"{base}.{index}"
-            index += 1
-        self._names.add(result)
-        return result
 
 
 def _intermediate_scales(
@@ -73,6 +45,7 @@ def _intermediate_scales(
 def adapt_quantized_moe(
     model: onnx.ModelProto,
     value: GraphMetadata,
+    context: OnnxLoweringContext | None = None,
 ) -> None:
     """Rewrite quantized generic nodes to the ATC INT8 activation layout."""
     targets = sorted(
@@ -92,18 +65,14 @@ def adapt_quantized_moe(
         raise OnnxExportError(
             "Quantized MoeExpert targets do not match ONNX nodes"
         )
-    initializers = {
-        item.name: item for item in model.graph.initializer
-    }
-    types = model_types(model)
-    context = _MoeAdaptationContext.from_model(model)
+    lowering_context = context or OnnxLoweringContext.from_model(model)
     for node, target in zip(nodes, targets, strict=True):
         if len(node.input) < 5:
             raise OnnxExportError(
                 "Quantized MoeExpert node lacks scale input"
             )
-        weight = initializers.get(node.input[3])
-        scales = initializers.get(node.input[4])
+        weight = lowering_context.first_initializer(node.input[3])
+        scales = lowering_context.first_initializer(node.input[4])
         if weight is None or scales is None:
             raise OnnxExportError(
                 "Quantized MoeExpert parameters must be initializers"
@@ -137,8 +106,8 @@ def adapt_quantized_moe(
                 projection_scales[:, 2],
             )
         ).reshape(-1)
-        scale_name = context.unique_name(f"{node.name}.atc_scales")
-        model.graph.initializer.append(
+        scale_name = lowering_context.unique_name(f"{node.name}.atc_scales")
+        lowering_context.append_initializer(
             initializer(scale_name, combined)
         )
         source = node.input[0]
@@ -154,35 +123,33 @@ def adapt_quantized_moe(
             raise OnnxExportError(
                 "MoeExpert ATC adaptation requires static model dimensions"
             )
-        source_shape = types.get(
+        source_shape = lowering_context.types.get(
             source,
             (TensorProto.FLOAT16, (token_count, hidden_size)),
         )[1]
-        ids_dtype, ids_shape = types.get(
+        ids_dtype, ids_shape = lowering_context.types.get(
             node.input[1],
             (TensorProto.INT64, (token_count, top_k)),
         )
-        if source not in types:
-            source_dtype = types.get(
+        if source not in lowering_context.types:
+            source_dtype = lowering_context.types.get(
                 node.input[2],
                 (TensorProto.FLOAT16, ids_shape),
             )[0]
-            append_value(
-                model,
+            lowering_context.append_value(
                 source,
                 source_dtype,
                 source_shape,
             )
-        node.input[0] = append_quant(
-            model,
+        quant_axis = -2 if activation.granularity == "per_token" else -1
+        node.input[0] = lowering_context.request_quant(
             source,
-            source_shape,
             activation,
-            f"{node.name}.input_quant",
-            name_allocator=context.unique_name,
+            axis=quant_axis,
+            name=f"{node.name}.input_quant",
         )
         if ids_dtype != TensorProto.INT16:
-            cast_output = context.unique_name(
+            cast_output = lowering_context.unique_name(
                 f"{node.name}.topk_ids_int16"
             )
             model.graph.node.append(
@@ -194,8 +161,7 @@ def adapt_quantized_moe(
                     to=TensorProto.INT16,
                 )
             )
-            append_value(
-                model,
+            lowering_context.append_value(
                 cast_output,
                 TensorProto.INT16,
                 ids_shape,

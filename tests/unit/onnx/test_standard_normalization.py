@@ -367,42 +367,53 @@ def _custom_model() -> onnx.ModelProto:
     return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
 
 
-def test_normalize_custom_branch_seeds_value_info_and_uses_mdc_validation(
+def test_normalize_custom_branch_seeds_value_info_and_uses_structure_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
 
-    def validate(model: onnx.ModelProto) -> None:
+    def validate_structure(model: onnx.ModelProto) -> None:
         assert any(item.name == "custom_hidden" for item in model.graph.value_info)
-        calls.append("mdc")
+        calls.append("structure")
 
     def reject_standard(*args: object, **kwargs: object) -> None:
         raise AssertionError("standard checker must not validate custom graph")
 
-    monkeypatch.setattr(normalization_module, "validate_mdc_model", validate)
+    monkeypatch.setattr(
+        normalization_module,
+        "validate_mdc_model_structure",
+        validate_structure,
+    )
     monkeypatch.setattr(onnx.checker, "check_model", reject_standard)
 
     normalize_standard_onnx(_custom_model(), _linear_graph(0), _metadata())
 
-    assert calls == ["mdc"]
+    assert calls == ["structure"]
 
 
-def test_normalize_standard_branch_uses_onnx_checker(
+def test_normalize_standard_branch_uses_standard_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
 
-    def check(model: onnx.ModelProto, *, full_check: bool) -> None:
+    def validate_standard(model: onnx.ModelProto) -> None:
         del model
-        assert full_check is True
         calls.append("standard")
 
-    def reject_mdc(model: onnx.ModelProto) -> None:
+    def reject_mdc_structure(model: onnx.ModelProto) -> None:
         del model
-        raise AssertionError("MDC validator must not validate standard graph")
+        raise AssertionError("MDC structure validator must not validate standard graph")
 
-    monkeypatch.setattr(onnx.checker, "check_model", check)
-    monkeypatch.setattr(normalization_module, "validate_mdc_model", reject_mdc)
+    monkeypatch.setattr(
+        normalization_module,
+        "validate_standard_model",
+        validate_standard,
+    )
+    monkeypatch.setattr(
+        normalization_module,
+        "validate_mdc_model_structure",
+        reject_mdc_structure,
+    )
 
     normalize_standard_onnx(_linear_model(), _linear_graph(), _metadata())
 

@@ -296,6 +296,10 @@ def test_root_lazy_exports_target_public_domain_entries() -> None:
         "export": ("mdc_llm_deploy.export", "export"),
         "oneshot": ("mdc_llm_deploy.quantization", "oneshot"),
         "onnx_export": ("mdc_llm_deploy.onnx.api", "onnx_export"),
+        "standard_onnx_export": (
+            "mdc_llm_deploy.onnx.api",
+            "standard_onnx_export",
+        ),
     }
 
     assert lazy_exports == expected_exports

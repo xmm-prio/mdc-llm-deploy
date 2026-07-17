@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,10 @@ from onnx import TensorProto, helper, numpy_helper
 
 from mdc_llm_deploy.errors import OnnxExportError
 from mdc_llm_deploy.onnx.export import artifacts as artifact_io
-from mdc_llm_deploy.onnx.export.artifacts import commit_validated_onnx
+from mdc_llm_deploy.onnx.export.artifacts import (
+    commit_mdc_onnx,
+    commit_standard_onnx,
+)
 
 
 def _model(weight_value: float = 1.0) -> onnx.ModelProto:
@@ -30,10 +34,140 @@ def _model(weight_value: float = 1.0) -> onnx.ModelProto:
     )
 
 
+def _mdc_model(weight_value: float = 1.0) -> onnx.ModelProto:
+    model = _model(weight_value)
+    helper.set_model_props(
+        model,
+        {
+            "mdc.graph_schema_version": "1",
+            "mdc.stage": "FLOAT_PREFILL",
+            "mdc.mask_mode": "masked",
+            "mdc.mask_semantics": "explicit-causal",
+            "mdc.model_kind": "dense",
+            "mdc.algorithm": "fp16",
+            "mdc.target": "fp16",
+            "mdc.dialect": "MDC ONNX",
+            "mdc.numeric_spine": "validated-standard-aten",
+            "mdc.lowering_source": "test",
+        },
+    )
+    return model
+
+
 def _weight_value(target: Path) -> float:
     loaded = onnx.load(target, load_external_data=True)
     onnx.checker.check_model(loaded)
     return float(numpy_helper.to_array(loaded.graph.initializer[0])[0, 0])
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda model: setattr(model.opset_import[0], "version", 17),
+            "MDC ONNX must use opset",
+        ),
+        (
+            lambda model: model.opset_import.append(
+                helper.make_opsetid("unsupported.domain", 1)
+            ),
+            "unsupported operator domain",
+        ),
+        (
+            lambda model: setattr(
+                model.graph.node[0],
+                "op_type",
+                "ApplyRotaryPosEmb",
+            ),
+            "output count does not match schema",
+        ),
+    ],
+)
+def test_mdc_commit_rejects_invalid_dialect_model(
+    tmp_path: Path,
+    mutate: Callable[[onnx.ModelProto], None],
+    message: str,
+) -> None:
+    model = _mdc_model()
+    mutate(model)
+
+    with pytest.raises(OnnxExportError, match=message):
+        commit_mdc_onnx(model, tmp_path / "invalid.onnx", external_data=False)
+
+
+def test_mdc_commit_rejects_missing_metadata_before_publication(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "model.onnx"
+    target.write_bytes(b"old artifact")
+
+    with pytest.raises(
+        OnnxExportError,
+        match="MDC metadata properties are incomplete",
+    ):
+        commit_mdc_onnx(_model(), target, external_data=False)
+
+    assert target.read_bytes() == b"old artifact"
+    assert not (tmp_path / "model.onnx.data").exists()
+    assert not any(path.name.startswith(".model") for path in tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"mdc.dialect": "ONNX"}, "Invalid MDC dialect marker"),
+        (
+            {"mdc.mask_semantics": "all-visible-non-causal"},
+            "Mask semantics metadata is inconsistent",
+        ),
+        (
+            {"mdc.algorithm": "minmax", "mdc.target": "linear"},
+            "Float stage metadata must declare fp16",
+        ),
+        (
+            {"mdc.stage": "QUANTIZED_PREFILL"},
+            "Quantized stage metadata cannot declare fp16",
+        ),
+        (
+            {
+                "mdc.stage": "QUANTIZED_PREFILL",
+                "mdc.algorithm": "gptq",
+                "mdc.target": "linear",
+            },
+            "MDC ONNX does not support GPTQ metadata",
+        ),
+    ],
+)
+def test_mdc_commit_rejects_invalid_metadata_semantics(
+    tmp_path: Path,
+    changes: dict[str, str],
+    message: str,
+) -> None:
+    model = _mdc_model()
+    properties = {item.key: item.value for item in model.metadata_props}
+    helper.set_model_props(model, properties | changes)
+
+    with pytest.raises(OnnxExportError, match=message):
+        commit_mdc_onnx(model, tmp_path / "invalid.onnx", external_data=False)
+
+
+@pytest.mark.parametrize("external_data", [False, True])
+def test_mdc_commit_round_trips_valid_metadata(
+    tmp_path: Path,
+    external_data: bool,
+) -> None:
+    target = tmp_path / "model.onnx"
+    expected = {item.key: item.value for item in _mdc_model().metadata_props}
+
+    committed = commit_mdc_onnx(
+        _mdc_model(),
+        target,
+        external_data=external_data,
+    )
+
+    assert {item.key: item.value for item in committed.metadata_props} == expected
+    assert (tmp_path / "model.onnx.data").exists() is external_data
+    assert not any(path.name.startswith(".model") for path in tmp_path.iterdir())
 
 
 def _fail_model_publication_once(
@@ -55,9 +189,9 @@ def _fail_model_publication_once(
 
 def test_external_data_is_named_and_replaced_atomically(tmp_path: Path) -> None:
     target = tmp_path / "model.onnx"
-    commit_validated_onnx(_model(1.0), target, external_data=True)
+    commit_standard_onnx(_model(1.0), target, external_data=True)
 
-    commit_validated_onnx(_model(2.0), target, external_data=True)
+    commit_standard_onnx(_model(2.0), target, external_data=True)
 
     assert target.is_file()
     assert (tmp_path / "model.onnx.data").is_file()
@@ -70,7 +204,7 @@ def test_inline_export_removes_obsolete_external_data(tmp_path: Path) -> None:
     data = tmp_path / "model.onnx.data"
     data.write_bytes(b"obsolete")
 
-    commit_validated_onnx(_model(), target, external_data=False)
+    commit_standard_onnx(_model(), target, external_data=False)
 
     assert target.is_file()
     assert not data.exists()
@@ -82,13 +216,13 @@ def test_external_failure_restores_previous_external_pair(
 ) -> None:
     target = tmp_path / "model.onnx"
     data_target = tmp_path / "model.onnx.data"
-    commit_validated_onnx(_model(1.0), target, external_data=True)
+    commit_standard_onnx(_model(1.0), target, external_data=True)
     original_model = target.read_bytes()
     original_data = data_target.read_bytes()
     _fail_model_publication_once(monkeypatch, target)
 
     with pytest.raises(OnnxExportError, match="model publication failed"):
-        commit_validated_onnx(_model(2.0), target, external_data=True)
+        commit_standard_onnx(_model(2.0), target, external_data=True)
 
     assert target.read_bytes() == original_model
     assert data_target.read_bytes() == original_data
@@ -102,12 +236,12 @@ def test_external_failure_restores_previous_inline_model(
 ) -> None:
     target = tmp_path / "model.onnx"
     data_target = tmp_path / "model.onnx.data"
-    commit_validated_onnx(_model(1.0), target, external_data=False)
+    commit_standard_onnx(_model(1.0), target, external_data=False)
     original_model = target.read_bytes()
     _fail_model_publication_once(monkeypatch, target)
 
     with pytest.raises(OnnxExportError, match="model publication failed"):
-        commit_validated_onnx(_model(2.0), target, external_data=True)
+        commit_standard_onnx(_model(2.0), target, external_data=True)
 
     assert target.read_bytes() == original_model
     assert not data_target.exists()
@@ -120,7 +254,7 @@ def test_inline_failure_restores_previous_external_pair(
 ) -> None:
     target = tmp_path / "model.onnx"
     data_target = tmp_path / "model.onnx.data"
-    commit_validated_onnx(_model(1.0), target, external_data=True)
+    commit_standard_onnx(_model(1.0), target, external_data=True)
     original_model = target.read_bytes()
     original_data = data_target.read_bytes()
     real_unlink = Path.unlink
@@ -136,7 +270,7 @@ def test_inline_failure_restores_previous_external_pair(
     monkeypatch.setattr(Path, "unlink", unlink)
 
     with pytest.raises(OnnxExportError, match="sidecar removal failed"):
-        commit_validated_onnx(_model(2.0), target, external_data=False)
+        commit_standard_onnx(_model(2.0), target, external_data=False)
 
     assert target.read_bytes() == original_model
     assert data_target.read_bytes() == original_data
@@ -149,7 +283,7 @@ def test_link_snapshot_failure_falls_back_to_copy(
 ) -> None:
     target = tmp_path / "model.onnx"
     data_target = tmp_path / "model.onnx.data"
-    commit_validated_onnx(_model(1.0), target, external_data=True)
+    commit_standard_onnx(_model(1.0), target, external_data=True)
 
     def link(
         source: Path,
@@ -161,7 +295,7 @@ def test_link_snapshot_failure_falls_back_to_copy(
 
     monkeypatch.setattr(artifact_io.os, "link", link)
 
-    commit_validated_onnx(_model(2.0), target, external_data=True)
+    commit_standard_onnx(_model(2.0), target, external_data=True)
 
     assert target.is_file()
     assert data_target.is_file()
@@ -175,7 +309,7 @@ def test_copy_snapshots_restore_previous_external_pair(
 ) -> None:
     target = tmp_path / "model.onnx"
     data_target = tmp_path / "model.onnx.data"
-    commit_validated_onnx(_model(1.0), target, external_data=True)
+    commit_standard_onnx(_model(1.0), target, external_data=True)
     original_model = target.read_bytes()
     original_data = data_target.read_bytes()
 
@@ -191,7 +325,7 @@ def test_copy_snapshots_restore_previous_external_pair(
     _fail_model_publication_once(monkeypatch, target)
 
     with pytest.raises(OnnxExportError, match="model publication failed"):
-        commit_validated_onnx(_model(2.0), target, external_data=True)
+        commit_standard_onnx(_model(2.0), target, external_data=True)
 
     assert target.read_bytes() == original_model
     assert data_target.read_bytes() == original_data
@@ -205,7 +339,7 @@ def test_partial_copy_snapshot_failure_does_not_start_publication(
 ) -> None:
     target = tmp_path / "model.onnx"
     data_target = tmp_path / "model.onnx.data"
-    commit_validated_onnx(_model(1.0), target, external_data=True)
+    commit_standard_onnx(_model(1.0), target, external_data=True)
     original_model = target.read_bytes()
     original_data = data_target.read_bytes()
     real_copy2 = artifact_io.shutil.copy2
@@ -245,7 +379,7 @@ def test_partial_copy_snapshot_failure_does_not_start_publication(
         OnnxExportError,
         match=r"link snapshot failed.*copy snapshot failed",
     ) as raised:
-        commit_validated_onnx(_model(2.0), target, external_data=True)
+        commit_standard_onnx(_model(2.0), target, external_data=True)
 
     assert raised.value.__cause__ is copy_error
     assert replace_calls == 0
@@ -261,7 +395,7 @@ def test_rollback_failure_reports_both_errors(
 ) -> None:
     target = tmp_path / "model.onnx"
     data_target = tmp_path / "model.onnx.data"
-    commit_validated_onnx(_model(1.0), target, external_data=True)
+    commit_standard_onnx(_model(1.0), target, external_data=True)
     real_replace = artifact_io.os.replace
 
     def replace(source: Path, destination: Path) -> None:
@@ -279,7 +413,7 @@ def test_rollback_failure_reports_both_errors(
         OnnxExportError,
         match="ONNX publication failed: publication failed; rollback failed: rollback failed",
     ) as raised:
-        commit_validated_onnx(_model(2.0), target, external_data=True)
+        commit_standard_onnx(_model(2.0), target, external_data=True)
 
     assert isinstance(raised.value.__cause__, OSError)
     assert str(raised.value.__cause__) == "publication failed"

@@ -27,6 +27,7 @@ def test_root_public_api_surface_is_frozen() -> None:
         "export",
         "oneshot",
         "onnx_export",
+        "standard_onnx_export",
     }
     assert mdc_llm_deploy.__version__ == "0.1.0"
 
@@ -72,11 +73,18 @@ def test_export_has_one_public_implementation() -> None:
 def test_quantization_and_onnx_export_have_one_public_implementation() -> None:
     from mdc_llm_deploy import oneshot as root_oneshot
     from mdc_llm_deploy import onnx_export as root_onnx_export
+    from mdc_llm_deploy import standard_onnx_export as root_standard_onnx_export
     from mdc_llm_deploy.onnx import (
         onnx_export as package_onnx_export,
     )
+    from mdc_llm_deploy.onnx import (
+        standard_onnx_export as package_standard_onnx_export,
+    )
     from mdc_llm_deploy.onnx.api import (
         onnx_export as module_onnx_export,
+    )
+    from mdc_llm_deploy.onnx.api import (
+        standard_onnx_export as module_standard_onnx_export,
     )
     from mdc_llm_deploy.quantization import (
         oneshot as package_oneshot,
@@ -91,6 +99,11 @@ def test_quantization_and_onnx_export_have_one_public_implementation() -> None:
         is package_onnx_export
         is module_onnx_export
     )
+    assert (
+        root_standard_onnx_export
+        is package_standard_onnx_export
+        is module_standard_onnx_export
+    )
 
 
 def test_public_entrypoint_signatures_are_frozen() -> None:
@@ -99,6 +112,7 @@ def test_public_entrypoint_signatures_are_frozen() -> None:
         export,
         oneshot,
         onnx_export,
+        standard_onnx_export,
     )
 
     assert tuple(inspect.signature(export).parameters) == (
@@ -126,6 +140,19 @@ def test_public_entrypoint_signatures_are_frozen() -> None:
         is inspect.Parameter.KEYWORD_ONLY
     )
     assert onnx_parameters["external_data"].default is True
+    standard_parameters = inspect.signature(
+        standard_onnx_export
+    ).parameters
+    assert tuple(standard_parameters) == (
+        "graph",
+        "output_path",
+        "external_data",
+    )
+    assert (
+        standard_parameters["external_data"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert standard_parameters["external_data"].default is True
 
 
 def test_public_exception_hierarchy_is_frozen() -> None:

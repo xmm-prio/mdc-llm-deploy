@@ -14,7 +14,7 @@ from ..graph.fx.ownership import is_fqn_descendant
 from ..graph.lifecycle import metadata
 from ..graph.metadata import GraphMetadata
 from ..operators.contracts.onnx import MDC_ONNX_OPSET
-from .export.artifacts import commit_validated_onnx
+from .export.artifacts import commit_mdc_onnx, commit_standard_onnx
 from .export.standard import build_standard_onnx
 from .transform.attention import (
     MaskMode as MaskMode,
@@ -32,8 +32,9 @@ from .transform.cleanup import (
 from .transform.linear import append_quantized_linears
 from .transform.moe import adapt_quantized_moe
 from .transform.output import retain_logits_output
-from .validation.compatibility import validate_onnx_compatibility
-from .validation.model import validate_mdc_model
+from .transform.support import OnnxLoweringContext
+from .validation.compatibility import validate_mdc_onnx_compatibility
+from .validation.model import validate_mdc_model, validate_standard_model
 
 
 def _lower(
@@ -53,6 +54,7 @@ def _lower(
         lower_maskless_attention(model)
     if any(boundary.kind == "rms_norm" for boundary in value.boundaries):
         lower_rms_norms(model, value)
+    lowering_context = OnnxLoweringContext.from_model(model)
     attention_boundaries = sorted(
         (
             boundary
@@ -77,9 +79,10 @@ def _lower(
             replace(value, boundaries=(attention, ropes[0])),
             mask_mode,
             layer_id=layer_id,
+            context=lowering_context,
         )
-    append_quantized_linears(model, value)
-    adapt_quantized_moe(model, value)
+    append_quantized_linears(model, value, lowering_context)
+    adapt_quantized_moe(model, value, lowering_context)
     if value.output_abi and value.output_abi[0].name == "logits":
         retain_logits_output(model)
     prune_unreachable(model)
@@ -112,6 +115,14 @@ def _lower(
     return model
 
 
+def _prepare_output_path(output_path: str | Path) -> Path:
+    target = Path(output_path)
+    if target.suffix.lower() != ".onnx":
+        raise OnnxExportError("output_path must use .onnx suffix")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def onnx_export(
     graph: GraphModule,
     output_path: str | Path,
@@ -126,15 +137,30 @@ def onnx_export(
     mask_mode: MaskMode = (
         "masked" if configured_mask == "causal" else "maskless"
     )
-    validate_onnx_compatibility(value, mask_mode)
-    target = Path(output_path)
-    if target.suffix.lower() != ".onnx":
-        raise OnnxExportError("output_path must use .onnx suffix")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    validate_mdc_onnx_compatibility(value, mask_mode)
+    target = _prepare_output_path(output_path)
     standard = build_standard_onnx(graph, value, target.parent)
     model = _lower(standard, value, mask_mode)
     validate_mdc_model(model)
-    return commit_validated_onnx(
+    return commit_mdc_onnx(
+        model,
+        target,
+        external_data=external_data,
+    )
+
+
+def standard_onnx_export(
+    graph: GraphModule,
+    output_path: str | Path,
+    *,
+    external_data: bool = True,
+) -> onnx.ModelProto:
+    """Export and atomically publish a standard ONNX model."""
+    value = metadata(graph)
+    target = _prepare_output_path(output_path)
+    model = build_standard_onnx(graph, value, target.parent)
+    validate_standard_model(model)
+    return commit_standard_onnx(
         model,
         target,
         external_data=external_data,

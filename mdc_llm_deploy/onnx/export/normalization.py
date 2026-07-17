@@ -12,7 +12,10 @@ from torch.fx import GraphModule
 from ...errors import OnnxExportError
 from ...graph.metadata import GraphMetadata
 from ...operators.contracts.schema import OPERATOR_SCHEMAS
-from ..validation.model import validate_mdc_model
+from ..validation.model import (
+    validate_mdc_model_structure,
+    validate_standard_model,
+)
 from .linear_binding import canonicalize_linear_initializers
 
 _FLOAT_ONNX_DTYPES: set[int] = {
@@ -343,7 +346,7 @@ def normalize_standard_onnx(
         data_prop=True,
     )
     if contains_custom:
-        validate_mdc_model(model)
+        validate_mdc_model_structure(model)
     else:
-        onnx.checker.check_model(model, full_check=True)
+        validate_standard_model(model)
     return model
