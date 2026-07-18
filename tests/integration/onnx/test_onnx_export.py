@@ -395,7 +395,11 @@ def test_onnx_semantics_come_from_model_config(
     assert target.is_file()
     assert (tmp_path / f"{mask_mode}.onnx.data").is_file()
     assert [item.name for item in model.graph.input] == ["input_ids"]
-    assert [item.name for item in model.graph.output] == ["logits"]
+    assert [item.name for item in model.graph.output] == [
+        "logits",
+        "present.0.key",
+        "present.0.value",
+    ]
     assert validated.stage == GraphStage.FLOAT_PREFILL.value
     assert validated.mask_mode == (
         "masked" if mask_mode == "causal" else "maskless"
@@ -560,7 +564,7 @@ def test_oneshot_moe_exports_int8_packed_weights(
     assert producers[node.input[1]].op_type == "Cast"
 
 
-def test_two_layer_decode_accepts_every_cache_and_only_returns_logits(
+def test_two_layer_decode_accepts_and_returns_every_cache(
     tmp_path: Path,
 ) -> None:
     graph = export(
@@ -578,5 +582,11 @@ def test_two_layer_decode_accepts_every_cache_and_only_returns_logits(
         "past.1.key",
         "past.1.value",
     ]
-    assert [item.name for item in model.graph.output] == ["logits"]
+    assert [item.name for item in model.graph.output] == [
+        "logits",
+        "present.0.key",
+        "present.0.value",
+        "present.1.key",
+        "present.1.value",
+    ]
     assert sum(node.op_type == "FusedInferAttentionScore" for node in model.graph.node) == 2

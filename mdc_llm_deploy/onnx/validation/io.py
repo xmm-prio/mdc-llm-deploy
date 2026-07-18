@@ -2,56 +2,72 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import onnx
 from onnx import TensorProto
 
-from ...errors import OnnxExportError
+from ...errors import GraphStateError, OnnxExportError
+from ...graph.metadata import GraphMetadata, TensorAbi, derive_artifact_io_abi
 from ..inspection import static_shape as _shape
 
+_ONNX_DTYPES = {
+    "bool": TensorProto.BOOL,
+    "bfloat16": TensorProto.BFLOAT16,
+    "float16": TensorProto.FLOAT16,
+    "float32": TensorProto.FLOAT,
+    "int8": TensorProto.INT8,
+    "int16": TensorProto.INT16,
+    "int32": TensorProto.INT32,
+    "int64": TensorProto.INT64,
+    "uint64": TensorProto.UINT64,
+}
 
-def validate_io_abi(model: onnx.ModelProto, stage: str) -> None:
-    """Validate ordered runtime names, dtypes, and static shapes."""
-    inputs = list(model.graph.input)
-    outputs = list(model.graph.output)
-    input_names = [item.name for item in inputs]
-    if not input_names or input_names[0] != "input_ids":
-        raise OnnxExportError("MDC runtime input ABI is invalid")
-    cache_inputs = inputs[1:]
-    if stage.endswith("PREFILL"):
-        if cache_inputs:
-            raise OnnxExportError("Prefill runtime must not accept KV cache")
-    elif len(cache_inputs) % 2:
-        raise OnnxExportError("Decode KV inputs must contain key/value pairs")
-    else:
-        expected_cache_names = [
-            f"past.{layer_id}.{edge}"
-            for layer_id in range(len(cache_inputs) // 2)
-            for edge in ("key", "value")
-        ]
-        if [item.name for item in cache_inputs] != expected_cache_names:
-            raise OnnxExportError("Decode KV input names are invalid")
-    if [item.name for item in outputs] != ["logits"]:
-        raise OnnxExportError("MDC runtime output ABI is invalid")
-    input_ids = inputs[0]
-    if input_ids.type.tensor_type.elem_type != TensorProto.INT64:
-        raise OnnxExportError("input_ids must use INT64")
-    logits_shape = _shape(outputs[0])
-    if len(logits_shape) != 3 or logits_shape[0] != 1:
-        raise OnnxExportError("logits ABI shape is invalid")
-    if stage.endswith("PREFILL"):
-        if _shape(input_ids) != (1, logits_shape[1]):
+
+def _validate_entries(
+    label: str,
+    actual: list[onnx.ValueInfoProto],
+    expected: tuple[TensorAbi, ...],
+    dtype_overrides: Mapping[str, str],
+) -> None:
+    actual_names = tuple(item.name for item in actual)
+    expected_names = tuple(item.name for item in expected)
+    if actual_names != expected_names:
+        raise OnnxExportError(
+            f"{label} names do not match artifact ABI: "
+            f"{actual_names!r} != {expected_names!r}"
+        )
+    for value_info, entry in zip(actual, expected, strict=True):
+        actual_dtype = value_info.type.tensor_type.elem_type
+        expected_dtype = dtype_overrides.get(entry.name, entry.dtype)
+        if actual_dtype != _ONNX_DTYPES[expected_dtype]:
             raise OnnxExportError(
-                "Prefill sequence ABI is inconsistent"
+                f"{label} {entry.name!r} dtype does not match artifact ABI"
             )
-        return
-    if _shape(input_ids) != (1, 1) or logits_shape[1] != 1:
-        raise OnnxExportError("Decode query ABI must use one token")
-    for index in range(0, len(cache_inputs), 2):
-        key_shape = _shape(cache_inputs[index])
-        value_shape = _shape(cache_inputs[index + 1])
-        if (
-            len(key_shape) != 4
-            or key_shape != value_shape
-            or key_shape[0] != 1
-        ):
-            raise OnnxExportError("Decode KV input ABI shape is invalid")
+        if _shape(value_info) != entry.shape:
+            raise OnnxExportError(
+                f"{label} {entry.name!r} shape does not match artifact ABI"
+            )
+
+
+def validate_io_abi(
+    model: onnx.ModelProto,
+    metadata: GraphMetadata,
+    *,
+    output_dtype_overrides: Mapping[str, str] | None = None,
+) -> None:
+    """Validate ordered artifact names, dtypes, and static shapes."""
+    try:
+        expected = derive_artifact_io_abi(metadata)
+    except GraphStateError as error:
+        raise OnnxExportError(f"Invalid graph artifact ABI: {error}") from error
+    _validate_entries("Input", list(model.graph.input), expected.inputs, {})
+    _validate_entries(
+        "Output",
+        list(model.graph.output),
+        expected.outputs,
+        output_dtype_overrides or {},
+    )
+
+
+__all__ = ["validate_io_abi"]

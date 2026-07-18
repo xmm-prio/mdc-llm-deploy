@@ -12,10 +12,8 @@ from pathlib import Path
 import onnx
 
 from ...errors import OnnxExportError
-from ..validation.model import (
-    load_validated_mdc_artifact,
-    validate_serialized_standard_model,
-)
+from ..validation.model import load_validated_mdc_artifact
+from .normalization import validate_serialized_normalized_onnx
 
 
 @dataclass(frozen=True)
@@ -154,7 +152,7 @@ def commit_standard_onnx(
         model,
         target,
         external_data=external_data,
-        validate_serialized=validate_serialized_standard_model,
+        validate_serialized=validate_serialized_normalized_onnx,
     )
 
 

@@ -46,8 +46,33 @@ decode 输入增加每层 `past.N.key/value`。
 将带合法图元数据的模型无关 FX 图导出为标准 ONNX，不执行 MDC lowering、不写入
 `mdc.*` 属性，也不保证产物可部署到 MDC。适用于通用算子小图和标准 ONNX 工具链。
 
-prefill 和 decode ONNX 都只公开 `logits` 输出。decode KV 缓存由调用方通过
-`past.N.key/value` 输入提供。
+### KV Cache ONNX 契约
+
+`standard_onnx_export()` 和 `onnx_export()` 使用相同的公开 I/O 名称与顺序。设模型层数为
+`L`、配置的静态序列长度为 `S`、KV head 数为 `Nkv`、head dim 为 `D`：
+
+- prefill 输入为 `input_ids: [1, S]`，输出先为 `logits: [1, S, vocab_size]`，再按数字层序
+  排列 `present.0.key`、`present.0.value`，直至 `present.(L-1).value`；每个 cache 使用
+  BNSD shape `[1, Nkv, S, D]`。
+- decode 输入先为 `input_ids: [1, 1]`，再按相同层序排列 `past.N.key/value`；每个 past
+  cache 使用 BNSD shape `[1, Nkv, S-1, D]`。输出为 `logits: [1, 1, vocab_size]` 和
+  `[1, Nkv, S, D]` 的 `present.N.key/value`。这是静态 `S-1` 到 `S` 的单步边界，不是
+  动态或连续增长的 cache。
+- 未量化 K/V cache 时，cache 沿用图的浮点 dtype（生产 FP16 图通常为 `FLOAT16`）。
+  Attention key/value 激活量化命中时，MDC ONNX 的对应 cache 为 `INT8`；量化 decode 的
+  `past`/`present` ABI 也为 `INT8`。标准 ONNX 保留 FX 图声明的 cache dtype。
+
+`save_kv_cache=True` 是默认值，prefill 和 decode 均公开上述 `present` 输出。显式设置
+`False` 时，两阶段只公开 `logits`；decode 的 `past.N.key/value` 输入仍然存在，内部 FX
+输出也仍保留完整逐层 cache，保证 decode 转换与 MDC lowering 可用：
+
+```python
+export_config = ExportModelConfig(
+    sequence_length=3072,
+    mask_mode="causal",
+    save_kv_cache=False,
+)
+```
 
 ### 模型
 
@@ -55,9 +80,10 @@ prefill 和 decode ONNX 都只公开 `logits` 输出。decode KV 缓存由调用
 从本地目录或 Hugging Face Hub 加载单文件或分片 safetensors，并按 checkpoint 自动选择
 Qwen3 Dense 或 Qwen3-MoE。只有已存在目录会按本地源处理；已存在的非目录路径会抛出
 `ValueError`，其他值按 Hugging Face Hub 仓库 ID 解析。
-- `ExportModelConfig(sequence_length, mask_mode="causal")`
+- `ExportModelConfig(sequence_length, mask_mode="causal", save_kv_cache=True)`
 固定序列长度、RoPE cache 和 mask 语义。`mask_mode` 仅接受 `"causal"` 或 `"none"`；
-ONNX API 不再单独接收 mask 参数。
+`save_kv_cache` 必须为 `bool`，默认公开逐层 KV Cache 输出。ONNX API 不再单独接收
+mask 或 KV Cache 开关参数。
 - `Qwen3Config` / `Qwen3MoeConfig`
 Qwen3 Dense/MoE 架构的正规化配置。
 - `Qwen3ForCausalLM` / `Qwen3MoeForCausalLM`

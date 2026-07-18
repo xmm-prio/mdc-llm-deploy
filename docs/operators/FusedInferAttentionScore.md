@@ -133,7 +133,7 @@ FusedInferAttentionScore(
 
 - 输入 layout 固定为 `BNSD`，`num_heads=4`、`num_key_value_heads=2`、`scale=0.25`。
 - batch 固定为 1，因此 `key` 和 `value` 的 Tensor 数组长度固定为 1；ONNX 符号直接在对应变长输入槽位传入单个 Tensor，不生成 ONNX Sequence。
-- prefill Q shape 为 `[1, 4, 3072, 16]`，K/V shape 为 `[1, 2, 3072, 16]`；decode Q shape 为 `[1, 4, 1, 16]`，K/V 为拼接后的 `[1, 2, 3072, 16]`。
+- 设导出配置的静态序列长度为 `S`：prefill Q/K/V 的序列维均为 `S`；decode Q 的序列维为 1，输入 past K/V 的序列维为 `S-1`，算子接收拼接当前 token 后序列维为 `S` 的 K/V。发布配置 `S=3072` 时，prefill Q shape 为 `[1, 4, 3072, 16]`、K/V 为 `[1, 2, 3072, 16]`；decode Q 为 `[1, 4, 1, 16]`、拼接后 K/V 为 `[1, 2, 3072, 16]`。
 - masked 模式显式提供 BOOL `atten_mask`，并使用 `sparse_mode=0`；maskless 模式省略 `atten_mask`，使用 `sparse_mode=0`、`pre_tokens=next_tokens=2147483647`。
 - `softmax_lse_flag=false`，第二输出必须是 shape `[1]` 的 FP32 零 Tensor。
 - K Cache 是 RoPE 后的 K，V Cache 是 value projection 后、进入 Attention 前的 V。
@@ -142,6 +142,24 @@ FusedInferAttentionScore(
 - K/V 参数完全相同时允许合并为 `antiquant_*`。
 - Q 和 softmax score 只允许对称量化，因为 `0.1.0` 接口没有对应 zero-point 输入；非对称 Q/score 必须在 `onnx_export` 阶段拒绝。K/V 非对称量化分别使用 `key_antiquant_offset` 和 `value_antiquant_offset`。
 - `0.1.0` 的模型 ONNX 只允许浮点或 INT8 K/V；`INT4(INT32)` 仅保留为算子接口能力，不进入发布模型。
+
+## 模型 ONNX KV Cache I/O
+
+`ExportModelConfig.save_kv_cache` 默认是 `True`。标准 ONNX 与 MDC ONNX 使用同一公开名称、
+顺序和静态 BNSD shape：
+
+- prefill 输入仅有 `input_ids: [1, S]`；输出为 `logits`，随后按数字层序排列
+  `present.N.key`、`present.N.value`，每个 cache shape 为 `[1, Nkv, S, D]`。
+- decode 输入为 `input_ids: [1, 1]`，随后按相同层序排列 `past.N.key/value`，shape 为
+  `[1, Nkv, S-1, D]`；输出为 `logits` 和 `[1, Nkv, S, D]` 的
+  `present.N.key/value`。
+- 显式设置 `save_kv_cache=False` 只隐藏两阶段 ONNX 的公开 `present` 输出。decode 的
+  `past` 输入、FX 内部逐层 `present` 输出和 Attention lowering 不变。
+
+浮点路径的 cache 沿用图 dtype，生产模型通常为 `FLOAT16`。Attention key/value 激活量化
+命中时，MDC ONNX 中送入 `FusedInferAttentionScore` 并公开的对应 cache 为 `INT8`；
+量化 decode 的 `past` 和 `present` ABI 同为 `INT8`。标准 ONNX 保留 FX 图声明的 cache
+dtype，不套用 MDC lowering 的 dtype 覆盖。
 
 ## 前置条件与错误
 

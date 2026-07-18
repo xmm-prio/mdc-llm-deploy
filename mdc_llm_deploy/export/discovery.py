@@ -13,7 +13,12 @@ from torch.fx import GraphModule
 from ..errors import UnsupportedPatternError
 from ..graph.fx.inspection import flatten_nodes, node_target
 from ..graph.fx.ownership import NodeOwnershipIndex, is_fqn_descendant
-from ..graph.metadata import FusionBoundary, TensorAbi
+from ..graph.metadata import (
+    SAVE_KV_CACHE_PROPERTY,
+    FusionBoundary,
+    TensorAbi,
+    boundary_sort_key,
+)
 from ..operators.contracts.onnx import MDC_ONNX_OPSET
 from ..placement.inputs import INPUT_DEVICES_PROPERTY, capture_input_devices
 
@@ -100,7 +105,7 @@ def _resolve_boundary_overlaps(
             continue
         claimed.update(owned)
         result.append(FusionBoundary(kind, fqn, owned))
-    return tuple(sorted(result, key=lambda item: (item.kind, item.fqn)))
+    return tuple(sorted(result, key=boundary_sort_key))
 
 
 def _discover_boundaries(
@@ -145,15 +150,22 @@ def _output_abi(graph: GraphModule) -> tuple[TensorAbi, ...]:
 
 def _model_properties(model: nn.Module, graph: GraphModule) -> dict[str, Any]:
     config = getattr(model, "config", None)
+    export_config = getattr(model, "export_config", None)
+    save_kv_cache = getattr(export_config, "save_kv_cache", True)
+    if type(save_kv_cache) is not bool:
+        raise UnsupportedPatternError(
+            "Model export_config.save_kv_cache must be a bool"
+        )
     properties: dict[str, Any] = {
         "opset": MDC_ONNX_OPSET,
         "source": "torch.export",
         "dialect": "ATEN",
         "mask_mode": getattr(
-            getattr(model, "export_config", None),
+            export_config,
             "mask_mode",
             "causal",
         ),
+        SAVE_KV_CACHE_PROPERTY: save_kv_cache,
         "rms_norm_epsilon": getattr(config, "rms_norm_eps", None),
         "hidden_size": getattr(config, "hidden_size", None),
         "vocab_size": getattr(config, "vocab_size", None),

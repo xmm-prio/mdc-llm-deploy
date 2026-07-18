@@ -80,6 +80,23 @@ def test_fixed_point_folds_reverse_order_broadcast_chain_deterministically() -> 
     assert model.SerializeToString(deterministic=True) == serialized
 
 
+def test_identity_preserves_scalar_initializer_rank() -> None:
+    model = _model(
+        [helper.make_node("Identity", ["scalar"], ["output"])],
+        [_initializer("scalar", 1.25, np.dtype(np.float32))],
+        output_shape=(),
+    )
+
+    stats = fold_constant_subgraphs(model)
+
+    assert stats.folded_nodes == 1
+    assert _array(model, "output").shape == ()
+    np.testing.assert_array_equal(
+        _array(model, "output"),
+        np.asarray(1.25, dtype=np.float32),
+    )
+
+
 @pytest.mark.parametrize(
     ("node", "initializers", "expected"),
     [

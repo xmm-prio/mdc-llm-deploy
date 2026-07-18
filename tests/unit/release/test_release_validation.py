@@ -55,6 +55,8 @@ def _capability(
 
 def _metadata(
     capability: Capability,
+    *,
+    save_kv_cache: bool | None = True,
 ) -> ValidatedMetadata:
     stage = {
         (Algorithm.FP16, Phase.PREFILL): GraphStage.FLOAT_PREFILL,
@@ -67,8 +69,11 @@ def _metadata(
         if capability.algorithm is Algorithm.FP16
         else capability.target.value
     )
+    properties = {"mdc.model_kind": capability.model.value}
+    if save_kv_cache is not None:
+        properties["save_kv_cache"] = str(save_kv_cache).lower()
     return ValidatedMetadata(
-        properties={"mdc.model_kind": capability.model.value},
+        properties=properties,
         stage=stage,
         mask_mode=capability.mask_mode.value,
         algorithms=frozenset({capability.algorithm.value}),
@@ -76,7 +81,11 @@ def _metadata(
     )
 
 
-def _model(capability: Capability) -> onnx.ModelProto:
+def _model(
+    capability: Capability,
+    *,
+    save_kv_cache: bool = True,
+) -> onnx.ModelProto:
     if capability.phase is Phase.PREFILL:
         inputs = [
             helper.make_tensor_value_info(
@@ -86,6 +95,7 @@ def _model(capability: Capability) -> onnx.ModelProto:
             )
         ]
         output_shape = [1, 8, 128]
+        cache_shape = [1, 2, 8, 64]
     else:
         cache_dtype = (
             onnx.TensorProto.INT8
@@ -109,17 +119,34 @@ def _model(capability: Capability) -> onnx.ModelProto:
             ],
         ]
         output_shape = [1, 1, 128]
+        cache_shape = [1, 2, 8, 64]
+    cache_dtype = (
+        onnx.TensorProto.INT8
+        if capability.target is Target.ATTENTION
+        else onnx.TensorProto.FLOAT16
+    )
+    outputs = [
+        helper.make_tensor_value_info(
+            "logits",
+            onnx.TensorProto.FLOAT16,
+            output_shape,
+        )
+    ]
+    if save_kv_cache:
+        outputs.extend(
+            helper.make_tensor_value_info(
+                f"present.{layer}.{kind}",
+                cache_dtype,
+                cache_shape,
+            )
+            for layer in range(2)
+            for kind in ("key", "value")
+        )
     graph = helper.make_graph(
         [],
         "release",
         inputs,
-        [
-            helper.make_tensor_value_info(
-                "logits",
-                onnx.TensorProto.FLOAT16,
-                output_shape,
-            )
-        ],
+        outputs,
     )
     return helper.make_model(graph)
 
@@ -170,7 +197,13 @@ def test_release_artifact_returns_immutable_evidence(
     )
 
     assert evidence.input_names == ("input_ids",)
-    assert evidence.output_names == ("logits",)
+    assert evidence.output_names == (
+        "logits",
+        "present.0.key",
+        "present.0.value",
+        "present.1.key",
+        "present.1.value",
+    )
     assert evidence.declared_targets == {"fp16"}
     assert evidence.observed_quantized_targets == frozenset()
     assert evidence.operator_counts == (
@@ -224,7 +257,59 @@ def test_release_artifact_rejects_decode_input_order(
         frozenset(),
     )
 
-    with pytest.raises(OnnxExportError, match="incomplete or out of order"):
+    with pytest.raises(OnnxExportError, match="past KV ABI"):
+        release_validation.validate_release_artifact("artifact.onnx", capability)
+
+
+@pytest.mark.parametrize("phase", [Phase.PREFILL, Phase.DECODE])
+@pytest.mark.parametrize("serialized", ["false", None])
+def test_release_artifact_accepts_logits_only_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: Phase,
+    serialized: str | None,
+) -> None:
+    capability = _capability(phase=phase)
+    model = _model(capability, save_kv_cache=False)
+    metadata = _metadata(capability, save_kv_cache=None)
+    if serialized is not None:
+        metadata.properties["save_kv_cache"] = serialized
+    _stub_validation_layers(monkeypatch, model, metadata, frozenset())
+
+    evidence = release_validation.validate_release_artifact(
+        "artifact.onnx",
+        capability,
+    )
+
+    assert evidence.output_names == ("logits",)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "key/value pairs"),
+        ("reordered", "ordered contiguous key/value pairs"),
+    ],
+)
+def test_release_artifact_rejects_invalid_present_cache_order(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    message: str,
+) -> None:
+    capability = _capability()
+    model = _model(capability)
+    if mutation == "missing":
+        del model.graph.output[-1]
+    else:
+        model.graph.output[1].name = "present.0.value"
+        model.graph.output[2].name = "present.0.key"
+    _stub_validation_layers(
+        monkeypatch,
+        model,
+        _metadata(capability),
+        frozenset(),
+    )
+
+    with pytest.raises(OnnxExportError, match=message):
         release_validation.validate_release_artifact("artifact.onnx", capability)
 
 

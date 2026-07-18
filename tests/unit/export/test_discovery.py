@@ -8,8 +8,12 @@ from torch import nn
 from torch.fx import Graph, GraphModule
 
 from mdc_llm_deploy.errors import UnsupportedPatternError
-from mdc_llm_deploy.export.discovery import _discover_boundaries
+from mdc_llm_deploy.export.discovery import (
+    _discover_boundaries,
+    _model_properties,
+)
 from mdc_llm_deploy.graph.metadata import FusionBoundary
+from mdc_llm_deploy.models import ExportModelConfig
 
 
 class _Rope(nn.Module):
@@ -47,6 +51,42 @@ def _graph(
         created.append(node)
     graph.output(tuple(created))
     return GraphModule(nn.Module(), graph)
+
+
+@pytest.mark.parametrize("save_kv_cache", [True, False])
+def test_model_properties_capture_save_kv_cache(
+    save_kv_cache: bool,
+) -> None:
+    model = nn.Module()
+    model.export_config = ExportModelConfig(  # type: ignore[attr-defined]
+        sequence_length=4,
+        save_kv_cache=save_kv_cache,
+    )
+
+    properties = _model_properties(model, _graph([]))
+
+    assert properties["save_kv_cache"] is save_kv_cache
+
+
+def test_discovered_attention_boundaries_use_numeric_layer_order() -> None:
+    model = nn.Module()
+    layers = nn.ModuleList(_Attention() for _ in range(12))
+    model.add_module("layers", layers)
+    graph = _graph(
+        [
+            (
+                f"attention_{layer_id}",
+                {"owner": (f"layers.{layer_id}", _Attention)},
+            )
+            for layer_id in range(12)
+        ]
+    )
+
+    boundaries = _discover_boundaries(model, graph)
+
+    assert tuple(item.fqn for item in boundaries) == tuple(
+        f"layers.{layer_id}" for layer_id in range(12)
+    )
 
 
 def test_nested_boundaries_claim_deepest_nodes_and_keep_sort_order() -> None:

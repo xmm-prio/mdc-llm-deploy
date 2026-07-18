@@ -129,7 +129,17 @@ def test_runner_short_slice_generates_and_validates_all_14_models(tmp_path: Path
     )
 
     assert len(artifacts) == 14
-    assert all(item.output_names == ("logits",) for item in evidence)
+    assert all(
+        item.output_names
+        == (
+            "logits",
+            "present.0.key",
+            "present.0.value",
+            "present.1.key",
+            "present.1.value",
+        )
+        for item in evidence
+    )
     assert {
         model_kind: {
             dict(item.operator_counts)["NPURmsNorm"]

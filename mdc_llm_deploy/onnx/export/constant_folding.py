@@ -270,7 +270,10 @@ def _run_evaluation(
 ) -> np.ndarray[Any, Any]:
     try:
         with np.errstate(all="ignore"):
-            return np.ascontiguousarray(evaluation.evaluate())
+            result = np.asarray(evaluation.evaluate())
+            if result.ndim == 0:
+                return result.copy()
+            return np.ascontiguousarray(result)
     except (ArithmeticError, IndexError, TypeError, ValueError) as error:
         raise _node_error(node, f"evaluation failed: {error}") from error
 

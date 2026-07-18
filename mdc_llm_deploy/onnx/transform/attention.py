@@ -10,9 +10,14 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper
 
-from ...errors import OnnxExportError
+from ...errors import GraphStateError, OnnxExportError
 from ...graph.fx.ownership import is_fqn_descendant
-from ...graph.metadata import GraphMetadata, QuantizedTarget
+from ...graph.metadata import (
+    GraphMetadata,
+    QuantizedTarget,
+    derive_artifact_io_abi,
+    order_attention_boundaries,
+)
 from ...graph.metadata.model import AttentionDimensions
 from ...operators.contracts.attention import (
     ATTENTION_INPUT_COUNT,
@@ -35,6 +40,13 @@ from .support import (
 
 MaskMode = Literal["masked", "maskless"]
 
+_ABI_DTYPES = {
+    "bfloat16": TensorProto.BFLOAT16,
+    "float16": TensorProto.FLOAT16,
+    "float32": TensorProto.FLOAT,
+    "int8": TensorProto.INT8,
+}
+
 
 def _target(
     value: GraphMetadata,
@@ -51,6 +63,115 @@ def _target(
         )
     ]
     return matches[0] if matches else None
+
+
+def attention_cache_dtype_overrides(
+    value: GraphMetadata,
+) -> dict[str, str]:
+    """Return lowered cache dtypes that intentionally differ from FX ABI."""
+    result: dict[str, str] = {}
+    for layer_id, boundary in enumerate(
+        order_attention_boundaries(value.boundaries)
+    ):
+        for edge in ("key", "value"):
+            if _target(value, edge, boundary.fqn) is not None:
+                result[f"present.{layer_id}.{edge}"] = "int8"
+    return result
+
+
+def validate_lowered_attention_cache(
+    model: onnx.ModelProto,
+    value: GraphMetadata,
+) -> dict[str, str]:
+    """Validate lowered present producers, layer mapping, BNSD, and dtype."""
+    try:
+        artifact_abi = derive_artifact_io_abi(value)
+        boundaries = order_attention_boundaries(value.boundaries)
+    except GraphStateError as error:
+        raise OnnxExportError(
+            f"Invalid graph artifact ABI: {error}"
+        ) from error
+    cache_entries = value.output_abi[1:]
+    expected_output_names = tuple(item.name for item in value.output_abi)
+    actual_output_names = tuple(item.name for item in model.graph.output)
+    if actual_output_names != expected_output_names:
+        raise OnnxExportError(
+            "Lowered attention outputs do not preserve internal layer order"
+        )
+    if len(cache_entries) != artifact_abi.layer_count * 2:
+        raise OnnxExportError("Lowered attention cache layer count is invalid")
+
+    producers_by_name: dict[str, list[onnx.NodeProto]] = {}
+    for node in model.graph.node:
+        for output_name in node.output:
+            if output_name:
+                producers_by_name.setdefault(output_name, []).append(node)
+    outputs_by_name = {item.name: item for item in model.graph.output}
+    overrides = attention_cache_dtype_overrides(value)
+    try:
+        dimensions = AttentionDimensions.from_properties(value.properties)
+    except ValueError as error:
+        raise OnnxExportError(str(error)) from error
+    expected_sequence = (
+        value.sequence_length
+        if value.stage.is_prefill
+        else (
+            value.absolute_position + 1
+            if value.absolute_position is not None
+            else 0
+        )
+    )
+    if expected_sequence <= 0:
+        raise OnnxExportError(
+            "Attention cache validation requires a positive sequence length"
+        )
+
+    for layer_id, boundary in enumerate(boundaries):
+        attention_nodes = [
+            node
+            for node in model.graph.node
+            if node.name == f"mdc.attention.{boundary.fqn}"
+            and node.op_type == "FusedInferAttentionScore"
+        ]
+        if len(attention_nodes) != 1:
+            raise OnnxExportError(
+                f"Attention layer {layer_id} has invalid lowered producer mapping"
+            )
+        attention_node = attention_nodes[0]
+        for offset, edge in enumerate(("key", "value")):
+            entry = cache_entries[layer_id * 2 + offset]
+            output = outputs_by_name[entry.name]
+            producers = producers_by_name.get(entry.name, ())
+            if len(producers) != 1:
+                raise OnnxExportError(
+                    f"Present cache {entry.name!r} must have one producer"
+                )
+            shape = static_shape(output)
+            if (
+                shape != entry.shape
+                or len(shape) != 4
+                or shape[1] != dimensions.num_key_value_heads
+                or shape[2] != expected_sequence
+                or shape[3] != dimensions.head_dim
+            ):
+                raise OnnxExportError(
+                    f"Present cache {entry.name!r} must use static BNSD layout"
+                )
+            expected_dtype = overrides.get(entry.name, entry.dtype)
+            if output.type.tensor_type.elem_type != _ABI_DTYPES[expected_dtype]:
+                raise OnnxExportError(
+                    f"Present cache {entry.name!r} has invalid lowered dtype"
+                )
+            input_index = (
+                AttentionInput.KEY
+                if edge == "key"
+                else AttentionInput.VALUE
+            )
+            if attention_node.input[input_index] != entry.name:
+                raise OnnxExportError(
+                    f"Attention layer {layer_id} {edge} cache mapping is invalid"
+                )
+    return overrides
 
 
 def _consumer_map(model: onnx.ModelProto) -> dict[str, list[onnx.NodeProto]]:

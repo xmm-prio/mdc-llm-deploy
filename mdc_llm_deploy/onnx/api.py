@@ -9,21 +9,29 @@ import onnx
 from onnx import helper
 from torch.fx import GraphModule
 
-from ..errors import OnnxExportError
+from ..errors import GraphStateError, OnnxExportError
 from ..graph.fx.ownership import is_fqn_descendant
 from ..graph.lifecycle import metadata
-from ..graph.metadata import GraphMetadata
+from ..graph.metadata import (
+    SAVE_KV_CACHE_PROPERTY,
+    GraphMetadata,
+    order_attention_boundaries,
+    resolve_save_kv_cache,
+)
 from ..observability import StageReporter
 from ..operators.contracts.onnx import MDC_ONNX_OPSET
 from .export.artifacts import commit_mdc_onnx, commit_standard_onnx
+from .export.normalization import validate_normalized_onnx
 from .export.standard import build_standard_onnx
 from .transform.attention import (
     MaskMode as MaskMode,
 )
 from .transform.attention import (
+    attention_cache_dtype_overrides,
     lower_maskless_attention,
     lower_rms_norms,
     lower_rope_attention,
+    validate_lowered_attention_cache,
 )
 from .transform.cleanup import (
     prune_unreachable,
@@ -32,10 +40,11 @@ from .transform.cleanup import (
 )
 from .transform.linear import append_quantized_linears
 from .transform.moe import adapt_quantized_moe
-from .transform.output import retain_logits_output
+from .transform.output import finalize_artifact_outputs
 from .transform.support import OnnxLoweringContext
 from .validation.compatibility import validate_mdc_onnx_compatibility
-from .validation.model import validate_mdc_model, validate_standard_model
+from .validation.io import validate_io_abi
+from .validation.model import validate_mdc_model
 
 
 def _lower(
@@ -56,14 +65,12 @@ def _lower(
     if any(boundary.kind == "rms_norm" for boundary in value.boundaries):
         lower_rms_norms(model, value)
     lowering_context = OnnxLoweringContext.from_model(model)
-    attention_boundaries = sorted(
-        (
-            boundary
-            for boundary in value.boundaries
-            if boundary.kind == "attention"
-        ),
-        key=lambda boundary: boundary.fqn,
-    )
+    try:
+        attention_boundaries = order_attention_boundaries(value.boundaries)
+    except GraphStateError as error:
+        raise OnnxExportError(
+            f"Invalid attention layer order: {error}"
+        ) from error
     for layer_id, attention in enumerate(attention_boundaries):
         ropes = tuple(
             boundary
@@ -84,8 +91,8 @@ def _lower(
         )
     append_quantized_linears(model, value, lowering_context)
     adapt_quantized_moe(model, value, lowering_context)
-    if value.output_abi and value.output_abi[0].name == "logits":
-        retain_logits_output(model)
+    validate_lowered_attention_cache(model, value)
+    finalize_artifact_outputs(model, value)
     prune_unreachable(model)
     topologically_sort(model)
     algorithms = sorted({item.algorithm for item in value.quantized_targets}) or ["fp16"]
@@ -104,6 +111,9 @@ def _lower(
         "mdc.dialect": "MDC ONNX",
         "mdc.numeric_spine": "validated-standard-aten",
         "mdc.lowering_source": "fx-boundaries-and-graph-metadata",
+        SAVE_KV_CACHE_PROPERTY: str(
+            resolve_save_kv_cache(value.properties)
+        ).lower(),
     }
     linear_target_count = sum(item.target_type == "linear" for item in value.quantized_targets)
     if linear_target_count:
@@ -150,7 +160,11 @@ def onnx_export(
         target = _prepare_output_path(output_path)
         standard = build_standard_onnx(graph, value, target.parent)
         model = _lower(standard, value, mask_mode)
-        validate_mdc_model(model)
+        validate_mdc_model(
+            model,
+            value,
+            output_dtype_overrides=attention_cache_dtype_overrides(value),
+        )
         published = commit_mdc_onnx(
             model,
             target,
@@ -181,7 +195,9 @@ def standard_onnx_export(
         )
         target = _prepare_output_path(output_path)
         model = build_standard_onnx(graph, value, target.parent)
-        validate_standard_model(model)
+        finalize_artifact_outputs(model, value)
+        validate_normalized_onnx(model)
+        validate_io_abi(model, value)
         published = commit_standard_onnx(
             model,
             target,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +15,11 @@ from torch.fx import Graph, GraphModule
 
 import mdc_llm_deploy.onnx.export.standard as standard_module
 from mdc_llm_deploy.errors import OnnxExportError
+from mdc_llm_deploy.export import convert_to_decode, export
 from mdc_llm_deploy.graph.lifecycle import GraphMetadata, GraphStage, TensorAbi
+from mdc_llm_deploy.onnx import standard_onnx_export
 from mdc_llm_deploy.onnx.export.standard import build_standard_onnx
+from tests.support.models.qwen3 import dense_model
 
 
 def _metadata() -> GraphMetadata:
@@ -121,6 +125,38 @@ def test_standard_facade_real_cpu_graph_preserves_numeric_contract(
         "graph.second_weight",
     ]
     assert all(node.op_type != "Transpose" for node in model.graph.node)
+
+
+@pytest.mark.parametrize(
+    ("save_kv_cache", "decode"),
+    [(True, False), (False, False), (True, True), (False, True)],
+)
+def test_standard_export_finalizes_conditional_cache_outputs(
+    tmp_path: Path,
+    save_kv_cache: bool,
+    decode: bool,
+) -> None:
+    model = dense_model(4)
+    model.export_config = replace(
+        model.export_config,
+        save_kv_cache=save_kv_cache,
+    )
+    graph = export(model, {"input_ids": torch.arange(4).reshape(1, 4)})
+    if decode:
+        convert_to_decode(graph)
+
+    exported = standard_onnx_export(
+        graph,
+        tmp_path / f"standard-{save_kv_cache}-{decode}.onnx",
+        external_data=False,
+    )
+
+    expected = (
+        ["logits", "present.0.key", "present.0.value"]
+        if save_kv_cache
+        else ["logits"]
+    )
+    assert [item.name for item in exported.graph.output] == expected
 
 
 @pytest.mark.parametrize("owner", ["export_legacy_onnx", "normalize_standard_onnx"])

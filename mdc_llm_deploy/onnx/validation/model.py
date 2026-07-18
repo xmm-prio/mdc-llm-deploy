@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import onnx
 
 from ...errors import OnnxExportError
+from ...graph.metadata import GraphMetadata
 from ...operators.contracts.attention import ATTENTION_INPUT_COUNT
 from ...operators.contracts.onnx import MDC_ONNX_DOMAIN, MDC_ONNX_OPSET
 from ...operators.contracts.schema import OPERATOR_SCHEMAS
+from .io import validate_io_abi
 from .metadata import ValidatedMetadata, validate_metadata
 from .operator import validate_rope_initializers
 from .topology import (
@@ -77,7 +80,10 @@ def _validate_custom_nodes(model: onnx.ModelProto) -> None:
             )
 
 
-def validate_standard_model(model: onnx.ModelProto) -> None:
+def validate_standard_model(
+    model: onnx.ModelProto,
+    graph_metadata: GraphMetadata | None = None,
+) -> None:
     """Validate a standard ONNX model without MDC dialect assumptions."""
     if not isinstance(model, onnx.ModelProto):
         raise TypeError("model must be onnx.ModelProto")
@@ -88,6 +94,8 @@ def validate_standard_model(model: onnx.ModelProto) -> None:
         onnx.checker.check_model(model, full_check=True)
     except Exception as error:
         raise OnnxExportError(f"ONNX checker failed: {error}") from error
+    if graph_metadata is not None:
+        validate_io_abi(model, graph_metadata)
 
 
 def validate_mdc_model_structure(model: onnx.ModelProto) -> None:
@@ -108,11 +116,22 @@ def validate_mdc_model_structure(model: onnx.ModelProto) -> None:
         validate_standard_model(model)
 
 
-def validate_mdc_model(model: onnx.ModelProto) -> ValidatedMetadata:
+def validate_mdc_model(
+    model: onnx.ModelProto,
+    graph_metadata: GraphMetadata | None = None,
+    *,
+    output_dtype_overrides: Mapping[str, str] | None = None,
+) -> ValidatedMetadata:
     """Validate a complete in-memory MDC ONNX artifact."""
     validate_mdc_model_structure(model)
     metadata = validate_metadata(model)
     validate_quantization_topology(model, metadata)
+    if graph_metadata is not None:
+        validate_io_abi(
+            model,
+            graph_metadata,
+            output_dtype_overrides=output_dtype_overrides,
+        )
     return metadata
 
 

@@ -27,6 +27,29 @@ _FLOAT_ONNX_DTYPES: set[int] = {
 }
 
 
+def _contains_custom_operators(model: onnx.ModelProto) -> bool:
+    custom_names = {schema.onnx_name for schema in OPERATOR_SCHEMAS.values()}
+    return any(node.op_type in custom_names for node in model.graph.node)
+
+
+def validate_normalized_onnx(model: onnx.ModelProto) -> None:
+    """Validate normalized ONNX using its actual operator dialect."""
+    if _contains_custom_operators(model):
+        validate_mdc_model_structure(model)
+    else:
+        validate_standard_model(model)
+
+
+def validate_serialized_normalized_onnx(path: str) -> onnx.ModelProto:
+    """Load and validate a serialized normalized ONNX artifact."""
+    try:
+        model = onnx.load(path, load_external_data=True)
+    except Exception as error:
+        raise OnnxExportError(f"Cannot read ONNX protobuf: {error}") from error
+    validate_normalized_onnx(model)
+    return model
+
+
 def _seed_custom_value_info(model: onnx.ModelProto) -> None:
     """Seed shape propagation across custom operators with identity-shaped output."""
     values = {
@@ -364,10 +387,7 @@ def normalize_standard_onnx(
                 count,
             )
 
-        custom_names = {schema.onnx_name for schema in OPERATOR_SCHEMAS.values()}
-        contains_custom = any(
-            node.op_type in custom_names for node in model.graph.node
-        )
+        contains_custom = _contains_custom_operators(model)
         if contains_custom:
             _seed_custom_value_info(model)
         model = shape_inference.infer_shapes(
@@ -375,10 +395,7 @@ def normalize_standard_onnx(
             strict_mode=not contains_custom,
             data_prop=True,
         )
-        if contains_custom:
-            validate_mdc_model_structure(model)
-        else:
-            validate_standard_model(model)
+        validate_normalized_onnx(model)
         reporter.update(
             node_count=len(model.graph.node),
             initializer_count=len(model.graph.initializer),

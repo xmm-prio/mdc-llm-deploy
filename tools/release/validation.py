@@ -15,8 +15,16 @@ from mdc_llm_deploy.capabilities import (
     Phase,
     Target,
 )
-from mdc_llm_deploy.errors import OnnxExportError
-from mdc_llm_deploy.graph.metadata import GraphStage
+from mdc_llm_deploy.errors import GraphStateError, OnnxExportError
+from mdc_llm_deploy.graph.metadata import (
+    SAVE_KV_CACHE_PROPERTY,
+    FusionBoundary,
+    GraphMetadata,
+    GraphStage,
+    TensorAbi,
+    derive_artifact_io_abi,
+    resolve_save_kv_cache,
+)
 from mdc_llm_deploy.onnx.validation.metadata import ValidatedMetadata
 from mdc_llm_deploy.onnx.validation.model import (
     load_validated_mdc_artifact,
@@ -96,6 +104,69 @@ def _tensor_signature(value: onnx.ValueInfoProto) -> tuple[int, tuple[int, ...]]
     return tensor_type.elem_type, tuple(dimensions)
 
 
+def _save_kv_cache(metadata: ValidatedMetadata) -> bool:
+    raw_value: object = metadata.properties.get(SAVE_KV_CACHE_PROPERTY, False)
+    if isinstance(raw_value, str):
+        serialized_values = {"true": True, "false": False}
+        if raw_value not in serialized_values:
+            raise OnnxExportError(
+                "Release save_kv_cache metadata must be 'true' or 'false'"
+            )
+        raw_value = serialized_values[raw_value]
+    try:
+        return resolve_save_kv_cache({SAVE_KV_CACHE_PROPERTY: raw_value})
+    except GraphStateError as error:
+        raise OnnxExportError(f"Invalid release artifact ABI: {error}") from error
+
+
+def _tensor_abi(value: onnx.ValueInfoProto, *, name: str | None = None) -> TensorAbi:
+    _, shape = _tensor_signature(value)
+    return TensorAbi(name or value.name, "float16", shape)
+
+
+def _artifact_abi(
+    model: onnx.ModelProto,
+    metadata: ValidatedMetadata,
+) -> tuple[TensorAbi, ...]:
+    save_kv_cache = _save_kv_cache(metadata)
+    inputs = tuple(_tensor_abi(item) for item in model.graph.input)
+    public_outputs = tuple(_tensor_abi(item) for item in model.graph.output)
+    stage = GraphStage(metadata.stage)
+    if save_kv_cache or stage.is_prefill:
+        internal_outputs = public_outputs
+    else:
+        internal_outputs = (
+            public_outputs[0],
+            *(
+                _tensor_abi(
+                    item,
+                    name=f"present.{item.name.removeprefix('past.')}",
+                )
+                for item in model.graph.input[1:]
+            ),
+        )
+    layer_count = (len(internal_outputs) - 1) // 2
+    contract_metadata = GraphMetadata(
+        schema_version=1,
+        stage=stage,
+        model_kind=metadata.properties["mdc.model_kind"],
+        input_abi=inputs,
+        output_abi=internal_outputs,
+        boundaries=tuple(
+            FusionBoundary(
+                "attention",
+                f"model.layers.{layer_id}.self_attn",
+            )
+            for layer_id in range(layer_count)
+        ),
+        properties={SAVE_KV_CACHE_PROPERTY: save_kv_cache},
+    )
+    try:
+        return derive_artifact_io_abi(contract_metadata).outputs
+    except GraphStateError as error:
+        raise OnnxExportError(f"Invalid release artifact ABI: {error}") from error
+
+
 def _validate_metadata_contract(
     metadata: ValidatedMetadata,
     capability: Capability,
@@ -134,15 +205,19 @@ def _validate_metadata_contract(
 
 def _validate_io_contract(
     model: onnx.ModelProto,
+    metadata: ValidatedMetadata,
     capability: Capability,
     contract: ReleaseModelContract,
 ) -> None:
     inputs = tuple(model.graph.input)
     outputs = tuple(model.graph.output)
+    expected_outputs = _artifact_abi(model, metadata)
     _require(
-        tuple(item.name for item in outputs) == ("logits",),
-        "Release ONNX outputs must be exactly ('logits',)",
+        tuple(item.name for item in outputs)
+        == tuple(item.name for item in expected_outputs),
+        "Release ONNX outputs do not match artifact ABI",
     )
+    save_kv_cache = _save_kv_cache(metadata)
     if capability.phase is Phase.PREFILL:
         _require(
             tuple(item.name for item in inputs) == ("input_ids",),
@@ -162,18 +237,28 @@ def _validate_io_contract(
             and output_shape == (1, input_shape[1], contract.vocab_size),
             "Prefill logits ABI is invalid",
         )
+        if save_kv_cache:
+            expected_cache = (
+                contract.cache_dtype(capability),
+                (
+                    1,
+                    contract.key_value_heads,
+                    input_shape[1],
+                    contract.head_dim,
+                ),
+            )
+            _require(
+                len(outputs) == 1 + contract.layer_count * 2
+                and all(
+                    _tensor_signature(item) == expected_cache
+                    for item in outputs[1:]
+                ),
+                "Prefill present cache ABI is invalid",
+            )
         return
 
-    expected_names = (
-        "input_ids",
-        *(
-            f"past.{layer}.{kind}"
-            for layer in range(contract.layer_count)
-            for kind in ("key", "value")
-        ),
-    )
     _require(
-        tuple(item.name for item in inputs) == expected_names,
+        len(inputs) == 1 + contract.layer_count * 2,
         "Decode inputs are incomplete or out of order",
     )
     _require(
@@ -196,6 +281,24 @@ def _validate_io_contract(
         == (onnx.TensorProto.FLOAT16, (1, 1, contract.vocab_size)),
         "Decode logits ABI is invalid",
     )
+    if save_kv_cache:
+        expected_present_cache = (
+            contract.cache_dtype(capability),
+            (
+                1,
+                contract.key_value_heads,
+                cache_length + 1,
+                contract.head_dim,
+            ),
+        )
+        _require(
+            len(outputs) == 1 + contract.layer_count * 2
+            and all(
+                _tensor_signature(item) == expected_present_cache
+                for item in outputs[1:]
+            ),
+            "Decode present cache ABI is invalid",
+        )
 
 
 def _validate_operator_contract(
@@ -230,7 +333,7 @@ def _validate_release_artifact(
     metadata = artifact.metadata
     counts = Counter(dict(artifact.topology.operator_counts))
     _validate_metadata_contract(metadata, capability)
-    _validate_io_contract(model, capability, _CONTRACT)
+    _validate_io_contract(model, metadata, capability, _CONTRACT)
     _validate_operator_contract(counts, capability)
     observed_targets = artifact.topology.observed_quantized_targets
     expected_observed = (

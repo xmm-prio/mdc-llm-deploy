@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import inspect
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,7 @@ from mdc_llm_deploy.graph.metadata import (
     GraphMetadata,
     GraphStage,
     QuantizedTarget,
+    TensorAbi,
 )
 from mdc_llm_deploy.onnx import api, onnx_export
 from mdc_llm_deploy.onnx.transform import (
@@ -27,7 +29,10 @@ from mdc_llm_deploy.onnx.transform import (
 )
 from mdc_llm_deploy.onnx.transform.cleanup import producer_map
 from mdc_llm_deploy.onnx.transform.support import OnnxLoweringContext
-from mdc_llm_deploy.operators.contracts.attention import AttentionInput
+from mdc_llm_deploy.operators.contracts.attention import (
+    ATTENTION_INPUT_COUNT,
+    AttentionInput,
+)
 from mdc_llm_deploy.quantization import oneshot
 from tests.support.models.qwen3 import dense_model
 
@@ -115,6 +120,106 @@ def _attention_target(fqn: str) -> QuantizedTarget:
     )
 
 
+def _lowered_cache_fixture() -> tuple[onnx.ModelProto, GraphMetadata]:
+    cache_shape = (1, 2, 4, 16)
+    inputs = [
+        helper.make_tensor_value_info("input_ids", TensorProto.INT64, (1, 4)),
+        helper.make_tensor_value_info("key.source", TensorProto.FLOAT, cache_shape),
+        helper.make_tensor_value_info("value.source", TensorProto.FLOAT, cache_shape),
+    ]
+    outputs = [
+        helper.make_tensor_value_info("logits", TensorProto.FLOAT, (1, 4, 128)),
+        helper.make_tensor_value_info(
+            "present.0.key", TensorProto.FLOAT, cache_shape
+        ),
+        helper.make_tensor_value_info(
+            "present.0.value", TensorProto.FLOAT, cache_shape
+        ),
+    ]
+    attention_inputs = [""] * ATTENTION_INPUT_COUNT
+    attention_inputs[AttentionInput.QUERY] = "query"
+    attention_inputs[AttentionInput.KEY] = "present.0.key"
+    attention_inputs[AttentionInput.VALUE] = "present.0.value"
+    nodes = [
+        helper.make_node("Identity", ["key.source"], ["present.0.key"]),
+        helper.make_node("Identity", ["value.source"], ["present.0.value"]),
+        helper.make_node(
+            "FusedInferAttentionScore",
+            attention_inputs,
+            ["attention.output", "attention.lse"],
+            name="mdc.attention.model.layers.0.self_attn",
+        ),
+        helper.make_node("Identity", ["attention.output"], ["logits"]),
+    ]
+    metadata = GraphMetadata(
+        schema_version=1,
+        stage=GraphStage.FLOAT_PREFILL,
+        model_kind="dense",
+        input_abi=(TensorAbi("input_ids", "int64", (1, 4)),),
+        output_abi=(
+            TensorAbi("logits", "float32", (1, 4, 128)),
+            TensorAbi("present.0.key", "float32", cache_shape),
+            TensorAbi("present.0.value", "float32", cache_shape),
+        ),
+        boundaries=(
+            FusionBoundary("attention", "model.layers.0.self_attn"),
+        ),
+        sequence_length=4,
+        properties={
+            "save_kv_cache": True,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+        },
+    )
+    return helper.make_model(
+        helper.make_graph(nodes, "lowered_cache", inputs, outputs)
+    ), metadata
+
+
+def test_lowered_attention_cache_validation_accepts_bnsd_contract() -> None:
+    model, metadata = _lowered_cache_fixture()
+
+    assert attention_lowering.validate_lowered_attention_cache(
+        model, metadata
+    ) == {}
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("producer", "must have one producer"),
+        ("order", "internal layer order"),
+        ("shape", "static BNSD layout"),
+        ("dtype", "invalid lowered dtype"),
+        ("mapping", "cache mapping is invalid"),
+    ],
+)
+def test_lowered_attention_cache_validation_rejects_invalid_contract(
+    mutation: str,
+    message: str,
+) -> None:
+    model, metadata = _lowered_cache_fixture()
+    if mutation == "producer":
+        del model.graph.node[0]
+    elif mutation == "order":
+        model.graph.output.reverse()
+    elif mutation == "shape":
+        model.graph.output[1].type.tensor_type.shape.dim[1].dim_value = 4
+    elif mutation == "dtype":
+        model.graph.output[1].type.tensor_type.elem_type = TensorProto.INT8
+    else:
+        attention = next(
+            node
+            for node in model.graph.node
+            if node.op_type == "FusedInferAttentionScore"
+        )
+        attention.input[AttentionInput.KEY] = "present.0.value"
+
+    with pytest.raises(OnnxExportError, match=message):
+        attention_lowering.validate_lowered_attention_cache(model, metadata)
+
+
 @pytest.mark.parametrize(
     ("attention_fqn", "target_fqn", "edge", "matches"),
     [
@@ -173,6 +278,8 @@ def test_api_lower_selects_only_strict_attention_descendant_rope(
     for name in (
         "append_quantized_linears",
         "adapt_quantized_moe",
+        "validate_lowered_attention_cache",
+        "finalize_artifact_outputs",
         "prune_unreachable",
         "topologically_sort",
         "remove_dynamic_value_info",
@@ -285,15 +392,53 @@ def test_attention_shared_context_reserves_smallest_suffix() -> None:
     assert context.unique_name("value") == "value.4"
 
 
-def _quantized_attention_graph() -> torch.fx.GraphModule:
+def _attention_graph(
+    *,
+    quantized: bool,
+    save_kv_cache: bool = True,
+) -> torch.fx.GraphModule:
     inputs = {"input_ids": torch.arange(4).reshape(1, 4)}
-    graph = export(dense_model(4, layers=2), inputs)
-    oneshot(
-        graph,
-        "configs/quantization/minmax-attention-a8.json",
-        [inputs],
+    model = dense_model(4, layers=2)
+    model.export_config = replace(
+        model.export_config,
+        save_kv_cache=save_kv_cache,
     )
+    graph = export(model, inputs)
+    if quantized:
+        oneshot(
+            graph,
+            "configs/quantization/minmax-attention-a8.json",
+            [inputs],
+        )
     return graph
+
+
+def _quantized_attention_graph() -> torch.fx.GraphModule:
+    return _attention_graph(quantized=True)
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_mdc_output_finalization_hides_cache_without_pruning_producers(
+    tmp_path: Path,
+    quantized: bool,
+) -> None:
+    model = onnx_export(
+        _attention_graph(quantized=quantized, save_kv_cache=False),
+        tmp_path / f"hidden-cache-{quantized}.onnx",
+        external_data=False,
+    )
+
+    assert [item.name for item in model.graph.output] == ["logits"]
+    produced_values = {
+        output
+        for node in model.graph.node
+        for output in node.output
+    }
+    assert {
+        f"present.{layer_id}.{edge}"
+        for layer_id in range(2)
+        for edge in ("key", "value")
+    } <= produced_values
 
 
 def test_quantized_attention_lowering_is_deterministic(
