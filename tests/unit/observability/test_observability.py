@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import logging
 from collections.abc import Iterator, Mapping
+from typing import TextIO, cast
 
 import pytest
 
@@ -17,6 +18,15 @@ from mdc_llm_deploy.observability.logging import configure_package_logger
 class _TerminalBuffer(io.StringIO):
     def isatty(self) -> bool:
         return True
+
+
+class _ExplodingTerminalBuffer(io.StringIO):
+    def isatty(self) -> bool:
+        raise OSError("terminal probe failed")
+
+
+class _StreamWithoutIsatty:
+    pass
 
 
 class _ExplodingFields(Mapping[str, object]):
@@ -62,7 +72,22 @@ def test_environment_defaults_on_and_controls_are_independent(
         progress_enabled=False,
         report_enabled=True,
         is_terminal=False,
+        color_enabled=False,
     )
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        _ExplodingTerminalBuffer(),
+        cast(TextIO, _StreamWithoutIsatty()),
+    ],
+)
+def test_unsafe_or_missing_isatty_disables_terminal_features(stream: TextIO) -> None:
+    config = ObservabilityConfig.from_env(environ={}, stream=stream)
+
+    assert not config.is_terminal
+    assert not config.color_enabled
 
 
 def test_package_logger_isolated_from_root_and_has_one_owned_handler() -> None:
@@ -95,6 +120,36 @@ def test_log_level_controls_debug_output() -> None:
     assert "DEBUG mdc_llm_deploy.test: Operator detail" in stream.getvalue()
 
 
+def test_terminal_logs_use_semantic_level_colors() -> None:
+    stream = _TerminalBuffer()
+    config = ObservabilityConfig.from_env(
+        environ={"MDC_LLM_DEPLOY_LOG_LEVEL": "DEBUG"},
+        stream=stream,
+    )
+    logger = configure_package_logger(config, stream=stream)
+
+    logger.debug("debug detail")
+    logger.info("info detail")
+    logger.warning("warning detail")
+    logger.error("error detail")
+    logger.critical("critical detail")
+
+    output = stream.getvalue()
+    assert "\x1b[90mDEBUG" in output
+    assert "\x1b[34mINFO" in output
+    assert "\x1b[33mWARNING" in output
+    assert "\x1b[31mERROR" in output
+    assert "\x1b[1;31mCRITICAL" in output
+    for message in (
+        "debug detail",
+        "info detail",
+        "warning detail",
+        "error detail",
+        "critical detail",
+    ):
+        assert message in output
+
+
 def test_non_terminal_uses_static_plain_report_and_no_dynamic_progress() -> None:
     stream = io.StringIO()
     with StageReporter("export", stream=stream, environ={}) as reporter:
@@ -124,6 +179,77 @@ def test_terminal_progress_supports_unknown_total() -> None:
         progress.advance()
 
     assert "1 completed" in stream.getvalue()
+
+
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {"NO_COLOR": ""},
+        {"NO_COLOR": "0"},
+        {"TERM": "DuMb"},
+    ],
+)
+def test_terminal_color_controls_do_not_disable_progress(
+    environ: dict[str, str],
+) -> None:
+    stream = _TerminalBuffer()
+    selected_environ = {
+        **environ,
+        "MDC_LLM_DEPLOY_LOG_LEVEL": "DEBUG",
+        "MDC_LLM_DEPLOY_REPORT": "off",
+    }
+
+    with (
+        StageReporter("no-color", stream=stream, environ=selected_environ) as reporter,
+        reporter.progress("items") as progress,
+    ):
+        assert reporter.config.is_terminal
+        assert not reporter.config.color_enabled
+        assert progress.enabled
+        get_logger("test").debug("plain detail")
+        progress.advance()
+
+    output = stream.getvalue()
+    assert "\x1b[" not in output
+    assert "DEBUG" in output
+    assert "plain detail" in output
+    assert "1 completed" in output
+    assert "\r" in output
+
+
+def test_terminal_report_and_progress_use_semantic_colors() -> None:
+    stream = _TerminalBuffer()
+
+    with (
+        StageReporter(
+            "export",
+            stream=stream,
+            environ={"MDC_LLM_DEPLOY_LOGGING": "off"},
+        ) as reporter,
+        reporter.progress("nodes") as progress,
+    ):
+        progress.advance()
+
+    output = stream.getvalue()
+    assert "\x1b[1;36mexport" in output
+    assert "\x1b[32mSUCCESS" in output
+    assert "\x1b[36m" in output
+
+
+def test_terminal_failed_report_uses_red_status() -> None:
+    stream = _TerminalBuffer()
+
+    with (
+        pytest.raises(ValueError, match="business failure"),
+        StageReporter(
+            "quantize",
+            stream=stream,
+            environ={"MDC_LLM_DEPLOY_LOGGING": "off"},
+        ),
+    ):
+        raise ValueError("business failure")
+
+    assert "\x1b[31mFAILED" in stream.getvalue()
 
 
 def test_failed_stage_keeps_business_exception_and_redacts_secret_fields() -> None:
