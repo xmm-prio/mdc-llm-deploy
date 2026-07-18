@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -15,11 +15,9 @@ from torch.fx import GraphModule
 from ..errors import QuantizationConfigError
 from ..graph.metadata import QuantizedTarget
 from .algorithms.gptq import GptqFallbackError, gptq_weight_quantize
-from .algorithms.math import (
-    calculate_qparams,
-    quantize,
-)
-from .config import ActivationSpec, WeightSpec
+from .algorithms.math import quantize
+from .calibration import CalibrationArtifacts
+from .config import ActivationSpec
 from .planning import QuantizedTensor, TargetPlan
 
 
@@ -42,10 +40,6 @@ class MaterializationContext:
 
     candidate: GraphModule
     parameters: Mapping[str, Tensor]
-    activation_parameters: dict[
-        tuple[object, ActivationSpec | WeightSpec],
-        tuple[Tensor, Tensor],
-    ] = field(default_factory=dict)
 
     @classmethod
     def capture(cls, candidate: GraphModule) -> MaterializationContext:
@@ -68,11 +62,11 @@ class MaterializationContext:
 
 
 def _required_sample(
-    calibration: Mapping[str, Tensor],
+    calibration: CalibrationArtifacts,
     fqn: str,
 ) -> Tensor:
     try:
-        return calibration[fqn]
+        return calibration.samples(fqn)
     except KeyError as error:
         raise QuantizationConfigError(
             f"No activation calibration captured for {fqn!r}"
@@ -93,61 +87,24 @@ def _require_same_device(
         )
 
 
-def _activation_parameters(
-    sample: Tensor,
-    spec: ActivationSpec | WeightSpec,
-) -> tuple[Tensor, Tensor]:
-    axis = 0 if spec.granularity == "per_token" else None
-    return calculate_qparams(
-        sample,
-        bits=spec.bits,
-        symmetric=spec.symmetric,
-        axis=axis,
-    )
-
-
-def _sample_items(
-    calibration: Mapping[str, Tensor],
-    fqn: str,
-) -> tuple[tuple[object, Tensor], ...]:
-    resolver = getattr(calibration, "sample_items", None)
-    if callable(resolver):
-        return cast(tuple[tuple[object, Tensor], ...], resolver(fqn))
-    return ((fqn, _required_sample(calibration, fqn)),)
-
-
-def _boundary_key(
-    calibration: Mapping[str, Tensor],
-    fqn: str,
-) -> object:
-    resolver = getattr(calibration, "boundary_key", None)
-    if callable(resolver):
-        return resolver(fqn)
-    return fqn
-
-
-def _cached_activation_parameters(
-    context: MaterializationContext,
-    calibration: Mapping[str, Tensor],
+def _required_qparams(
+    calibration: CalibrationArtifacts,
     target: TargetPlan,
-    spec: ActivationSpec | WeightSpec,
+    spec: ActivationSpec,
 ) -> tuple[Tensor, Tensor]:
-    key = (_boundary_key(calibration, target.fqn), spec)
-    cached = context.activation_parameters.get(key)
-    if cached is None:
-        cached = _activation_parameters(
-            _required_sample(calibration, target.fqn),
-            spec,
-        )
-        context.activation_parameters[key] = cached
-    return cached
+    try:
+        return calibration.qparams(target.fqn, spec)
+    except KeyError as error:
+        raise QuantizationConfigError(
+            f"No activation calibration captured for {target.fqn!r}"
+        ) from error
 
 
 def _materialize_weight(
     context: MaterializationContext,
     parameter: Tensor,
     target: TargetPlan,
-    calibration: Mapping[str, Tensor],
+    calibration: CalibrationArtifacts,
     sample: Tensor | None = None,
 ) -> tuple[QuantizedTensor, str | None, tuple[float, ...] | None]:
     if target.weight is None:
@@ -304,14 +261,12 @@ def _materialize_weight(
 
 
 def _activation_metadata(
-    context: MaterializationContext,
     target: TargetPlan,
-    calibration: Mapping[str, Tensor],
+    calibration: CalibrationArtifacts,
 ) -> dict[str, Any] | None:
     if target.activation is None:
         return None
-    scale, zero_point = _cached_activation_parameters(
-        context,
+    scale, zero_point = _required_qparams(
         calibration,
         target,
         target.activation,
@@ -344,7 +299,7 @@ def _integer_sha256(
 def materialize_target(
     context: MaterializationContext,
     target: TargetPlan,
-    calibration: Mapping[str, Tensor],
+    calibration: CalibrationArtifacts,
     *,
     weight_sample: Tensor | None = None,
 ) -> MaterializationResult:
@@ -369,14 +324,16 @@ def materialize_target(
         scale = result.scale
         zero_point = result.zero_point
     else:
-        scale, zero_point = _cached_activation_parameters(
-            context,
+        if target.activation is None:
+            raise QuantizationConfigError(
+                f"Target {target.fqn!r} has no activation spec"
+            )
+        scale, zero_point = _required_qparams(
             calibration,
             target,
-            spec,
+            target.activation,
         )
     activation_qparams = _activation_metadata(
-        context,
         target,
         calibration,
     )
@@ -412,7 +369,7 @@ def materialize_target(
 def materialize_alias_group(
     context: MaterializationContext,
     targets: tuple[TargetPlan, ...],
-    calibration: Mapping[str, Tensor],
+    calibration: CalibrationArtifacts,
 ) -> tuple[MaterializationResult, ...]:
     """Materialize one initial alias group without refreshing its parameter."""
     if not targets:
@@ -434,7 +391,13 @@ def materialize_alias_group(
     ):
         unique_samples: dict[object, Tensor] = {}
         for target in targets:
-            for boundary, sample in _sample_items(calibration, target.fqn):
+            try:
+                items = calibration.sample_items(target.fqn)
+            except KeyError as error:
+                raise QuantizationConfigError(
+                    f"No activation calibration captured for {target.fqn!r}"
+                ) from error
+            for boundary, sample in items:
                 unique_samples.setdefault(boundary, sample)
         samples = tuple(unique_samples.values())
         devices = {sample.device for sample in samples}
@@ -453,7 +416,6 @@ def materialize_alias_group(
     results = [first]
     for target in targets[1:]:
         activation_qparams = _activation_metadata(
-            context,
             target,
             calibration,
         )

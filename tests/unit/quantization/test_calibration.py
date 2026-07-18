@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 import pytest
@@ -7,6 +8,7 @@ import torch
 from torch import nn
 from torch.fx import Graph, GraphModule, Node
 
+import mdc_llm_deploy.quantization.calibration as calibration_module
 from mdc_llm_deploy.errors import QuantizationConfigError
 from mdc_llm_deploy.graph.fx import ownership as ownership_module
 from mdc_llm_deploy.graph.lifecycle import (
@@ -14,14 +16,24 @@ from mdc_llm_deploy.graph.lifecycle import (
     GraphMetadata,
     GraphStage,
     TensorAbi,
+    metadata,
     set_metadata,
 )
-from mdc_llm_deploy.quantization import materialization as materialization_module
-from mdc_llm_deploy.quantization.algorithms.math import quantize
+from mdc_llm_deploy.quantization import (
+    materialization as materialization_module,
+)
+from mdc_llm_deploy.quantization import (
+    oneshot,
+)
+from mdc_llm_deploy.quantization.algorithms.math import (
+    calculate_qparams,
+    quantize,
+)
 from mdc_llm_deploy.quantization.calibration import (
+    _CalibrationBoundaryMap,
     _CalibrationInterpreter,
     _CalibrationOwnershipSnapshot,
-    collect_calibration_samples,
+    collect_calibration_artifacts,
 )
 from mdc_llm_deploy.quantization.config import ActivationSpec, WeightSpec
 from mdc_llm_deploy.quantization.materialization import (
@@ -32,12 +44,19 @@ from mdc_llm_deploy.quantization.materialization import (
 )
 from mdc_llm_deploy.quantization.planning import (
     CalibrationPlan,
+    CalibrationRequirement,
     TargetPlan,
     plan_calibration,
 )
 
 _WEIGHT = WeightSpec(bits=8, granularity="per_channel")
 _ACTIVATION = ActivationSpec(bits=8, granularity="per_tensor", mode="static")
+_NONFINITE_CASES = (
+    ("per_tensor", float("inf")),
+    ("per_tensor", float("nan")),
+    ("per_token", float("inf")),
+    ("per_token", float("nan")),
+)
 
 
 def _target(
@@ -60,8 +79,22 @@ def _target(
     )
 
 
-def _capture(*fqns: str) -> CalibrationPlan:
-    return CalibrationPlan(frozenset(fqns))
+def _capture(
+    *fqns: str,
+    full_samples: bool = False,
+    activation: ActivationSpec | None = _ACTIVATION,
+) -> CalibrationPlan:
+    targets = tuple(
+        _target(
+            fqn,
+            algorithm="gptq" if full_samples else "minmax",
+            parameter_name=f"{fqn}.weight" if full_samples else None,
+            weight=_WEIGHT if full_samples else None,
+            activation=activation,
+        )
+        for fqn in fqns
+    )
+    return plan_calibration(targets)
 
 
 def _graph() -> GraphModule:
@@ -289,6 +322,18 @@ def test_plan_calibration_derives_all_materialization_requirements() -> None:
             "attention.query",
         }
     )
+    assert result.requirements["activation_only"] == CalibrationRequirement(
+        frozenset({_ACTIVATION}),
+        False,
+    )
+    assert result.requirements["gptq_weight"] == CalibrationRequirement(
+        frozenset(),
+        True,
+    )
+    assert result.requirements["block.expert_weights"] == CalibrationRequirement(
+        frozenset(),
+        True,
+    )
 
 
 def test_plan_calibration_preserves_every_gptq_alias_target() -> None:
@@ -313,7 +358,70 @@ def test_plan_calibration_preserves_every_gptq_alias_target() -> None:
 
 
 def test_plan_calibration_accepts_empty_target_tuple() -> None:
-    assert plan_calibration(()).required_fqns == frozenset()
+    plan = plan_calibration(())
+
+    assert plan.requires_collection is False
+    assert plan.required_fqns == frozenset()
+    assert dict(plan.requirements) == {}
+
+
+def test_plan_calibration_requires_collection_for_each_artifact_kind() -> None:
+    activation = plan_calibration((_target("linear", activation=_ACTIVATION),))
+    gptq = plan_calibration(
+        (
+            _target(
+                "linear",
+                algorithm="gptq",
+                parameter_name="linear.weight",
+                weight=_WEIGHT,
+            ),
+        )
+    )
+    packed_moe = plan_calibration(
+        (
+            _target(
+                "block.expert_weights",
+                target_type="moe",
+                parameter_name="block.expert_weights",
+                weight=_WEIGHT,
+            ),
+        )
+    )
+
+    assert activation.requires_collection is True
+    assert gptq.requires_collection is True
+    assert packed_moe.requires_collection is True
+
+
+def test_plan_calibration_merges_requirements_order_independently() -> None:
+    four_bit = ActivationSpec(
+        bits=4,
+        granularity="per_token",
+        mode="static",
+        symmetric=False,
+    )
+    targets = (
+        _target("shared", activation=_ACTIVATION),
+        _target(
+            "shared",
+            algorithm="gptq",
+            parameter_name="shared.weight",
+            weight=_WEIGHT,
+            activation=four_bit,
+        ),
+    )
+
+    forward = plan_calibration(targets)
+    reverse = plan_calibration(tuple(reversed(targets)))
+
+    expected = CalibrationRequirement(
+        frozenset({_ACTIVATION, four_bit}),
+        True,
+    )
+    assert forward.requirements["shared"] == expected
+    assert reverse.requirements["shared"] == expected
+    with pytest.raises(TypeError):
+        forward.requirements["other"] = expected  # type: ignore[index]
 
 
 @pytest.mark.parametrize(
@@ -442,25 +550,21 @@ def test_calibration_ownership_resolves_once_per_function_node(
 
     monkeypatch.setattr(ownership_module, "node_owner_fqns", counted_lookup)
     monkeypatch.setattr(_CalibrationInterpreter, "_record", traced_record)
-    collect_calibration_samples(
+    collect_calibration_artifacts(
         graph,
         [
             {"x": torch.ones(1, 1, 2, 2)}
             for _ in range(batch_count)
         ],
-        CalibrationPlan(
-            frozenset(
-                {
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "ordinary",
-                    "self_attn.query",
-                    "self_attn.key",
-                    "self_attn.value",
-                    "self_attn.score",
-                }
-            )
+        _capture(
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "ordinary",
+            "self_attn.query",
+            "self_attn.key",
+            "self_attn.value",
+            "self_attn.score",
         ),
     )
 
@@ -481,7 +585,7 @@ def test_calibration_ownership_resolves_once_per_function_node(
         assert tuple(id(value) for value in node.meta.values()) == identities
 
 
-def test_collect_calibration_samples_preserves_attention_fqn_view() -> None:
+def test_collect_calibration_artifacts_preserves_attention_fqn_view() -> None:
     graph = _attention_graph()
     batches = [
         {"x": torch.arange(4, dtype=torch.float32).reshape(1, 1, 2, 2)},
@@ -499,59 +603,185 @@ def test_collect_calibration_samples_preserves_attention_fqn_view() -> None:
             "self_attn.score",
         }
     )
-    actual = collect_calibration_samples(
+    actual = collect_calibration_artifacts(
         graph,
         batches,
-        CalibrationPlan(required_fqns),
+        _capture(*required_fqns),
     )
 
-    assert set(actual) == required_fqns
-    assert actual["q_proj"].shape == (4, 2)
-    assert actual["self_attn.query"].shape == (4, 2)
-    assert actual["self_attn.score"].shape == (4, 2)
+    for fqn in required_fqns:
+        scale, zero_point = actual.qparams(fqn, _ACTIVATION)
+        assert scale.shape == torch.Size([])
+        assert zero_point.shape == torch.Size([])
+        with pytest.raises(KeyError):
+            actual.samples(fqn)
 
 
-def test_collect_calibration_samples_records_shared_boundary_once() -> None:
+def test_collect_calibration_artifacts_records_shared_boundary_once() -> None:
     graph = _fanout_linear_graph()
     batches = [
         {"x": torch.tensor([[1.0, 2.0]])},
         {"x": torch.tensor([[3.0, 4.0]])},
     ]
 
-    samples = collect_calibration_samples(
+    artifacts = collect_calibration_artifacts(
         graph,
         batches,
         _capture("first", "second"),
     )
 
-    assert samples["first"] is samples["second"]
-    assert samples["first"].shape == (2, 2)
-    assert samples.boundary_key("first") == samples.boundary_key("second")
-    torch.testing.assert_close(
-        samples["first"],
+    first = artifacts.qparams("first", _ACTIVATION)
+    second = artifacts.qparams("second", _ACTIVATION)
+    expected = calculate_qparams(
         torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        bits=8,
+        symmetric=True,
+    )
+    assert first is second
+    torch.testing.assert_close(first[0], expected[0])
+    torch.testing.assert_close(first[1], expected[1])
+    with pytest.raises(KeyError):
+        artifacts.samples("first")
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("symmetric", [False, True])
+@pytest.mark.parametrize("granularity", ["per_tensor", "per_token"])
+def test_streamed_qparams_match_full_sample_reference(
+    bits: int,
+    symmetric: bool,
+    granularity: str,
+) -> None:
+    spec = ActivationSpec(
+        bits=bits,  # type: ignore[arg-type]
+        granularity=granularity,  # type: ignore[arg-type]
+        mode="static",
+        symmetric=symmetric,
+    )
+    batches = (
+        torch.tensor([[0.0, 2.0]]),
+        torch.tensor([[-4.0, -1.0]]),
+        torch.tensor([[3.0, 0.0]]),
+    )
+    artifacts = collect_calibration_artifacts(
+        _graph(),
+        [{"x": batch} for batch in batches],
+        _capture("linear", activation=spec),
     )
 
+    actual = artifacts.qparams("linear", spec)
+    expected = calculate_qparams(
+        torch.cat(batches),
+        bits=bits,
+        symmetric=symmetric,
+        axis=0 if granularity == "per_token" else None,
+    )
 
-def test_materialization_caches_shared_boundary_activation_contract(
-    monkeypatch: pytest.MonkeyPatch,
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    assert torch.equal(actual[1], expected[1])
+    assert actual[0].dtype is torch.float32
+    assert actual[1].dtype is torch.int32
+
+
+@pytest.mark.parametrize(("granularity", "nonfinite"), _NONFINITE_CASES)
+def test_streamed_qparams_reject_nonfinite_intermediate_activation(
+    granularity: str,
+    nonfinite: float,
 ) -> None:
+    graph = _attention_graph()
+    with torch.no_grad():
+        graph.q_proj.weight.fill_(nonfinite)
+    spec = ActivationSpec(
+        bits=8,
+        granularity=granularity,  # type: ignore[arg-type]
+        mode="static",
+    )
+
+    with pytest.raises(ValueError, match=r"^tensor contains NaN or Inf$"):
+        collect_calibration_artifacts(
+            graph,
+            [{"x": torch.ones(1, 1, 2, 2)}],
+            _capture("self_attn.query", activation=spec),
+        )
+
+
+@pytest.mark.parametrize(("granularity", "nonfinite"), _NONFINITE_CASES)
+def test_oneshot_preserves_nonfinite_activation_error_and_graph(
+    granularity: str,
+    nonfinite: float,
+) -> None:
+    graph = _attention_graph()
+    with torch.no_grad():
+        graph.q_proj.weight.fill_(nonfinite)
+    graph_before = str(graph.graph)
+    metadata_before = metadata(graph)
+    parameter_before = graph.q_proj.weight
+    config = {
+        "modifiers": [
+            {
+                "type": "minmax",
+                "attention": {
+                    "query": {
+                        "bits": 8,
+                        "granularity": granularity,
+                        "mode": "static",
+                        "symmetric": True,
+                    }
+                },
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match=r"^tensor contains NaN or Inf$"):
+        oneshot(
+            graph,
+            config,
+            [{"x": torch.ones(1, 1, 2, 2)}],
+        )
+
+    assert str(graph.graph) == graph_before
+    assert metadata(graph) == metadata_before
+    assert graph.q_proj.weight is parameter_before
+
+
+def test_combined_requirement_produces_qparams_and_full_samples() -> None:
+    target = _target(
+        "linear",
+        algorithm="gptq",
+        parameter_name="linear.weight",
+        weight=_WEIGHT,
+        activation=_ACTIVATION,
+    )
+    batches = (
+        torch.tensor([[1.0, 2.0]]),
+        torch.tensor([[3.0, 4.0]]),
+    )
+
+    artifacts = collect_calibration_artifacts(
+        _graph(),
+        [{"x": batch} for batch in batches],
+        plan_calibration((target,)),
+    )
+
+    torch.testing.assert_close(artifacts.samples("linear"), torch.cat(batches))
+    actual = artifacts.qparams("linear", _ACTIVATION)
+    expected = calculate_qparams(
+        torch.cat(batches),
+        bits=8,
+        symmetric=True,
+    )
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    assert torch.equal(actual[1], expected[1])
+
+
+def test_materialization_uses_shared_boundary_activation_contract() -> None:
     graph = _fanout_linear_graph()
-    samples = collect_calibration_samples(
+    samples = collect_calibration_artifacts(
         graph,
         [{"x": torch.tensor([[1.0, 2.0]])}],
         _capture("first", "second"),
     )
     context = MaterializationContext.capture(graph)
-    calls = 0
-    original = materialization_module.calculate_qparams
-
-    def counted(*args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        nonlocal calls
-        calls += 1
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(materialization_module, "calculate_qparams", counted)
     first = materialize_target(
         context,
         _target("first", activation=_ACTIVATION),
@@ -563,30 +793,32 @@ def test_materialization_caches_shared_boundary_activation_contract(
         samples,
     )
 
-    assert calls == 1
+    assert samples.qparams("first", _ACTIVATION) is samples.qparams(
+        "second",
+        _ACTIVATION,
+    )
     assert first.activation_qparams == second.activation_qparams
     assert first.target.scale == second.target.scale
 
 
-def test_shared_boundary_supports_distinct_activation_contracts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_shared_boundary_supports_distinct_activation_contracts() -> None:
     graph = _fanout_linear_graph()
-    samples = collect_calibration_samples(
+    four_bit = ActivationSpec(
+        bits=4,
+        granularity="per_tensor",
+        mode="static",
+    )
+    samples = collect_calibration_artifacts(
         graph,
         [{"x": torch.tensor([[1.0, 2.0]])}],
-        _capture("first", "second"),
+        plan_calibration(
+            (
+                _target("first", activation=_ACTIVATION),
+                _target("second", activation=four_bit),
+            )
+        ),
     )
     context = MaterializationContext.capture(graph)
-    calls = 0
-    original = materialization_module.calculate_qparams
-
-    def counted(*args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        nonlocal calls
-        calls += 1
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(materialization_module, "calculate_qparams", counted)
     first = materialize_target(
         context,
         _target("first", activation=_ACTIVATION),
@@ -596,17 +828,11 @@ def test_shared_boundary_supports_distinct_activation_contracts(
         context,
         _target(
             "second",
-            activation=ActivationSpec(
-                bits=4,
-                granularity="per_tensor",
-                mode="static",
-            ),
+            activation=four_bit,
         ),
         samples,
     )
 
-    assert samples["first"] is samples["second"]
-    assert calls == 2
     assert first.activation_qparams is not None
     assert second.activation_qparams is not None
     assert first.activation_qparams["bits"] == 8
@@ -617,13 +843,13 @@ def test_alias_group_deduplicates_shared_boundary_for_gptq(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     graph = _fanout_linear_graph(tied=True)
-    samples = collect_calibration_samples(
+    samples = collect_calibration_artifacts(
         graph,
         [
             {"x": torch.tensor([[1.0, 2.0]])},
             {"x": torch.tensor([[3.0, 4.0]])},
         ],
-        _capture("first", "second"),
+        _capture("first", "second", full_samples=True, activation=None),
     )
     observed_shapes: list[torch.Size] = []
 
@@ -664,11 +890,11 @@ def test_alias_group_deduplicates_shared_boundary_for_gptq(
     assert observed_shapes == [torch.Size((2, 2))]
 
 
-def test_collect_calibration_samples_wraps_ownership_capture_error(
+def test_collect_calibration_artifacts_wraps_ownership_capture_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     graph = _attention_graph()
-    plan = CalibrationPlan(frozenset({"self_attn.score"}))
+    plan = _capture("self_attn.score")
 
     def fail_lookup(node: Node) -> tuple[str, ...]:
         raise RuntimeError(f"owner lookup failed at {node.name}")
@@ -679,7 +905,7 @@ def test_collect_calibration_samples_wraps_ownership_capture_error(
         QuantizationConfigError,
         match="Calibration graph execution failed: owner lookup failed at q_proj",
     ) as caught:
-        collect_calibration_samples(
+        collect_calibration_artifacts(
             graph,
             [{"x": torch.ones(1, 1, 2, 2)}],
             plan,
@@ -689,35 +915,36 @@ def test_collect_calibration_samples_wraps_ownership_capture_error(
     assert str(caught.value.__cause__) == "owner lookup failed at q_proj"
 
 
-def test_collect_calibration_samples_aggregates_linear_inputs() -> None:
+def test_collect_calibration_artifacts_aggregates_linear_inputs() -> None:
     first = torch.tensor([[1.0, 2.0]], requires_grad=True)
     second = torch.tensor([[3.0, 4.0]])
 
-    samples = collect_calibration_samples(
+    artifacts = collect_calibration_artifacts(
         _graph(),
         [{"x": first}, {"x": second}],
-        _capture("linear"),
+        _capture("linear", full_samples=True, activation=None),
     )
 
+    samples = artifacts.samples("linear")
     torch.testing.assert_close(
-        samples["linear"],
+        samples,
         torch.cat((first.detach(), second)),
     )
-    assert samples["linear"].device.type == "cpu"
-    assert not samples["linear"].requires_grad
+    assert samples.device.type == "cpu"
+    assert not samples.requires_grad
 
 
-def test_collect_calibration_samples_accepts_mapping_order_independent_of_abi() -> None:
-    samples = collect_calibration_samples(
+def test_collect_calibration_artifacts_accepts_mapping_order_independent_of_abi() -> None:
+    artifacts = collect_calibration_artifacts(
         _graph_with_bias_input(),
         [{"bias": torch.zeros(2), "x": torch.ones(1, 2)}],
-        _capture("linear"),
+        _capture("linear", full_samples=True, activation=None),
     )
 
-    torch.testing.assert_close(samples["linear"], torch.ones(1, 2))
+    torch.testing.assert_close(artifacts.samples("linear"), torch.ones(1, 2))
 
 
-def test_collect_calibration_samples_rejects_empty_dataloader_without_capture(
+def test_collect_calibration_artifacts_rejects_empty_dataloader_without_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fail_capture(*args: object, **kwargs: object) -> None:
@@ -732,7 +959,7 @@ def test_collect_calibration_samples_rejects_empty_dataloader_without_capture(
         QuantizationConfigError,
         match="must yield at least one batch",
     ):
-        collect_calibration_samples(_graph(), [], _capture())
+        collect_calibration_artifacts(_graph(), [], _capture("linear"))
 
 
 @pytest.mark.parametrize(
@@ -745,7 +972,7 @@ def test_collect_calibration_samples_rejects_empty_dataloader_without_capture(
         ({"x": torch.tensor([[float("inf"), 0.0]])}, "contains NaN or Inf"),
     ],
 )
-def test_collect_calibration_samples_rejects_invalid_batches(
+def test_collect_calibration_artifacts_rejects_invalid_batches(
     monkeypatch: pytest.MonkeyPatch,
     batch: dict[str, torch.Tensor],
     message: str,
@@ -759,49 +986,52 @@ def test_collect_calibration_samples_rejects_invalid_batches(
         fail_capture,
     )
     with pytest.raises(QuantizationConfigError, match=message):
-        collect_calibration_samples(_graph(), [batch], _capture())
+        collect_calibration_artifacts(_graph(), [batch], _capture("linear"))
 
 
-def test_collect_calibration_samples_filters_unrequired_fqns() -> None:
+def test_collect_calibration_artifacts_filters_unrequired_fqns() -> None:
     value = torch.tensor([[1.0, 2.0]])
 
-    samples = collect_calibration_samples(
+    artifacts = collect_calibration_artifacts(
         _two_linear_graph(),
         [{"x": value}],
         _capture("first"),
     )
 
-    assert set(samples) == {"first"}
-    torch.testing.assert_close(samples["first"], value)
+    artifacts.qparams("first", _ACTIVATION)
+    with pytest.raises(KeyError):
+        artifacts.qparams("second", _ACTIVATION)
 
 
-def test_collect_calibration_samples_empty_plan_still_executes_graph(
+def test_collect_calibration_artifacts_empty_plan_does_not_iterate_or_execute(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    graph = _graph()
-    calls = 0
-    original_run = _CalibrationInterpreter.run
+    class FailOnIteration:
+        def __iter__(self) -> Iterator[Mapping[str, torch.Tensor]]:
+            raise AssertionError("calibration dataloader must not be iterated")
 
-    def counted_run(
-        self: _CalibrationInterpreter,
-        *args: torch.Tensor,
-        **kwargs: object,
-    ) -> object:
-        nonlocal calls
-        calls += 1
-        return original_run(self, *args, **kwargs)
+    def fail(*args: object, **kwargs: object) -> None:
+        raise AssertionError("calibration execution path must not run")
 
-    monkeypatch.setattr(_CalibrationInterpreter, "run", counted_run)
+    monkeypatch.setattr(calibration_module, "metadata", fail)
+    monkeypatch.setattr(_CalibrationOwnershipSnapshot, "capture", fail)
+    monkeypatch.setattr(_CalibrationBoundaryMap, "capture", fail)
+    monkeypatch.setattr(_CalibrationInterpreter, "run", fail)
 
-    assert collect_calibration_samples(
-        graph,
-        [{"x": torch.ones(1, 2)}],
+    artifacts = collect_calibration_artifacts(
+        _graph(),
+        FailOnIteration(),
         _capture(),
-    ) == {}
-    assert calls == 1
+    )
+    with pytest.raises(KeyError):
+        artifacts.qparams("linear", _ACTIVATION)
+    with pytest.raises(KeyError):
+        artifacts.samples("linear")
+    with pytest.raises(KeyError):
+        artifacts.sample_items("linear")
 
 
-def test_collect_calibration_samples_empty_plan_wraps_execution_error(
+def test_collect_calibration_artifacts_nonempty_plan_wraps_execution_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fail(*args: object, **kwargs: object) -> None:
@@ -813,19 +1043,19 @@ def test_collect_calibration_samples_empty_plan_wraps_execution_error(
         QuantizationConfigError,
         match="Calibration graph execution failed",
     ):
-        collect_calibration_samples(
+        collect_calibration_artifacts(
             _graph(),
             [{"x": torch.ones(1, 2)}],
-            _capture(),
+            _capture("linear"),
         )
 
 
-def test_collect_calibration_samples_rejects_non_mapping_with_empty_plan() -> None:
+def test_collect_calibration_artifacts_rejects_non_mapping_with_nonempty_plan() -> None:
     with pytest.raises(TypeError, match="must be mappings"):
-        collect_calibration_samples(
+        collect_calibration_artifacts(
             _graph(),
             [torch.ones(1, 2)],  # type: ignore[list-item]
-            _capture(),
+            _capture("linear"),
         )
 
 

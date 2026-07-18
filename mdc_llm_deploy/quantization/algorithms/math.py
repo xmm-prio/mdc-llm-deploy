@@ -31,32 +31,20 @@ from .gptq import (
 )
 
 
-def calculate_qparams(
-    tensor: Tensor,
+def _qparams_from_extrema(
+    minimum: Tensor,
+    maximum: Tensor,
     *,
     bits: int,
     symmetric: bool,
-    axis: int | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Calculate FP32 MinMax scale and int32 zero point."""
-    if not tensor.is_floating_point():
-        raise TypeError("tensor must use a floating dtype")
-    source = tensor.detach().float()
-    if not torch.isfinite(source).all():
+    """Calculate qparams from FP32 minimum and maximum tensors."""
+    if not (
+        torch.isfinite(minimum).all()
+        and torch.isfinite(maximum).all()
+    ):
         raise ValueError("tensor contains NaN or Inf")
     qmin, qmax = integer_range(bits)
-    if axis is None:
-        minimum = source.amin()
-        maximum = source.amax()
-    else:
-        normalized_axis = axis % source.ndim
-        reduction = tuple(
-            index
-            for index in range(source.ndim)
-            if index != normalized_axis
-        )
-        minimum = source.amin(dim=reduction, keepdim=True)
-        maximum = source.amax(dim=reduction, keepdim=True)
     if symmetric:
         bound = torch.maximum(minimum.abs(), maximum.abs())
         scale = bound / qmax
@@ -91,6 +79,39 @@ def calculate_qparams(
             qmax,
         ).to(torch.int32)
     return scale.float(), zero_point
+
+
+def calculate_qparams(
+    tensor: Tensor,
+    *,
+    bits: int,
+    symmetric: bool,
+    axis: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Calculate FP32 MinMax scale and int32 zero point."""
+    if not tensor.is_floating_point():
+        raise TypeError("tensor must use a floating dtype")
+    source = tensor.detach().float()
+    if not torch.isfinite(source).all():
+        raise ValueError("tensor contains NaN or Inf")
+    if axis is None:
+        minimum = source.amin()
+        maximum = source.amax()
+    else:
+        normalized_axis = axis % source.ndim
+        reduction = tuple(
+            index
+            for index in range(source.ndim)
+            if index != normalized_axis
+        )
+        minimum = source.amin(dim=reduction, keepdim=True)
+        maximum = source.amax(dim=reduction, keepdim=True)
+    return _qparams_from_extrema(
+        minimum,
+        maximum,
+        bits=bits,
+        symmetric=symmetric,
+    )
 
 
 def quantize(

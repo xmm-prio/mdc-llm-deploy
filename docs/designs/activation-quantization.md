@@ -18,12 +18,19 @@
 - Attention query、key、value 和 score 使用对应输出 value。
 - MoE 使用 `MoeExpert` 的激活输入 value。
 
-同一边界在每个 calibration batch 中观察一次。不同 batch 的观察全部保留，
-并在执行结束后聚合一次。多个 target 可读取同一聚合结果。
+校准计划是阶段准入的唯一依据。计划不需要任何产物时，校准阶段直接返回空工件，不枚举
+`calibration_dataloader`、不解析物理边界，也不执行 FX 图；计划非空时才逐 batch 校验并观察。
+GPTQ 和 packed MoE 即使没有 activation 配置也需要完整样本，因此不会进入空计划短路。
 
-原始样本共享不代表量化契约合并。bits、granularity、mode 或 symmetric
-不同的 target 使用同一份样本分别计算 qparams；边界与激活契约都相同时，
-qparams 计算结果复用。
+同一边界在每个 calibration batch 中观察一次。校准计划按算法声明产物：
+MinMax 流式合并极值并生成 qparams，不保留跨 batch 原始 activation；
+GPTQ 与 packed MoE 保留完整、顺序稳定的 activation matrix。多个 target
+可共享同一物理边界的采集状态。
+
+物理边界共享不代表量化契约合并。bits、granularity、mode 或 symmetric
+不同的 target 分别生成 qparams；边界与激活契约都相同时，极值状态和
+qparams 结果复用。`per_tensor` 极值使用常量空间，`per_token` 仅保留每行
+极值，均不保留隐藏维原始 activation。
 
 参数 alias group 聚合 GPTQ 或 MoE 样本时，也按物理边界去重，避免同一
 样本因多个 FQN 被重复拼接。

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
@@ -15,7 +15,9 @@ from ..errors import QuantizationConfigError
 from ..graph.fx.inspection import linear_weight_name
 from ..graph.fx.ownership import NodeOwnershipIndex
 from ..graph.lifecycle import metadata
-from .planning import CalibrationPlan
+from .algorithms.math import _qparams_from_extrema
+from .config import ActivationSpec
+from .planning import CalibrationPlan, CalibrationRequirement
 
 
 def _first_owner_by_node(
@@ -153,57 +155,222 @@ class _CalibrationBoundaryMap:
         )
 
 
-class CalibrationSamples(Mapping[str, Tensor]):
-    """Aggregated boundary samples with a backward-compatible FQN view."""
+@dataclass(slots=True)
+class _BoundaryAccumulator:
+    """Collect only artifacts required at one physical FX boundary."""
+
+    activation_specs: frozenset[ActivationSpec]
+    full_samples: bool
+    devices: set[torch.device] = field(default_factory=set)
+    samples: list[Tensor] = field(default_factory=list)
+    tensor_minimum: Tensor | None = None
+    tensor_maximum: Tensor | None = None
+    token_minima: list[Tensor] = field(default_factory=list)
+    token_maxima: list[Tensor] = field(default_factory=list)
+
+    def observe(self, value: Tensor) -> None:
+        """Merge one batch observation into bounded or full-sample state."""
+        detached = value.detach()
+        self.devices.add(detached.device)
+        if self.full_samples:
+            self.samples.append(detached)
+        source = detached.float().reshape(-1, detached.shape[-1])
+        granularities = {spec.granularity for spec in self.activation_specs}
+        if "per_tensor" in granularities:
+            minimum = source.amin()
+            maximum = source.amax()
+            self.tensor_minimum = (
+                minimum
+                if self.tensor_minimum is None
+                else torch.minimum(self.tensor_minimum, minimum)
+            )
+            self.tensor_maximum = (
+                maximum
+                if self.tensor_maximum is None
+                else torch.maximum(self.tensor_maximum, maximum)
+            )
+        if "per_token" in granularities:
+            self.token_minima.append(source.amin(dim=1, keepdim=True))
+            self.token_maxima.append(source.amax(dim=1, keepdim=True))
+
+    def extrema(self, granularity: str) -> tuple[Tensor, Tensor]:
+        """Finalize extrema for one activation granularity."""
+        if granularity == "per_tensor":
+            if self.tensor_minimum is None or self.tensor_maximum is None:
+                raise KeyError(granularity)
+            return self.tensor_minimum, self.tensor_maximum
+        if not self.token_minima or not self.token_maxima:
+            raise KeyError(granularity)
+        return torch.cat(self.token_minima), torch.cat(self.token_maxima)
+
+    def full_sample(self) -> Tensor:
+        """Finalize the complete row-major activation matrix."""
+        if not self.full_samples or not self.samples:
+            raise KeyError("full_samples")
+        return torch.cat(
+            tuple(
+                value.reshape(-1, value.shape[-1])
+                for value in self.samples
+            )
+        )
+
+
+class CalibrationArtifacts:
+    """Typed calibration outputs consumed by materialization."""
+
+    @classmethod
+    def empty(cls) -> CalibrationArtifacts:
+        """Create calibration artifacts with no planned outputs."""
+        return cls({}, {}, {}, {})
 
     def __init__(
         self,
-        by_node: Mapping[Node, Tensor],
+        qparams: Mapping[tuple[str, ActivationSpec], tuple[Tensor, Tensor]],
+        samples_by_node: Mapping[Node, Tensor],
         nodes_by_target: Mapping[str, tuple[Node, ...]],
+        requirements: Mapping[str, CalibrationRequirement],
     ) -> None:
-        self._by_node = MappingProxyType(dict(by_node))
+        self._qparams = MappingProxyType(dict(qparams))
+        self._samples_by_node = MappingProxyType(dict(samples_by_node))
         self._nodes_by_target = MappingProxyType(dict(nodes_by_target))
-        self._target_cache: dict[str, Tensor] = {}
+        self._requirements = MappingProxyType(dict(requirements))
+        self._sample_cache: dict[str, Tensor] = {}
 
-    def __iter__(self) -> Iterator[str]:
-        return (
-            target
-            for target, nodes in self._nodes_by_target.items()
-            if nodes
-        )
+    def qparams(
+        self,
+        fqn: str,
+        spec: ActivationSpec,
+    ) -> tuple[Tensor, Tensor]:
+        """Return finalized activation qparams for one logical target."""
+        try:
+            return self._qparams[(fqn, spec)]
+        except KeyError as error:
+            raise KeyError(fqn) from error
 
-    def __len__(self) -> int:
-        return sum(bool(nodes) for nodes in self._nodes_by_target.values())
-
-    def __getitem__(self, target: str) -> Tensor:
-        nodes = self._nodes_by_target[target]
-        if not nodes:
-            raise KeyError(target)
-        cached = self._target_cache.get(target)
+    def samples(self, fqn: str) -> Tensor:
+        """Return full samples only when explicitly planned."""
+        requirement = self._requirements.get(fqn)
+        if requirement is None or not requirement.full_samples:
+            raise KeyError(fqn)
+        cached = self._sample_cache.get(fqn)
         if cached is not None:
             return cached
-        values = tuple(self._by_node[node] for node in nodes)
-        value = values[0] if len(values) == 1 else torch.cat(values)
-        self._target_cache[target] = value
-        return value
+        items = self.sample_items(fqn)
+        if not items:
+            raise KeyError(fqn)
+        values = tuple(value for _, value in items)
+        result = values[0] if len(values) == 1 else torch.cat(values)
+        self._sample_cache[fqn] = result
+        return result
 
-    def sample_items(self, target: str) -> tuple[tuple[Node, Tensor], ...]:
-        """Return stable boundary identities and samples for one target."""
+    def sample_items(self, fqn: str) -> tuple[tuple[object, Tensor], ...]:
+        """Return stable physical boundaries and their full samples."""
+        requirement = self._requirements.get(fqn)
+        if requirement is None or not requirement.full_samples:
+            raise KeyError(fqn)
         try:
-            nodes = self._nodes_by_target[target]
-            return tuple((node, self._by_node[node]) for node in nodes)
+            nodes = self._nodes_by_target[fqn]
+            return tuple(
+                (node, self._samples_by_node[node])
+                for node in nodes
+            )
         except KeyError as error:
-            raise KeyError(target) from error
+            raise KeyError(fqn) from error
 
-    def boundary_key(self, target: str) -> tuple[Node, ...]:
-        """Return graph boundary identity used for qparam caching."""
-        try:
-            nodes = self._nodes_by_target[target]
-        except KeyError as error:
-            raise KeyError(target) from error
+
+def _boundary_accumulators(
+    boundaries: _CalibrationBoundaryMap,
+    plan: CalibrationPlan,
+) -> dict[Node, _BoundaryAccumulator]:
+    result: dict[Node, _BoundaryAccumulator] = {}
+    for node, targets in boundaries.targets_by_node.items():
+        specs: set[ActivationSpec] = set()
+        full_samples = False
+        for target in targets:
+            requirement = plan.requirements[target]
+            specs.update(requirement.activation_specs)
+            full_samples = full_samples or requirement.full_samples
+        result[node] = _BoundaryAccumulator(
+            activation_specs=frozenset(specs),
+            full_samples=full_samples,
+        )
+    return result
+
+
+def _finalize_artifacts(
+    boundaries: _CalibrationBoundaryMap,
+    accumulators: Mapping[Node, _BoundaryAccumulator],
+    plan: CalibrationPlan,
+) -> CalibrationArtifacts:
+    for node, accumulator in accumulators.items():
+        if len(accumulator.devices) > 1:
+            targets = boundaries.targets_by_node[node]
+            raise QuantizationConfigError(
+                f"Calibration samples for {targets!r} span devices "
+                f"{sorted(str(device) for device in accumulator.devices)}"
+            )
+    samples_by_node = {
+        node: accumulator.full_sample()
+        for node, accumulator in accumulators.items()
+        if accumulator.full_samples and accumulator.samples
+    }
+    qparams: dict[
+        tuple[str, ActivationSpec],
+        tuple[Tensor, Tensor],
+    ] = {}
+    shared: dict[
+        tuple[tuple[Node, ...], ActivationSpec],
+        tuple[Tensor, Tensor],
+    ] = {}
+    for fqn, requirement in plan.requirements.items():
+        nodes = boundaries.nodes_by_target[fqn]
         if not nodes:
-            raise KeyError(target)
-        return nodes
+            continue
+        devices = {
+            device
+            for node in nodes
+            for device in accumulators[node].devices
+        }
+        if len(devices) > 1:
+            raise QuantizationConfigError(
+                f"Calibration samples for {fqn!r} span devices "
+                f"{sorted(str(device) for device in devices)}"
+            )
+        for spec in requirement.activation_specs:
+            cache_key = (nodes, spec)
+            result = shared.get(cache_key)
+            if result is None:
+                extrema = tuple(
+                    accumulators[node].extrema(spec.granularity)
+                    for node in nodes
+                )
+                if spec.granularity == "per_tensor":
+                    minimum = extrema[0][0]
+                    maximum = extrema[0][1]
+                    for node_minimum, node_maximum in extrema[1:]:
+                        minimum = torch.minimum(minimum, node_minimum)
+                        maximum = torch.maximum(maximum, node_maximum)
+                else:
+                    minimum = torch.cat(
+                        tuple(item[0] for item in extrema)
+                    )
+                    maximum = torch.cat(
+                        tuple(item[1] for item in extrema)
+                    )
+                result = _qparams_from_extrema(
+                    minimum,
+                    maximum,
+                    bits=spec.bits,
+                    symmetric=spec.symmetric,
+                )
+                shared[cache_key] = result
+            qparams[(fqn, spec)] = result
+    return CalibrationArtifacts(
+        qparams,
+        samples_by_node,
+        boundaries.nodes_by_target,
+        plan.requirements,
+    )
 
 
 class _CalibrationInterpreter(Interpreter):
@@ -231,12 +398,15 @@ class _CalibrationInterpreter(Interpreter):
         return result
 
 
-def collect_calibration_samples(
+def collect_calibration_artifacts(
     graph: GraphModule,
     dataloader: Iterable[Mapping[str, Tensor]],
     plan: CalibrationPlan,
-) -> CalibrationSamples:
-    """Validate calibration batches and collect quantization-boundary samples."""
+) -> CalibrationArtifacts:
+    """Validate batches and collect planned calibration artifacts."""
+    if not plan.requires_collection:
+        return CalibrationArtifacts.empty()
+
     graph_metadata = metadata(graph)
     expected = tuple(item.name for item in graph_metadata.input_abi)
     expected_abi = {
@@ -252,8 +422,8 @@ def collect_calibration_samples(
         for boundary in graph_metadata.boundaries
         if boundary.kind == "moe"
     )
-    captured: dict[Node, list[Tensor]] = {}
     boundaries: _CalibrationBoundaryMap | None = None
+    accumulators: dict[Node, _BoundaryAccumulator] | None = None
     observed = 0
     for batch in dataloader:
         if not isinstance(batch, Mapping):
@@ -297,6 +467,7 @@ def collect_calibration_samples(
                     plan.required_fqns,
                     ownership,
                 )
+                accumulators = _boundary_accumulators(boundaries, plan)
             recorder = _CalibrationInterpreter(
                 graph,
                 boundaries,
@@ -307,32 +478,24 @@ def collect_calibration_samples(
             raise QuantizationConfigError(
                 f"Calibration graph execution failed: {error}"
             ) from error
+        if accumulators is None:
+            raise RuntimeError("Calibration accumulators were not captured")
         for node, value in recorder.samples.items():
-            captured.setdefault(node, []).append(value)
+            accumulators[node].observe(value)
         observed += 1
     if observed == 0:
         raise QuantizationConfigError(
             "Calibration dataloader must yield at least one batch"
         )
-    if boundaries is None:
+    if boundaries is None or accumulators is None:
         raise RuntimeError("Calibration boundaries were not captured")
     try:
-        aggregated: dict[Node, Tensor] = {}
-        for node, values in captured.items():
-            devices = {value.device for value in values}
-            if len(devices) != 1:
-                targets = boundaries.targets_by_node[node]
-                raise QuantizationConfigError(
-                    f"Calibration samples for {targets!r} span devices "
-                    f"{sorted(str(device) for device in devices)}"
-                )
-            aggregated[node] = torch.cat(
-                tuple(value.reshape(-1, value.shape[-1]) for value in values)
-            )
-        return CalibrationSamples(aggregated, boundaries.nodes_by_target)
+        return _finalize_artifacts(boundaries, accumulators, plan)
     except QuantizationConfigError:
+        raise
+    except ValueError:
         raise
     except Exception as error:
         raise QuantizationConfigError(
-            f"Calibration sample aggregation failed: {error}"
+            f"Calibration artifact finalization failed: {error}"
         ) from error

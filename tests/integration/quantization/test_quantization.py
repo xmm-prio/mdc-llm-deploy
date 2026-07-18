@@ -32,10 +32,10 @@ from mdc_llm_deploy.quantization.algorithms.math import (
     GptqFallbackError,
     gptq_weight_quantize,
 )
-from mdc_llm_deploy.quantization.calibration import collect_calibration_samples
-from mdc_llm_deploy.quantization.config import QuantizationConfig
+from mdc_llm_deploy.quantization.calibration import collect_calibration_artifacts
+from mdc_llm_deploy.quantization.config import QuantizationConfig, WeightSpec
 from mdc_llm_deploy.quantization.planning import (
-    CalibrationPlan,
+    TargetPlan,
     plan_calibration,
 )
 from tests.support.models.qwen3 import dense_model, moe_model
@@ -155,6 +155,40 @@ def test_minmax_linear_materializes_independent_reference() -> None:
     assert "gptq" not in value.properties
     assert value.properties["activation_qparams"]["lm_head"]["bits"] == 8
     assert len(value.properties["quantized_integer_sha256"]["lm_head"]) == 64
+
+
+def test_minmax_multibatch_preserves_oneshot_public_result() -> None:
+    single = _graph()
+    repeated = copy.deepcopy(single)
+    inputs = _inputs()
+
+    oneshot(
+        single,
+        "configs/quantization/minmax-linear-w8a8.json",
+        [inputs],
+    )
+    oneshot(
+        repeated,
+        "configs/quantization/minmax-linear-w8a8.json",
+        [inputs, inputs, inputs],
+    )
+
+    assert metadata(repeated) == metadata(single)
+    for (single_name, single_parameter), (
+        repeated_name,
+        repeated_parameter,
+    ) in zip(
+        single.named_parameters(),
+        repeated.named_parameters(),
+        strict=True,
+    ):
+        assert repeated_name == single_name
+        torch.testing.assert_close(
+            repeated_parameter,
+            single_parameter,
+            rtol=0,
+            atol=0,
+        )
 
 
 def test_materialization_captures_candidate_parameters_once(
@@ -595,21 +629,42 @@ def test_oneshot_materializes_tied_parameter_once_and_preserves_aliases() -> Non
 
 def test_minmax_tied_ordinary_moe_needs_no_calibration_samples() -> None:
     graph = _tied_ordinary_moe_graph()
+    baseline = copy.deepcopy(graph)
     config = QuantizationConfig.load(_tied_moe_minmax_config())
     plan = plan_quantization(graph, config)
+    device_before = graph.get_submodule("experts.0").weight.device
     inputs = {"input_ids": torch.arange(4, dtype=torch.float32).reshape(1, 4)}
 
     assert {target.fqn for target in plan} == {"experts.0", "experts.1"}
-    assert plan_calibration(plan).required_fqns == frozenset()
+    calibration_plan = plan_calibration(plan)
+    assert calibration_plan.requires_collection is False
+    assert calibration_plan.required_fqns == frozenset()
 
-    same = oneshot(graph, config, [inputs])
+    oneshot(baseline, config, [inputs])
+    same = oneshot(graph, config, ())
 
     assert same is graph
     assert (
         graph.get_submodule("experts.0").weight
         is graph.get_submodule("experts.1").weight
     )
-    assert {target.fqn for target in metadata(graph).quantized_targets} == {
+    assert graph.get_submodule("experts.0").weight.device == device_before
+    torch.testing.assert_close(
+        graph.get_submodule("experts.0").weight,
+        baseline.get_submodule("experts.0").weight,
+        rtol=0,
+        atol=0,
+    )
+    value = metadata(graph)
+    assert value == metadata(baseline)
+    assert value.stage is GraphStage.QUANTIZED_PREFILL
+    assert {target.fqn for target in value.quantized_targets} == {
+        "experts.0",
+        "experts.1",
+    }
+    assert value.config_fingerprint == config.fingerprint
+    assert value.properties["activation_qparams"] == {}
+    assert set(value.properties["quantized_integer_sha256"]) == {
         "experts.0",
         "experts.1",
     }
@@ -638,14 +693,26 @@ def test_oneshot_aggregates_each_target_on_its_resident_device() -> None:
         "input_ids": torch.arange(4, device="cuda:0").reshape(1, 4)
     }
     graph = export(ResidentLinearModel().eval(), inputs)
-    samples = collect_calibration_samples(
+    calibration_targets = tuple(
+        TargetPlan(
+            fqn=fqn,
+            target_type="linear",
+            algorithm="gptq",
+            modifier_index=0,
+            parameter_name=f"{fqn}.weight",
+            weight=WeightSpec(bits=8, granularity="per_channel"),
+            activation=None,
+        )
+        for fqn in ("first", "second")
+    )
+    samples = collect_calibration_artifacts(
         graph,
         [inputs, inputs],
-        CalibrationPlan(frozenset({"first", "second"})),
+        plan_calibration(calibration_targets),
     )
 
-    assert samples["first"].device == torch.device("cuda:0")
-    assert samples["second"].device == torch.device("cuda:1")
+    assert samples.samples("first").device == torch.device("cuda:0")
+    assert samples.samples("second").device == torch.device("cuda:1")
 
     oneshot(graph, _tied_minmax_config(), [inputs])
 

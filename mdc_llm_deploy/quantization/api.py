@@ -12,7 +12,7 @@ from ..errors import GraphStateError, QuantizationConfigError
 from ..graph.lifecycle import metadata, set_metadata, transactional_update
 from ..graph.metadata import GraphStage
 from ..placement import capture_placement
-from .calibration import collect_calibration_samples
+from .calibration import collect_calibration_artifacts
 from .config import QuantizationConfig
 from .materialization import (
     MaterializationContext,
@@ -45,7 +45,7 @@ def oneshot(
     calibration_plan = plan_calibration(plan)
     placement = capture_placement(graph)
     groups = group_alias_targets(graph, plan)
-    calibration = collect_calibration_samples(
+    calibration = collect_calibration_artifacts(
         graph,
         calibration_dataloader,
         calibration_plan,

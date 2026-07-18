@@ -33,7 +33,9 @@ python -m pip install -e ".[dev]"
 `int64` 的 `input_ids`，且模型、输入和参数必须位于同一设备。
 - `oneshot(graph, config, calibration_dataloader) -> torch.fx.GraphModule`
 在 `FLOAT_PREFILL` 阶段校准并插入 fake-quant。`config` 可为 `QuantizationConfig`、字典或
-UTF-8 JSON 路径；量化必须先于 decode 转换。
+UTF-8 JSON 路径；量化必须先于 decode 转换。`calibration_dataloader` 参数始终必填；
+当量化计划不需要任何校准产物时可传入空 iterable（如 `()`），且该 iterable 不会被枚举。
+需要校准产物的计划仍必须至少提供一个合法 batch。
 - `convert_to_decode(graph) -> torch.fx.GraphModule`
 将序列长度至少为 2 的 prefill 图原子改写为单 token decode 图。函数更新并返回同一图；
 decode 输入增加每层 `past.N.key/value`。
@@ -132,8 +134,8 @@ onnx_export(graph, "output/qwen3-decode.onnx")
 > `convert_to_decode()` 会更新同一 FX 图。请先导出 prefill，再执行转换和 decode 导出；转换后不能
 > 再从该图生成 prefill。量化同样必须在转换前完成。
 >
-> 模型、导出输入和 `oneshot()` 的校准批次必须位于同一设备。GPU 导出时，请在创建输入及校准
-> 数据时显式传入同一个 CUDA `device`。
+> 量化配置需要校准产物时，模型、导出输入和 `oneshot()` 的校准批次必须位于同一设备。
+> GPU 导出时，请在创建输入及校准数据时显式传入同一个 CUDA `device`。
 
 不需要量化时，跳过 `oneshot()` 即可导出 FP16 产物。默认输出为：
 
