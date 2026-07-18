@@ -194,13 +194,8 @@ class AttentionSpec:
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible representation."""
         return {
-            key: None if value is None else value.to_dict()
-            for key, value in (
-                ("query", self.query),
-                ("key", self.key),
-                ("value", self.value),
-                ("score", self.score),
-            )
+            edge: None if (spec := getattr(self, edge)) is None else spec.to_dict()
+            for edge in ATTENTION_EDGES
         }
 
 

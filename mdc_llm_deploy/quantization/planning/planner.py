@@ -16,6 +16,7 @@ from ..config.modifiers import (
     GPTQ_PERCDAMP_DEFAULT,
     Modifier,
 )
+from ..config.specs import ATTENTION_EDGES
 from .selectors import effective_selector, selected
 
 
@@ -150,7 +151,7 @@ def _append_attention_targets(
         if boundary.kind == "attention"
     )
     for attention_fqn in attention_fqns:
-        for edge in ("query", "key", "value", "score"):
+        for edge in ATTENTION_EDGES:
             activation = getattr(target, edge)
             fqn = f"{attention_fqn}.{edge}"
             if activation is not None and selected(fqn, include, exclude):

@@ -8,6 +8,13 @@ from torch import nn
 from torch.fx import Graph, GraphModule
 
 from mdc_llm_deploy.errors import QuantizationConfigError
+from mdc_llm_deploy.graph.lifecycle import (
+    FusionBoundary,
+    GraphMetadata,
+    GraphStage,
+    TensorAbi,
+    set_metadata,
+)
 from mdc_llm_deploy.quantization.config import QuantizationConfig
 from mdc_llm_deploy.quantization.planning import planner
 
@@ -196,6 +203,51 @@ def test_plan_preserves_modifier_and_category_order() -> None:
         (0, "moe", "experts.0.weight", "experts.0"),
         (1, "linear", "dense_b.weight", "dense_b"),
         (1, "moe", "shared_expert.weight", "shared_expert"),
+    ]
+
+
+def test_plan_preserves_attention_edge_order() -> None:
+    graph = _graph_module([])
+    set_metadata(
+        graph,
+        GraphMetadata(
+            schema_version=1,
+            stage=GraphStage.FLOAT_PREFILL,
+            model_kind="dense",
+            input_abi=(TensorAbi("value", "float32", (1, 2)),),
+            output_abi=(TensorAbi("output", "float32", (1, 2)),),
+            boundaries=(FusionBoundary("attention", "self_attn"),),
+            sequence_length=2,
+        ),
+    )
+    activation = {
+        "bits": 8,
+        "granularity": "per_tensor",
+        "mode": "static",
+    }
+    config = QuantizationConfig.from_dict(
+        {
+            "modifiers": [
+                {
+                    "type": "minmax",
+                    "attention": {
+                        "query": activation,
+                        "key": activation,
+                        "value": activation,
+                        "score": activation,
+                    },
+                }
+            ]
+        }
+    )
+
+    plan = planner.plan_quantization(graph, config)
+
+    assert [target.fqn for target in plan] == [
+        "self_attn.query",
+        "self_attn.key",
+        "self_attn.value",
+        "self_attn.score",
     ]
 
 

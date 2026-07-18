@@ -14,6 +14,7 @@ from ...capabilities import (
 )
 from ...errors import QuantizationConfigError
 from .specs import (
+    ATTENTION_EDGES,
     AttentionSpec,
     LinearSpec,
     MoeSpec,
@@ -55,14 +56,7 @@ def _has_tensor_spec(
     target: LinearSpec | AttentionSpec | MoeSpec,
 ) -> bool:
     if isinstance(target, AttentionSpec):
-        return any(
-            (
-                target.query,
-                target.key,
-                target.value,
-                target.score,
-            )
-        )
+        return any(getattr(target, edge) is not None for edge in ATTENTION_EDGES)
     return target.weight is not None or target.activation is not None
 
 

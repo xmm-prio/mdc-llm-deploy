@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import logging
+import subprocess
+import sys
 from collections.abc import Iterator, Mapping
 from typing import TextIO, cast
 
@@ -38,6 +40,26 @@ class _ExplodingFields(Mapping[str, object]):
 
     def __len__(self) -> int:
         raise AssertionError("disabled reports must not inspect fields")
+
+
+@pytest.fixture(autouse=True)
+def _restore_package_logger() -> Iterator[None]:
+    logger = get_logger()
+    saved_handlers = tuple(logger.handlers)
+    saved_level = logger.level
+    saved_propagate = logger.propagate
+    for handler in saved_handlers:
+        logger.removeHandler(handler)
+
+    yield
+
+    for handler in tuple(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+    for handler in saved_handlers:
+        logger.addHandler(handler)
+    logger.setLevel(saved_level)
+    logger.propagate = saved_propagate
 
 
 def test_environment_defaults_on_and_controls_are_independent(
@@ -103,6 +125,79 @@ def test_package_logger_isolated_from_root_and_has_one_owned_handler() -> None:
     assert len(first.handlers) == 1
     assert not first.propagate
     assert (root.level, tuple(root.handlers), root.propagate) == root_state
+
+
+def test_stage_reporter_preserves_host_logging_route() -> None:
+    logger = get_logger()
+    host_stream = io.StringIO()
+    package_stream = io.StringIO()
+    package_config = ObservabilityConfig.from_env(environ={}, stream=package_stream)
+    configure_package_logger(package_config, stream=package_stream)
+    assert len(logger.handlers) == 1
+
+    host_handler = logging.StreamHandler(host_stream)
+    host_formatter = logging.Formatter("HOST %(levelname)s: %(message)s")
+    host_handler.setFormatter(host_formatter)
+    host_handler.setLevel(logging.INFO)
+    logger.addHandler(host_handler)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = True
+
+    logger.info("before")
+    package_stream.seek(0)
+    package_stream.truncate()
+    with StageReporter(
+        "embedded",
+        stream=package_stream,
+        environ={
+            "MDC_LLM_DEPLOY_LOGGING": "off",
+            "MDC_LLM_DEPLOY_PROGRESS": "off",
+            "MDC_LLM_DEPLOY_REPORT": "off",
+        },
+    ):
+        pass
+    logger.info("after")
+
+    output = host_stream.getvalue()
+    assert "before" in output
+    assert "Stage started: embedded" in output
+    assert "Stage completed: embedded" in output
+    assert "after" in output
+    assert package_stream.getvalue() == ""
+    assert logger.handlers == [host_handler]
+    assert logger.level == logging.DEBUG
+    assert logger.propagate
+    assert host_handler.level == logging.INFO
+    assert host_handler.formatter is host_formatter
+
+
+def test_root_import_preserves_preconfigured_host_logger() -> None:
+    command = (
+        "import logging; "
+        "logger = logging.getLogger('mdc_llm_deploy'); "
+        "handler = logging.StreamHandler(); "
+        "formatter = logging.Formatter('HOST %(message)s'); "
+        "handler.setFormatter(formatter); "
+        "handler.setLevel(logging.WARNING); "
+        "logger.addHandler(handler); "
+        "logger.setLevel(logging.DEBUG); "
+        "logger.propagate = True; "
+        "import mdc_llm_deploy; "
+        "assert logger.handlers == [handler]; "
+        "assert logger.level == logging.DEBUG; "
+        "assert logger.propagate is True; "
+        "assert handler.level == logging.WARNING; "
+        "assert handler.formatter is formatter"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", command],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_log_level_controls_debug_output() -> None:

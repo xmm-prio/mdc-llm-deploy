@@ -25,6 +25,20 @@ class _PackageRichHandler(RichHandler):
 _OwnedHandler = _PackageStderrHandler | _PackageRichHandler
 
 
+def _partition_handlers(
+    logger: logging.Logger,
+) -> tuple[list[_OwnedHandler], list[logging.Handler]]:
+    """Separate package-owned handlers from host handlers."""
+    owned: list[_OwnedHandler] = []
+    external: list[logging.Handler] = []
+    for handler in logger.handlers:
+        if isinstance(handler, (_PackageStderrHandler, _PackageRichHandler)):
+            owned.append(handler)
+        else:
+            external.append(handler)
+    return owned, external
+
+
 def _new_handler(
     config: ObservabilityConfig,
     stream: TextIO,
@@ -54,12 +68,14 @@ def configure_package_logger(
 ) -> logging.Logger:
     """Configure one package-owned handler without touching the root logger."""
     logger = logging.getLogger(PACKAGE_LOGGER_NAME)
+    owned_handlers, external_handlers = _partition_handlers(logger)
+    if external_handlers:
+        for handler in owned_handlers:
+            logger.removeHandler(handler)
+            handler.close()
+        return logger
+
     selected_stream = sys.stderr if stream is None else stream
-    owned_handlers = [
-        handler
-        for handler in logger.handlers
-        if isinstance(handler, (_PackageStderrHandler, _PackageRichHandler))
-    ]
     expected_type = _PackageRichHandler if config.is_terminal else _PackageStderrHandler
     matching_handlers = [
         handler for handler in owned_handlers if isinstance(handler, expected_type)

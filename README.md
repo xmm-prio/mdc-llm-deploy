@@ -83,7 +83,7 @@ Qwen3 Dense/MoE 架构的正规化配置。
 
 模型加载、FX 导出、量化规划/校准/物化、decode 转换、ONNX 规范化和 ONNX 导出会在各自
 阶段输出日志、进度和阶段报告。三类输出默认全部开启，日志默认使用 `INFO` 级别；它们只写入
-标准错误流，不修改应用的 root logger，也不改变 API 返回值或异常类型。
+包自有的标准错误流，不修改应用的 root logger，也不改变 API 返回值或异常类型。
 
 可通过四个环境变量独立控制：
 
@@ -96,6 +96,10 @@ Qwen3 Dense/MoE 架构的正规化配置。
 前三个开关将 `0`、`false`、`no` 或 `off`（不区分大小写）视为关闭，其他值视为开启。设置
 `MDC_LLM_DEPLOY_LOG_LEVEL=DEBUG` 可查看节点、算子、量化 target 和常量折叠跳过原因等细节；
 日志和报告不会输出权重、token、凭据或完整私有路径。
+
+如果宿主在 `mdc_llm_deploy` logger 上安装 handler，日志路由由宿主接管。库会撤下包自有
+标准错误流 handler，并保留宿主设置的 logger level、propagate、handler level 和 formatter；
+`MDC_LLM_DEPLOY_LOGGING` 此时只控制包自有输出，不会静默宿主 sink。
 
 TTY 终端使用统一语义色：`DEBUG` 为灰色、`INFO` 为蓝色、`WARNING` 为黄色、`ERROR`
 为红色、`CRITICAL` 为粗体红色；阶段状态 `SUCCESS` 为绿色、`FAILED` 为红色，进度为青色。
@@ -116,7 +120,7 @@ $env:MDC_LLM_DEPLOY_REPORT = "0"
 .venv\Scripts\python.exe examples\export_model.py
 ```
 
-如需完全静默：
+如需关闭全部包自有输出：
 
 ```powershell
 $env:MDC_LLM_DEPLOY_LOGGING = "off"
