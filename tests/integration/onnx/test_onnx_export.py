@@ -419,6 +419,48 @@ def test_repeated_export_always_overwrites(tmp_path: Path) -> None:
     assert not any(path.name.startswith(".model") for path in tmp_path.iterdir())
 
 
+@pytest.mark.parametrize(
+    ("dtype", "onnx_dtype"),
+    [
+        pytest.param(torch.float16, onnx.TensorProto.FLOAT16, id="fp16"),
+        pytest.param(torch.float32, onnx.TensorProto.FLOAT, id="fp32"),
+    ],
+)
+@pytest.mark.parametrize("decode", [False, True], ids=["prefill", "decode"])
+def test_multilayer_rope_tables_are_direct_initializers(
+    tmp_path: Path,
+    dtype: torch.dtype,
+    onnx_dtype: int,
+    decode: bool,
+) -> None:
+    graph = export(
+        dense_model(4, layers=2).to(dtype=dtype),
+        {"input_ids": torch.arange(4).reshape(1, 4)},
+    )
+    if decode:
+        convert_to_decode(graph)
+
+    model = onnx_export(
+        graph,
+        tmp_path / f"rope-{dtype}-{decode}.onnx",
+        external_data=False,
+    )
+
+    initializers = {item.name: item for item in model.graph.initializer}
+    producers = {
+        output: node for node in model.graph.node for output in node.output
+    }
+    rope_nodes = [
+        node for node in model.graph.node if node.op_type == "ApplyRotaryPosEmb"
+    ]
+    assert len(rope_nodes) == 2
+    for node in rope_nodes:
+        for input_name in node.input[2:4]:
+            assert input_name in initializers
+            assert input_name not in producers
+            assert initializers[input_name].data_type == onnx_dtype
+
+
 def test_two_layer_onnx_contains_per_layer_custom_operators(
     tmp_path: Path,
 ) -> None:

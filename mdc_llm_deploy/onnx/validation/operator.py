@@ -14,6 +14,11 @@ from ..inspection import (
 )
 from .attention import validate_attention_operator
 
+_ROPE_DTYPES = {
+    int(TensorProto.FLOAT16),
+    int(TensorProto.FLOAT),
+}
+
 
 def validate_operator(
     node: onnx.NodeProto,
@@ -143,6 +148,71 @@ def validate_operator(
         raise OnnxExportError(
             f"No MDC ONNX validator for {node.op_type!r}"
         )
+
+
+def validate_rope_initializers(model: onnx.ModelProto) -> None:
+    """Validate final ApplyRotaryPosEmb initializer bindings and dtypes."""
+    initializers = {
+        item.name: item for item in model.graph.initializer
+    }
+    value_dtypes = {
+        item.name: int(item.type.tensor_type.elem_type)
+        for item in (
+            *model.graph.input,
+            *model.graph.value_info,
+            *model.graph.output,
+        )
+        if item.type.tensor_type.elem_type
+    }
+    value_dtypes.update(
+        {
+            name: int(initializer.data_type)
+            for name, initializer in initializers.items()
+        }
+    )
+
+    for node in model.graph.node:
+        if node.op_type != "ApplyRotaryPosEmb":
+            continue
+        node_name = node.name or "<unnamed>"
+        input_dtypes: dict[str, int] = {}
+        for index, role in enumerate(("query", "key")):
+            dtype = value_dtypes.get(node.input[index])
+            if dtype is None:
+                raise OnnxExportError(
+                    f"ApplyRotaryPosEmb node {node_name!r} {role} "
+                    "input dtype is unavailable"
+                )
+            if dtype not in _ROPE_DTYPES:
+                raise OnnxExportError(
+                    f"ApplyRotaryPosEmb node {node_name!r} {role} "
+                    "input dtype must be FLOAT16 or FLOAT"
+                )
+            input_dtypes[role] = dtype
+        if input_dtypes["key"] != input_dtypes["query"]:
+            raise OnnxExportError(
+                f"ApplyRotaryPosEmb node {node_name!r} key input "
+                "dtype must match query input"
+            )
+
+        for index, role in ((2, "cos"), (3, "sin")):
+            initializer = initializers.get(node.input[index])
+            if initializer is None:
+                raise OnnxExportError(
+                    f"ApplyRotaryPosEmb node {node_name!r} {role} "
+                    "input must directly reference an initializer"
+                )
+            dtype = int(initializer.data_type)
+            if dtype not in _ROPE_DTYPES:
+                raise OnnxExportError(
+                    f"ApplyRotaryPosEmb node {node_name!r} {role} "
+                    "initializer dtype must be FLOAT16 or FLOAT"
+                )
+            if dtype != input_dtypes["query"]:
+                raise OnnxExportError(
+                    f"ApplyRotaryPosEmb node {node_name!r} {role} "
+                    "initializer dtype must match query input"
+                )
 
 
 def validate_dequant_initializers(model: onnx.ModelProto) -> None:

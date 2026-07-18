@@ -11,6 +11,7 @@ from ...operators.contracts.attention import ATTENTION_INPUT_COUNT
 from ...operators.contracts.onnx import MDC_ONNX_DOMAIN, MDC_ONNX_OPSET
 from ...operators.contracts.schema import OPERATOR_SCHEMAS
 from .metadata import ValidatedMetadata, validate_metadata
+from .operator import validate_rope_initializers
 from .topology import (
     QuantizationTopologyEvidence,
     validate_quantization_topology,
@@ -102,6 +103,7 @@ def validate_mdc_model_structure(model: onnx.ModelProto) -> None:
         raise OnnxExportError("ONNX imports an unsupported operator domain")
     _validate_names(model)
     _validate_custom_nodes(model)
+    validate_rope_initializers(model)
     if not any(node.op_type in _CUSTOM_SCHEMAS for node in model.graph.node):
         validate_standard_model(model)
 

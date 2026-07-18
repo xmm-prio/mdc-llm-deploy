@@ -14,11 +14,14 @@ from torch.fx import GraphModule
 
 from ..errors import QuantizationConfigError
 from ..graph.metadata import QuantizedTarget
+from ..observability import get_logger
 from .algorithms.gptq import GptqFallbackError, gptq_weight_quantize
 from .algorithms.math import quantize
 from .calibration import CalibrationArtifacts
 from .config import ActivationSpec
 from .planning import QuantizedTensor, TargetPlan
+
+_LOGGER = get_logger("quantization.materialization")
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +160,11 @@ def _materialize_weight(
                 axis=axis,
             )
             fallback_reason = error.reason
+            _LOGGER.debug(
+                "GPTQ fallback selected: fqn=%s reason=%s",
+                target.fqn,
+                fallback_reason,
+            )
     else:
         result = quantize(
             parameter,
@@ -358,6 +366,14 @@ def materialize_target(
             int(item) for item in zero_point.reshape(-1).cpu()
         ),
         fallback_reason=fallback_reason,
+    )
+    _LOGGER.debug(
+        "Materialized quantization target: fqn=%s type=%s algorithm=%s "
+        "fallback=%s",
+        target.fqn,
+        target.target_type,
+        target.algorithm,
+        fallback_reason is not None,
     )
     return MaterializationResult(
         target=materialized,

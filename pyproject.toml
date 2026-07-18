@@ -18,6 +18,7 @@ dependencies = [
   "numpy>=2.0",
   "onnx>=1.17",
   "onnxscript>=0.2",
+  "rich>=14.0",
   "safetensors>=0.5",
   "torch>=2.8",
   "transformers>=4.57.0",

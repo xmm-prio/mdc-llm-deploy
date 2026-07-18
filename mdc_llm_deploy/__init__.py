@@ -13,6 +13,8 @@ from .errors import (
     QuantizationConfigError,
     UnsupportedPatternError,
 )
+from .observability.config import ObservabilityConfig as _ObservabilityConfig
+from .observability.logging import configure_package_logger as _configure_package_logger
 from .quantization.config import QuantizationConfig
 
 if TYPE_CHECKING:
@@ -29,6 +31,8 @@ if TYPE_CHECKING:
     from .quantization import oneshot
 
 __version__ = "0.1.0"
+
+_configure_package_logger(_ObservabilityConfig.from_env(stream=sys.stderr))
 
 __all__ = [
     "AutoExportModel",

@@ -11,11 +11,13 @@ from torch.fx import GraphModule
 
 from ...errors import OnnxExportError
 from ...graph.metadata import GraphMetadata
+from ...observability import StageReporter, get_logger
 from ...operators.contracts.schema import OPERATOR_SCHEMAS
 from ..validation.model import (
     validate_mdc_model_structure,
     validate_standard_model,
 )
+from .constant_folding import fold_constant_subgraphs
 from .linear_binding import canonicalize_linear_initializers
 
 _FLOAT_ONNX_DTYPES: set[int] = {
@@ -331,22 +333,54 @@ def normalize_standard_onnx(
     metadata: GraphMetadata,
 ) -> onnx.ModelProto:
     """Normalize and validate a materialized legacy ONNX model."""
-    _fold_linear_weight_transposes(model)
-    canonicalize_linear_initializers(model, graph)
-    _fold_rms_norm_initializers(model, metadata)
-    custom_names = {schema.onnx_name for schema in OPERATOR_SCHEMAS.values()}
-    contains_custom = any(
-        node.op_type in custom_names for node in model.graph.node
-    )
-    if contains_custom:
-        _seed_custom_value_info(model)
-    model = shape_inference.infer_shapes(
-        model,
-        strict_mode=not contains_custom,
-        data_prop=True,
-    )
-    if contains_custom:
-        validate_mdc_model_structure(model)
-    else:
-        validate_standard_model(model)
-    return model
+    with StageReporter(
+        "ONNX normalization",
+        fields={
+            "model_kind": metadata.model_kind,
+            "graph_stage": metadata.stage.value,
+        },
+    ) as reporter:
+        _fold_linear_weight_transposes(model)
+        canonicalize_linear_initializers(model, graph)
+        _fold_rms_norm_initializers(model, metadata)
+        folding = fold_constant_subgraphs(model)
+        reporter.update(
+            folded_nodes=folding.folded_nodes,
+            skipped_nodes=folding.skipped_nodes,
+            materialized_initializers=folding.materialized_initializers,
+            materialized_bytes=folding.materialized_bytes,
+        )
+        logger = get_logger("onnx.normalization")
+        logger.info(
+            "Constant folding completed: folded=%d skipped=%d materialized_bytes=%d",
+            folding.folded_nodes,
+            folding.skipped_nodes,
+            folding.materialized_bytes,
+        )
+        for reason, count in folding.skipped_by_reason:
+            logger.debug(
+                "Constant folding skipped nodes: reason=%s count=%d",
+                reason,
+                count,
+            )
+
+        custom_names = {schema.onnx_name for schema in OPERATOR_SCHEMAS.values()}
+        contains_custom = any(
+            node.op_type in custom_names for node in model.graph.node
+        )
+        if contains_custom:
+            _seed_custom_value_info(model)
+        model = shape_inference.infer_shapes(
+            model,
+            strict_mode=not contains_custom,
+            data_prop=True,
+        )
+        if contains_custom:
+            validate_mdc_model_structure(model)
+        else:
+            validate_standard_model(model)
+        reporter.update(
+            node_count=len(model.graph.node),
+            initializer_count=len(model.graph.initializer),
+        )
+        return model

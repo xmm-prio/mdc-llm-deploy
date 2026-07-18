@@ -18,6 +18,7 @@ from mdc_llm_deploy.graph.lifecycle import (
     GraphStage,
     TensorAbi,
 )
+from mdc_llm_deploy.onnx.export.constant_folding import ConstantFoldingStats
 from mdc_llm_deploy.onnx.export.normalization import (
     _fold_linear_weight_transposes,
     _fold_rms_norm_initializers,
@@ -418,3 +419,119 @@ def test_normalize_standard_branch_uses_standard_validation(
     normalize_standard_onnx(_linear_model(), _linear_graph(), _metadata())
 
     assert calls == ["standard"]
+
+
+def test_normalization_orders_specialized_folds_before_generic_folding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    report_updates: list[dict[str, object]] = []
+    model = _linear_model()
+    stats = ConstantFoldingStats(
+        folded_nodes=3,
+        materialized_initializers=3,
+        materialized_bytes=24,
+        skipped_nodes=1,
+        skipped_by_reason=(("rank_limit", 1),),
+    )
+
+    class Reporter:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        def __enter__(self) -> Reporter:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def update(self, **fields: object) -> None:
+            report_updates.append(fields)
+
+    def record(name: str) -> None:
+        calls.append(name)
+
+    monkeypatch.setattr(normalization_module, "StageReporter", Reporter)
+    monkeypatch.setattr(
+        normalization_module,
+        "_fold_linear_weight_transposes",
+        lambda value: record("linear"),
+    )
+    monkeypatch.setattr(
+        normalization_module,
+        "canonicalize_linear_initializers",
+        lambda value, graph: record("canonicalize"),
+    )
+    monkeypatch.setattr(
+        normalization_module,
+        "_fold_rms_norm_initializers",
+        lambda value, metadata: record("rms"),
+    )
+    monkeypatch.setattr(
+        normalization_module,
+        "fold_constant_subgraphs",
+        lambda value: (record("constant"), stats)[1],
+    )
+
+    def infer_shapes(value: onnx.ModelProto, **kwargs: object) -> onnx.ModelProto:
+        del kwargs
+        record("shape")
+        return value
+
+    monkeypatch.setattr(normalization_module.shape_inference, "infer_shapes", infer_shapes)
+    monkeypatch.setattr(
+        normalization_module,
+        "validate_standard_model",
+        lambda value: record("validate"),
+    )
+
+    normalize_standard_onnx(model, _linear_graph(), _metadata())
+
+    assert calls == ["linear", "canonicalize", "rms", "constant", "shape", "validate"]
+    assert report_updates[0] == {
+        "folded_nodes": 3,
+        "skipped_nodes": 1,
+        "materialized_initializers": 3,
+        "materialized_bytes": 24,
+    }
+
+
+def test_normalization_folds_static_cast_and_preserves_dynamic_cast() -> None:
+    model = helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node(
+                    "Cast",
+                    ["table"],
+                    ["table_fp16"],
+                    name="static_cast",
+                    to=TensorProto.FLOAT16,
+                ),
+                helper.make_node(
+                    "Cast",
+                    ["x"],
+                    ["x_fp16"],
+                    name="dynamic_cast",
+                    to=TensorProto.FLOAT16,
+                ),
+                helper.make_node("Add", ["x_fp16", "table_fp16"], ["output"]),
+            ],
+            "cast_folding",
+            [helper.make_tensor_value_info("x", TensorProto.FLOAT, (2,))],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT16, (2,))],
+            initializer=[
+                numpy_helper.from_array(
+                    np.ones(2, dtype=np.float32),
+                    name="table",
+                )
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 18)],
+    )
+
+    result = normalize_standard_onnx(model, _linear_graph(0), _metadata())
+
+    initializers = {item.name: item for item in result.graph.initializer}
+    assert initializers["table_fp16"].data_type == TensorProto.FLOAT16
+    casts = [node for node in result.graph.node if node.op_type == "Cast"]
+    assert [node.name for node in casts] == ["dynamic_cast"]

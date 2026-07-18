@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sized
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
@@ -15,6 +15,7 @@ from ..errors import QuantizationConfigError
 from ..graph.fx.inspection import linear_weight_name
 from ..graph.fx.ownership import NodeOwnershipIndex
 from ..graph.lifecycle import metadata
+from ..observability import StageProgress, StageReporter, get_logger
 from .algorithms.math import _qparams_from_extrema
 from .config import ActivationSpec
 from .planning import CalibrationPlan, CalibrationRequirement
@@ -398,15 +399,12 @@ class _CalibrationInterpreter(Interpreter):
         return result
 
 
-def collect_calibration_artifacts(
+def _collect_calibration_artifacts(
     graph: GraphModule,
     dataloader: Iterable[Mapping[str, Tensor]],
     plan: CalibrationPlan,
-) -> CalibrationArtifacts:
-    """Validate batches and collect planned calibration artifacts."""
-    if not plan.requires_collection:
-        return CalibrationArtifacts.empty()
-
+    progress: StageProgress,
+) -> tuple[CalibrationArtifacts, int]:
     graph_metadata = metadata(graph)
     expected = tuple(item.name for item in graph_metadata.input_abi)
     expected_abi = {
@@ -483,6 +481,7 @@ def collect_calibration_artifacts(
         for node, value in recorder.samples.items():
             accumulators[node].observe(value)
         observed += 1
+        progress.advance()
     if observed == 0:
         raise QuantizationConfigError(
             "Calibration dataloader must yield at least one batch"
@@ -490,7 +489,7 @@ def collect_calibration_artifacts(
     if boundaries is None or accumulators is None:
         raise RuntimeError("Calibration boundaries were not captured")
     try:
-        return _finalize_artifacts(boundaries, accumulators, plan)
+        return _finalize_artifacts(boundaries, accumulators, plan), observed
     except QuantizationConfigError:
         raise
     except ValueError:
@@ -499,3 +498,53 @@ def collect_calibration_artifacts(
         raise QuantizationConfigError(
             f"Calibration artifact finalization failed: {error}"
         ) from error
+
+
+def _batch_total(
+    dataloader: Iterable[Mapping[str, Tensor]],
+) -> int | None:
+    """Read a declared length without probing or consuming iterable values."""
+    if not isinstance(dataloader, Sized):
+        return None
+    try:
+        return len(dataloader)
+    except Exception:
+        return None
+
+
+def collect_calibration_artifacts(
+    graph: GraphModule,
+    dataloader: Iterable[Mapping[str, Tensor]],
+    plan: CalibrationPlan,
+) -> CalibrationArtifacts:
+    """Validate batches and collect planned calibration artifacts."""
+    logger = get_logger("quantization.calibration")
+    with StageReporter("Quantization calibration") as reporter:
+        boundary_count = len(plan.requirements)
+        reporter.update(calibration_boundary_count=boundary_count)
+        if not plan.requires_collection:
+            logger.info("Quantization calibration skipped: no required artifacts")
+            reporter.update(outcome="skipped", batch_count=0)
+            return CalibrationArtifacts.empty()
+        for fqn, requirement in plan.requirements.items():
+            logger.debug(
+                "Planned calibration boundary: fqn=%s activation_specs=%d "
+                "full_samples=%s",
+                fqn,
+                len(requirement.activation_specs),
+                requirement.full_samples,
+            )
+        total = _batch_total(dataloader)
+        reporter.update(batch_total="unknown" if total is None else total)
+        with reporter.progress(
+            "Collecting calibration batches",
+            total=total,
+        ) as progress:
+            artifacts, observed = _collect_calibration_artifacts(
+                graph,
+                dataloader,
+                plan,
+                progress,
+            )
+        reporter.update(outcome="completed", batch_count=observed)
+        return artifacts

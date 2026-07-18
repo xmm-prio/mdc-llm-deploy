@@ -3,7 +3,7 @@
 面向 MDC 的 Qwen3/Qwen3-MoE 静态图捕获、量化和 ONNX 导出库。模型参数命名兼容
 Transformers checkpoint，但模型实现不继承 Transformers 官方模型。
 
-[安装](#安装) · [API](#api) · [示例](#示例) · [配置文件](#配置文件)
+[安装](#安装) · [API](#api) · [可观测性](#可观测性) · [示例](#示例) · [配置文件](#配置文件)
 
 ## 安装
 
@@ -76,6 +76,47 @@ Qwen3 Dense/MoE 架构的正规化配置。
 - `UnsupportedPatternError`：模型或图模式不受支持。
 - `QuantizationConfigError`：量化配置无效。
 - `OnnxExportError`：ONNX lowering、校验或写入失败。
+
+
+
+## 可观测性
+
+模型加载、FX 导出、量化规划/校准/物化、decode 转换、ONNX 规范化和 ONNX 导出会在各自
+阶段输出日志、进度和阶段报告。三类输出默认全部开启，日志默认使用 `INFO` 级别；它们只写入
+标准错误流，不修改应用的 root logger，也不改变 API 返回值或异常类型。
+
+可通过四个环境变量独立控制：
+
+- `MDC_LLM_DEPLOY_LOGGING`：控制英文日志，默认开启。
+- `MDC_LLM_DEPLOY_LOG_LEVEL`：日志级别，可选 `CRITICAL`、`ERROR`、`WARNING`、`INFO`、
+  `DEBUG`，默认 `INFO`；无效值回退到 `INFO`。
+- `MDC_LLM_DEPLOY_PROGRESS`：控制动态进度，默认开启。
+- `MDC_LLM_DEPLOY_REPORT`：控制阶段结束后的静态表格，默认开启。
+
+前三个开关将 `0`、`false`、`no` 或 `off`（不区分大小写）视为关闭，其他值视为开启。设置
+`MDC_LLM_DEPLOY_LOG_LEVEL=DEBUG` 可查看节点、算子、量化 target 和常量折叠跳过原因等细节；
+日志和报告不会输出权重、token、凭据或完整私有路径。
+
+非 TTY 环境（如 CI 或重定向输出）仍保留英文日志和无颜色静态阶段表，但自动抑制动态进度
+刷新，不输出 ANSI 控制符或回车刷新字符。
+
+PowerShell 中可仅开启 DEBUG 日志并关闭进度和报告：
+
+```powershell
+$env:MDC_LLM_DEPLOY_LOGGING = "1"
+$env:MDC_LLM_DEPLOY_LOG_LEVEL = "DEBUG"
+$env:MDC_LLM_DEPLOY_PROGRESS = "0"
+$env:MDC_LLM_DEPLOY_REPORT = "0"
+.venv\Scripts\python.exe examples\export_model.py
+```
+
+如需完全静默：
+
+```powershell
+$env:MDC_LLM_DEPLOY_LOGGING = "off"
+$env:MDC_LLM_DEPLOY_PROGRESS = "off"
+$env:MDC_LLM_DEPLOY_REPORT = "off"
+```
 
 
 

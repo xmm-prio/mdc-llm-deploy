@@ -16,7 +16,11 @@ from ..graph.lifecycle import (
     infer_model_kind,
     set_metadata,
 )
+from ..graph.lifecycle import (
+    metadata as graph_metadata,
+)
 from ..graph.metadata import GRAPH_SCHEMA_VERSION, GraphMetadata, GraphStage
+from ..observability import StageReporter, get_logger
 from ..operators.contracts.schema import TORCH_NAMESPACE
 from ..placement import (
     PlacementSnapshot,
@@ -25,6 +29,8 @@ from ..placement import (
 )
 from .decode import convert_to_decode as convert_to_decode
 from .discovery import discover_metadata
+
+_LOGGER = get_logger(__name__)
 
 
 def _validate_aten_graph(graph: GraphModule) -> None:
@@ -190,11 +196,10 @@ def _validate_explicit_device_transfers(
         )
 
 
-def export(
+def _export_graph(
     model: nn.Module,
     example_inputs: Mapping[str, Tensor],
 ) -> GraphModule:
-    """Export an eval-mode model to a static, functional ATen FX graph."""
     if not isinstance(model, nn.Module):
         raise TypeError("model must be torch.nn.Module")
     if model.training:
@@ -225,6 +230,7 @@ def export(
     _validate_explicit_device_transfers(graph, placement)
     _validate_aten_graph(graph)
     model_kind = _model_kind(model)
+    _LOGGER.info("FX model kind selected: %s", model_kind)
     object.__setattr__(
         graph,
         "_mdc_model_kind",
@@ -245,3 +251,36 @@ def export(
     )
     set_metadata(graph, value)
     return graph
+
+
+def export(
+    model: nn.Module,
+    example_inputs: Mapping[str, Tensor],
+) -> GraphModule:
+    """Export an eval-mode model to a static, functional ATen FX graph."""
+    with StageReporter(
+        "FX export",
+        fields={"model_type": type(model).__name__},
+    ) as reporter:
+        _LOGGER.debug("Capturing static functional ATen graph")
+        with reporter.progress("Exporting FX graph", total=1) as progress:
+            graph = _export_graph(model, example_inputs)
+            progress.advance()
+        value = graph_metadata(graph)
+        reporter.update(
+            model_kind=value.model_kind,
+            input_abi_count=len(value.input_abi),
+            output_abi_count=len(value.output_abi),
+        )
+        if (
+            reporter.config.logging_enabled
+            or reporter.config.report_enabled
+            or reporter.config.progress_enabled
+        ):
+            reporter.update(node_count=sum(1 for _ in graph.graph.nodes))
+        _LOGGER.debug(
+            "FX graph validated: inputs=%d outputs=%d",
+            len(value.input_abi),
+            len(value.output_abi),
+        )
+        return graph

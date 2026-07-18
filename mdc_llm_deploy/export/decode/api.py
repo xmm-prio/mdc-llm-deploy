@@ -12,6 +12,7 @@ from ...graph.lifecycle import (
     set_metadata,
     transactional_update,
 )
+from ...observability import StageReporter, get_logger
 from .cache import (
     cache_target as _cache_target,
 )
@@ -35,9 +36,10 @@ from .rewrite import (
     rewrite_static_shapes as _rewrite_static_shapes,
 )
 
+_LOGGER = get_logger(__name__)
 
-def convert_to_decode(graph: GraphModule) -> GraphModule:
-    """Atomically rewrite a static prefill ATen graph into one-token decode."""
+
+def _convert_to_decode(graph: GraphModule) -> GraphModule:
     current = metadata(graph)
     if not current.stage.is_prefill:
         raise GraphStateError("convert_to_decode requires a prefill graph")
@@ -137,3 +139,38 @@ def convert_to_decode(graph: GraphModule) -> GraphModule:
         )
 
     return transactional_update(graph, mutate)
+
+
+def convert_to_decode(graph: GraphModule) -> GraphModule:
+    """Atomically rewrite a static prefill ATen graph into one-token decode."""
+    with StageReporter("Decode conversion") as reporter:
+        current = metadata(graph)
+        _LOGGER.info("Converting %s graph to decode", current.model_kind)
+        _LOGGER.debug(
+            "Decode source: stage=%s sequence_length=%d boundaries=%d",
+            current.stage,
+            current.sequence_length,
+            len(current.boundaries),
+        )
+        with reporter.progress("Converting decode graph", total=1) as progress:
+            result = _convert_to_decode(graph)
+            progress.advance()
+        value = metadata(result)
+        reporter.update(
+            model_kind=value.model_kind,
+            input_abi_count=len(value.input_abi),
+            output_abi_count=len(value.output_abi),
+        )
+        if (
+            reporter.config.logging_enabled
+            or reporter.config.report_enabled
+            or reporter.config.progress_enabled
+        ):
+            reporter.update(
+                cache_count=sum(
+                    item.name.startswith("past.") for item in value.input_abi
+                ),
+                node_count=sum(1 for _ in result.graph.nodes),
+            )
+        _LOGGER.debug("Decode graph validation completed")
+        return result

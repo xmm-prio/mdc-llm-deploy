@@ -13,6 +13,7 @@ from ..errors import OnnxExportError
 from ..graph.fx.ownership import is_fqn_descendant
 from ..graph.lifecycle import metadata
 from ..graph.metadata import GraphMetadata
+from ..observability import StageReporter
 from ..operators.contracts.onnx import MDC_ONNX_OPSET
 from .export.artifacts import commit_mdc_onnx, commit_standard_onnx
 from .export.standard import build_standard_onnx
@@ -130,23 +131,36 @@ def onnx_export(
     external_data: bool = True,
 ) -> onnx.ModelProto:
     """Lower an FX graph and atomically replace requested ONNX artifacts."""
-    value = metadata(graph)
-    configured_mask = value.properties.get("mask_mode", "causal")
-    if configured_mask not in {"causal", "none"}:
-        raise OnnxExportError("Graph mask_mode metadata is invalid")
-    mask_mode: MaskMode = (
-        "masked" if configured_mask == "causal" else "maskless"
-    )
-    validate_mdc_onnx_compatibility(value, mask_mode)
-    target = _prepare_output_path(output_path)
-    standard = build_standard_onnx(graph, value, target.parent)
-    model = _lower(standard, value, mask_mode)
-    validate_mdc_model(model)
-    return commit_mdc_onnx(
-        model,
-        target,
-        external_data=external_data,
-    )
+    with StageReporter(
+        "MDC ONNX export",
+        fields={"external_data": external_data},
+    ) as reporter:
+        value = metadata(graph)
+        reporter.update(
+            model_kind=value.model_kind,
+            graph_stage=value.stage.value,
+        )
+        configured_mask = value.properties.get("mask_mode", "causal")
+        if configured_mask not in {"causal", "none"}:
+            raise OnnxExportError("Graph mask_mode metadata is invalid")
+        mask_mode: MaskMode = (
+            "masked" if configured_mask == "causal" else "maskless"
+        )
+        validate_mdc_onnx_compatibility(value, mask_mode)
+        target = _prepare_output_path(output_path)
+        standard = build_standard_onnx(graph, value, target.parent)
+        model = _lower(standard, value, mask_mode)
+        validate_mdc_model(model)
+        published = commit_mdc_onnx(
+            model,
+            target,
+            external_data=external_data,
+        )
+        reporter.update(
+            node_count=len(published.graph.node),
+            initializer_count=len(published.graph.initializer),
+        )
+        return published
 
 
 def standard_onnx_export(
@@ -156,12 +170,25 @@ def standard_onnx_export(
     external_data: bool = True,
 ) -> onnx.ModelProto:
     """Export and atomically publish a standard ONNX model."""
-    value = metadata(graph)
-    target = _prepare_output_path(output_path)
-    model = build_standard_onnx(graph, value, target.parent)
-    validate_standard_model(model)
-    return commit_standard_onnx(
-        model,
-        target,
-        external_data=external_data,
-    )
+    with StageReporter(
+        "Standard ONNX export",
+        fields={"external_data": external_data},
+    ) as reporter:
+        value = metadata(graph)
+        reporter.update(
+            model_kind=value.model_kind,
+            graph_stage=value.stage.value,
+        )
+        target = _prepare_output_path(output_path)
+        model = build_standard_onnx(graph, value, target.parent)
+        validate_standard_model(model)
+        published = commit_standard_onnx(
+            model,
+            target,
+            external_data=external_data,
+        )
+        reporter.update(
+            node_count=len(published.graph.node),
+            initializer_count=len(published.graph.initializer),
+        )
+        return published
