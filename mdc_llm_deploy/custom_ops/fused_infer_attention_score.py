@@ -188,7 +188,7 @@ def _validate_metadata(
 def _validate_optional_scope(optional: tuple[torch.Tensor | None, ...]) -> None:
     supported_indices = {1, 2, 3}
     unsupported = [
-        FusedInferAttentionScore.onnx_input_slots[index + 3]
+        FusedInferAttentionScore.torch_input_slots[index + 3]
         for index, value in enumerate(optional)
         if index not in supported_indices and value is not None
     ]
@@ -263,6 +263,18 @@ def _symbolic_dtype(value: Any, name: str) -> str:
     if dtype is None:
         raise RuntimeError(f"ONNX FusedInferAttentionScore requires known {name} dtype")
     return str(dtype)
+
+
+def _symbolic_shape(value: Any, name: str) -> tuple[int | None, ...]:
+    try:
+        sizes = value.type().sizes()
+    except (AttributeError, RuntimeError) as error:
+        raise RuntimeError(
+            f"ONNX FusedInferAttentionScore requires tensor metadata for {name}"
+        ) from error
+    if sizes is None:
+        raise RuntimeError(f"ONNX FusedInferAttentionScore requires known {name} shape")
+    return tuple(int(size) if size is not None else None for size in sizes)
 
 
 def _visibility(
@@ -499,7 +511,7 @@ def _get_triton_kernel() -> Any:
 
 
 class FusedInferAttentionScore(CustomOp):
-    """Implement supported Qwen3 attention and preserve full ONNX ABI."""
+    """Implement broad Torch attention and narrow MC62 decode ONNX lowering."""
 
     qualified_name = "mdc_llm_deploy::fused_infer_attention_score"
     schema = (
@@ -523,7 +535,7 @@ class FusedInferAttentionScore(CustomOp):
         "bool softmax_lse_flag=False, int key_antiquant_mode=0, "
         "int value_antiquant_mode=0, int query_quant_mode=0) -> (Tensor, Tensor)"
     )
-    onnx_input_slots: ClassVar[tuple[str, ...]] = (
+    torch_input_slots: ClassVar[tuple[str, ...]] = (
         "query",
         "key",
         "value",
@@ -554,21 +566,25 @@ class FusedInferAttentionScore(CustomOp):
         "dequant_scale_query",
         "learnable_sink",
     )
+    onnx_input_slots: ClassVar[tuple[str, ...]] = (
+        "query",
+        "key",
+        "value",
+        "pse_shift",
+        "atten_mask",
+        "actual_seq_lengths",
+        "actual_seq_lengths_kv",
+        "dequant_scale1",
+        "quant_scale1",
+        "dequant_scale2",
+        "quant_scale2",
+        "quant_offset2",
+    )
     onnx_attribute_defaults: ClassVar[dict[str, object]] = {
         "num_heads": 1,
         "scale": 1.0,
-        "pre_tokens": _MAX_TOKENS,
-        "next_tokens": _MAX_TOKENS,
-        "input_layout": "BSH",
+        "input_layout": "BNSD",
         "num_key_value_heads": 0,
-        "sparse_mode": 0,
-        "inner_precise": 0,
-        "block_size": 0,
-        "antiquant_mode": 0,
-        "softmax_lse_flag": False,
-        "key_antiquant_mode": 0,
-        "value_antiquant_mode": 0,
-        "query_quant_mode": 0,
     }
     _triton_kernel: ClassVar[Any | None] = None
 
@@ -1012,7 +1028,7 @@ class FusedInferAttentionScore(CustomOp):
         query_quant_mode: int,
     ) -> Any:
         if input_layout != "BNSD":
-            raise RuntimeError("ONNX FusedInferAttentionScore supports only BNSD layout")
+            raise RuntimeError("MC62 ONNX FusedInferAttentionScore supports only BNSD layout")
         _validate_attributes(
             num_heads=num_heads,
             scale=scale,
@@ -1029,8 +1045,8 @@ class FusedInferAttentionScore(CustomOp):
             query_quant_mode=query_quant_mode,
         )
         if softmax_lse_flag:
-            raise RuntimeError("ONNX FusedInferAttentionScore does not support softmax LSE")
-        inputs = (
+            raise RuntimeError("MC62 ONNX FusedInferAttentionScore does not support softmax LSE")
+        torch_inputs = (
             query,
             key,
             value,
@@ -1061,40 +1077,53 @@ class FusedInferAttentionScore(CustomOp):
             dequant_scale_query,
             learnable_sink,
         )
+        missing = [
+            FusedInferAttentionScore.torch_input_slots[index]
+            for index, tensor in enumerate(torch_inputs[:3])
+            if _symbolic_is_none(tensor)
+        ]
+        if missing:
+            raise RuntimeError(
+                f"MC62 ONNX FusedInferAttentionScore requires Q/K/V: {', '.join(missing)}"
+            )
         unsupported = [
-            FusedInferAttentionScore.onnx_input_slots[index]
-            for index, value in enumerate(inputs)
-            if index not in {0, 1, 2, 4, 5, 6} and not _symbolic_is_none(value)
+            FusedInferAttentionScore.torch_input_slots[index]
+            for index, tensor in enumerate(torch_inputs[3:], start=3)
+            if not _symbolic_is_none(tensor)
         ]
         if unsupported:
             raise RuntimeError(
-                f"Unsupported ONNX attention inputs: {', '.join(unsupported)}"
+                f"MC62 float decode ONNX does not support optional inputs: {', '.join(unsupported)}"
             )
         query_dtype = _symbolic_dtype(query, "query")
         key_dtype = _symbolic_dtype(key, "key")
         value_dtype = _symbolic_dtype(value, "value")
-        if query_dtype not in {"Half", "BFloat16", "Char"}:
+        if query_dtype not in {"Half", "BFloat16"}:
             raise RuntimeError(
-                "ONNX FusedInferAttentionScore supports only FLOAT16, BFLOAT16, and INT8 Q/K/V"
+                "MC62 float decode ONNX FusedInferAttentionScore supports only FLOAT16 and BFLOAT16 Q/K/V"
             )
         if key_dtype != query_dtype or value_dtype != query_dtype:
             raise RuntimeError("ONNX FusedInferAttentionScore Q/K/V dtypes must match")
-        return graph.op(
+        query_shape = _symbolic_shape(query, "query")
+        if len(query_shape) != 4:
+            raise RuntimeError("MC62 float decode ONNX requires rank-4 BNSD query")
+        if query_shape[2] != 1:
+            raise RuntimeError(
+                "MC62 float decode ONNX requires query sequence length S=1; "
+                "float prefill must use small ops or fully-int8 FIA"
+            )
+        attention_out = graph.op(
             "FusedInferAttentionScore",
-            *inputs,
+            query,
+            key,
+            value,
             num_heads_i=num_heads,
             scale_f=scale,
-            pre_tokens_i=pre_tokens,
-            next_tokens_i=next_tokens,
             input_layout_s=input_layout,
             num_key_value_heads_i=num_key_value_heads,
-            sparse_mode_i=sparse_mode,
-            inner_precise_i=inner_precise,
-            block_size_i=block_size,
-            antiquant_mode_i=antiquant_mode,
-            softmax_lse_flag_i=int(softmax_lse_flag),
-            key_antiquant_mode_i=key_antiquant_mode,
-            value_antiquant_mode_i=value_antiquant_mode,
-            query_quant_mode_i=query_quant_mode,
-            outputs=2,
         )
+        softmax_lse = graph.op(
+            "Constant",
+            value_t=torch.zeros(1, dtype=torch.float32),
+        )
+        return attention_out, softmax_lse

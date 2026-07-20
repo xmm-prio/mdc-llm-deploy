@@ -21,7 +21,7 @@ from tests.hardware.custom_ops.generate_cases import generate_all
 _EXPECTED_CUSTOM_ABIS = {
     "apply_rotary_pos_emb": ("ApplyRotaryPosEmb", 4),
     "rms_norm": ("NPURmsNorm", 2),
-    "fused_infer_attention_score": ("FusedInferAttentionScore", 29),
+    "fused_infer_attention_score": ("FusedInferAttentionScore", 3),
     "moe_expert_int8": ("MoeExpert", 6),
 }
 
@@ -102,7 +102,7 @@ def test_moe_expert_case_matches_real_mdc_types_shapes_and_empty_offset(
     assert golden.graph.output[0].type.tensor_type.elem_type == onnx.TensorProto.FLOAT16
 
 
-def test_attention_hardware_case_uses_fp16_qkv_with_head_dim_128(
+def test_attention_hardware_case_matches_mc62_float_decode_reference(
     generated_cases: Path,
 ) -> None:
     custom = onnx.load(
@@ -121,9 +121,20 @@ def test_attention_hardware_case_uses_fp16_qkv_with_head_dim_128(
     assert input_types["query"] == onnx.TensorProto.FLOAT16
     assert input_types["key"] == onnx.TensorProto.FLOAT16
     assert input_types["value"] == onnx.TensorProto.FLOAT16
-    assert input_shapes["query"] == (2, 4, 3, 128)
-    assert input_shapes["key"] == (2, 2, 5, 128)
-    assert input_shapes["value"] == (2, 2, 5, 128)
+    assert input_shapes["query"] == (1, 8, 1, 64)
+    assert input_shapes["key"] == (1, 8, 16, 64)
+    assert input_shapes["value"] == (1, 8, 16, 64)
+    node = next(
+        node for node in custom.graph.node if node.op_type == "FusedInferAttentionScore"
+    )
+    assert len(node.output) == 1
+    assert {attribute.name for attribute in node.attribute} == {
+        "num_heads",
+        "scale",
+        "input_layout",
+        "num_key_value_heads",
+    }
+    assert len(custom.graph.output) == 1
 
 
 def test_input_generation_is_deterministic(tmp_path: Path) -> None:

@@ -175,9 +175,9 @@ def test_fake_reports_layout_independent_output_metadata() -> None:
     assert lse.dtype == torch.float32
 
 
-def test_class_preserves_complete_onnx_contract() -> None:
-    assert len(FusedInferAttentionScore.onnx_input_slots) == 29
-    assert FusedInferAttentionScore.onnx_input_slots[:7] == (
+def test_class_separates_complete_torch_schema_from_mc62_onnx_abi() -> None:
+    assert len(FusedInferAttentionScore.torch_input_slots) == 29
+    assert FusedInferAttentionScore.torch_input_slots[:7] == (
         "query",
         "key",
         "value",
@@ -186,21 +186,25 @@ def test_class_preserves_complete_onnx_contract() -> None:
         "actual_seq_lengths",
         "actual_seq_lengths_kv",
     )
+    assert FusedInferAttentionScore.onnx_input_slots == (
+        "query",
+        "key",
+        "value",
+        "pse_shift",
+        "atten_mask",
+        "actual_seq_lengths",
+        "actual_seq_lengths_kv",
+        "dequant_scale1",
+        "quant_scale1",
+        "dequant_scale2",
+        "quant_scale2",
+        "quant_offset2",
+    )
     assert set(FusedInferAttentionScore.onnx_attribute_defaults) == {
         "num_heads",
         "scale",
-        "pre_tokens",
-        "next_tokens",
         "input_layout",
         "num_key_value_heads",
-        "sparse_mode",
-        "inner_precise",
-        "block_size",
-        "antiquant_mode",
-        "softmax_lse_flag",
-        "key_antiquant_mode",
-        "value_antiquant_mode",
-        "query_quant_mode",
     }
 
 
@@ -274,16 +278,20 @@ def test_onnx_rejects_unsupported_optional_slots() -> None:
 
 
 class _SymbolicType:
-    def __init__(self, dtype: str) -> None:
+    def __init__(self, dtype: str, shape: tuple[int | None, ...] = (1, 4, 1, 8)) -> None:
         self._dtype = dtype
+        self._shape = shape
 
     def scalarType(self) -> str:  # noqa: N802
         return self._dtype
 
+    def sizes(self) -> tuple[int | None, ...]:
+        return self._shape
+
 
 class _SymbolicValue:
-    def __init__(self, dtype: str) -> None:
-        self._type = _SymbolicType(dtype)
+    def __init__(self, dtype: str, shape: tuple[int | None, ...] = (1, 4, 1, 8)) -> None:
+        self._type = _SymbolicType(dtype, shape)
 
     def type(self) -> _SymbolicType:
         return self._type
@@ -297,7 +305,7 @@ def test_onnx_rejects_float32_qkv_but_torch_keeps_support() -> None:
         *([None] * 26),
     ]
 
-    with pytest.raises(RuntimeError, match="only FLOAT16, BFLOAT16, and INT8"):
+    with pytest.raises(RuntimeError, match="only FLOAT16 and BFLOAT16"):
         FusedInferAttentionScore.onnx.__wrapped__(
             object(),
             *arguments,
@@ -322,3 +330,66 @@ def test_onnx_rejects_float32_qkv_but_torch_keeps_support() -> None:
         tensor, tensor, tensor, num_heads=1, input_layout="BNSD"
     )
     assert output.dtype == torch.float32
+
+
+@pytest.mark.parametrize("query_sequence", [3, None])
+def test_onnx_rejects_float_prefill_or_dynamic_sequence(
+    query_sequence: int | None,
+) -> None:
+    arguments: list[object | None] = [
+        _SymbolicValue("Half", (1, 8, query_sequence, 64)),
+        _SymbolicValue("Half", (1, 8, 16, 64)),
+        _SymbolicValue("Half", (1, 8, 16, 64)),
+        *([None] * 26),
+    ]
+
+    with pytest.raises(RuntimeError, match="requires query sequence length S=1"):
+        FusedInferAttentionScore.onnx.__wrapped__(
+            object(),
+            *arguments,
+            8,
+            0.125,
+            2_147_483_647,
+            2_147_483_647,
+            "BNSD",
+            8,
+            0,
+            0,
+            0,
+            0,
+            False,
+            0,
+            0,
+            0,
+        )
+
+
+def test_onnx_rejects_mask_even_when_torch_supports_it() -> None:
+    arguments: list[object | None] = [
+        _SymbolicValue("Half"),
+        _SymbolicValue("Half"),
+        _SymbolicValue("Half"),
+        None,
+        object(),
+        *([None] * 24),
+    ]
+
+    with pytest.raises(RuntimeError, match="optional inputs: atten_mask"):
+        FusedInferAttentionScore.onnx.__wrapped__(
+            object(),
+            *arguments,
+            4,
+            0.5,
+            2_147_483_647,
+            2_147_483_647,
+            "BNSD",
+            4,
+            0,
+            0,
+            0,
+            0,
+            False,
+            0,
+            0,
+            0,
+        )

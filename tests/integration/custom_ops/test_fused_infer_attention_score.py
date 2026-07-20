@@ -34,6 +34,26 @@ class _AttentionModule(torch.nn.Module):
         )
 
 
+class _MaskedAttentionModule(_AttentionModule):
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        atten_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._operator(
+            query,
+            key,
+            value,
+            atten_mask=atten_mask,
+            num_heads=4,
+            scale=0.5,
+            input_layout="BNSD",
+            num_key_value_heads=2,
+        )
+
+
 @pytest.mark.integration
 def test_registered_operator_runs_through_torch_compile() -> None:
     module = _AttentionModule()
@@ -65,11 +85,11 @@ def test_registered_operator_runs_through_torch_export() -> None:
 
 
 @pytest.mark.integration
-def test_legacy_onnx_export_preserves_29_slots_and_all_attributes(
+def test_legacy_onnx_export_emits_mc62_decode_abi(
     tmp_path: Path,
 ) -> None:
     module = _AttentionModule()
-    query = torch.randn(1, 4, 2, 4, dtype=torch.float16)
+    query = torch.randn(1, 4, 1, 4, dtype=torch.float16)
     key = torch.randn(1, 2, 3, 4, dtype=torch.float16)
     value = torch.randn(1, 2, 3, 4, dtype=torch.float16)
     output_path = tmp_path / "attention.onnx"
@@ -89,12 +109,55 @@ def test_legacy_onnx_export_preserves_29_slots_and_all_attributes(
     assert len(nodes) == 1
     node = nodes[0]
     assert node.domain == ""
-    assert len(node.input) == 29
-    assert node.input[:3] == ["query", "key", "value"]
-    assert list(node.input[3:]) == [""] * 26
+    assert list(node.input) == ["query", "key", "value"]
+    assert len(node.output) == 1
     assert {attribute.name for attribute in node.attribute} == set(
         FusedInferAttentionScore.onnx_attribute_defaults
     )
+    lse_output = model.graph.output[1].name
+    assert any(
+        producer.op_type == "Constant" and lse_output in producer.output
+        for producer in model.graph.node
+    )
+
+
+@pytest.mark.integration
+def test_legacy_onnx_export_rejects_float_prefill(tmp_path: Path) -> None:
+    module = _AttentionModule()
+    inputs = (
+        torch.randn(1, 4, 3, 4, dtype=torch.float16),
+        torch.randn(1, 2, 16, 4, dtype=torch.float16),
+        torch.randn(1, 2, 16, 4, dtype=torch.float16),
+    )
+
+    with pytest.raises(RuntimeError, match="query sequence length S=1"):
+        torch.onnx.export(
+            module,
+            inputs,
+            tmp_path / "prefill.onnx",
+            opset_version=18,
+            dynamo=False,
+        )
+
+
+@pytest.mark.integration
+def test_legacy_onnx_export_rejects_optional_mask(tmp_path: Path) -> None:
+    module = _MaskedAttentionModule()
+    inputs = (
+        torch.randn(1, 4, 1, 4, dtype=torch.float16),
+        torch.randn(1, 2, 16, 4, dtype=torch.float16),
+        torch.randn(1, 2, 16, 4, dtype=torch.float16),
+        torch.zeros(1, 1, 1, 16, dtype=torch.bool),
+    )
+
+    with pytest.raises(RuntimeError, match="optional inputs: atten_mask"):
+        torch.onnx.export(
+            module,
+            inputs,
+            tmp_path / "masked.onnx",
+            opset_version=18,
+            dynamo=False,
+        )
 
 
 @pytest.mark.integration
