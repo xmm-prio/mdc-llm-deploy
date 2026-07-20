@@ -60,6 +60,6 @@ key_rope_antiquant_scale, dequant_scale_query, learnable_sink
 
 ## B 端确定性用例
 
-`tests.hardware.custom_ops.fused_infer_attention_score` 生成 FP16 BNSD GQA、
-广播 mask、batch 有效长度用例，同时包含标准 ONNX、MDC ONNX、输入 bin 和
-manifest。
+`tests.hardware.custom_ops.fused_infer_attention_score` 生成 head dim 128 的
+FP16 BNSD GQA、广播 mask、batch 有效长度用例，同时包含标准 ONNX、MDC ONNX、
+输入 bin 和 manifest。

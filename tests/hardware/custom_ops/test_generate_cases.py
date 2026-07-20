@@ -102,17 +102,28 @@ def test_moe_expert_case_matches_real_mdc_types_shapes_and_empty_offset(
     assert golden.graph.output[0].type.tensor_type.elem_type == onnx.TensorProto.FLOAT16
 
 
-def test_attention_hardware_case_uses_fp16_qkv(generated_cases: Path) -> None:
+def test_attention_hardware_case_uses_fp16_qkv_with_head_dim_128(
+    generated_cases: Path,
+) -> None:
     custom = onnx.load(
         generated_cases / "fused_infer_attention_score" / "custom.onnx"
     )
     input_types = {
         value.name: value.type.tensor_type.elem_type for value in custom.graph.input
     }
+    input_shapes = {
+        value.name: tuple(
+            dimension.dim_value for dimension in value.type.tensor_type.shape.dim
+        )
+        for value in custom.graph.input
+    }
 
     assert input_types["query"] == onnx.TensorProto.FLOAT16
     assert input_types["key"] == onnx.TensorProto.FLOAT16
     assert input_types["value"] == onnx.TensorProto.FLOAT16
+    assert input_shapes["query"] == (2, 4, 3, 128)
+    assert input_shapes["key"] == (2, 2, 5, 128)
+    assert input_shapes["value"] == (2, 2, 5, 128)
 
 
 def test_input_generation_is_deterministic(tmp_path: Path) -> None:

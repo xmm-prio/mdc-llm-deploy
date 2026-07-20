@@ -81,20 +81,23 @@ def case_definition() -> CaseDefinition:
         custom_model=_CustomModel(),
         inputs={
             "query": torch.randn(
-                2, 4, 3, 8, generator=generator, dtype=torch.float16
+                2, 4, 3, 128, generator=generator, dtype=torch.float16
             ),
             "key": torch.randn(
-                2, 2, 5, 8, generator=generator, dtype=torch.float16
+                2, 2, 5, 128, generator=generator, dtype=torch.float16
             ),
             "value": torch.randn(
-                2, 2, 5, 8, generator=generator, dtype=torch.float16
+                2, 2, 5, 128, generator=generator, dtype=torch.float16
             ),
             "atten_mask": mask,
             "actual_seq_lengths": torch.tensor([3, 2], dtype=torch.int64),
             "actual_seq_lengths_kv": torch.tensor([5, 4], dtype=torch.int64),
         },
         output_names=("attention_out", "softmax_lse"),
-        description="BNSD FP16 GQA、广播 mask、有效序列长度的确定性 Attention 用例。",
+        description=(
+            "BNSD FP16 GQA、head dim 128、广播 mask、有效序列长度的确定性 "
+            "Attention 用例。"
+        ),
     )
 
 
