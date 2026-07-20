@@ -1,60 +1,41 @@
 # ApplyRotaryPosEmb
 
-## 名称
+源码：`mdc_llm_deploy/custom_ops/apply_rotary_pos_emb.py`。
 
-- ONNX OP：`ApplyRotaryPosEmb`
-- ONNX domain/opset：`ai.onnx::<opset>::ApplyRotaryPosEmb`
+## Torch CPU/CUDA 支持范围
 
-## 源码映射
+- 输入顺序：`query, key, cos, sin, layout=1, rotary_mode="half"`；输出为
+  `query_out, key_out`。
+- 支持 `FLOAT16`、`BFLOAT16`、`FLOAT32`，四个输入 dtype、设备必须一致。
+- 布局：`1=BSND`、`2=SBND`、`3=BNSD`、`4=TND`；前三种要求 rank 4，
+  TND 要求 rank 3。
+- `query` 与 `key` 仅允许 head 数不同，head dim 必须相同。`cos/sin` shape
+  相同，head 轴必须为 1，其他非末维可取 1 或对应 token 维。
+- 旋转维 `R=cos.shape[-1]` 满足 `0 < R <= D`。`half`、`interleave` 要求
+  `R` 被 2 整除；`quarter` 要求被 4 整除。`R < D` 时尾部原样保留。
+- CPU 使用 FP32 中间计算后转回输入 dtype。CUDA 使用 Triton，不回退到
+  PyTorch；CUDA 额外要求四个输入连续，且环境安装 Triton。
 
-- Python reference：`mdc_llm_deploy.operators.apply_rotary_pos_emb`
-- 集中 schema 键：`OPERATOR_SCHEMAS["ApplyRotaryPosEmb"]`
-- 源码函数使用 snake_case，ONNX `op_type` 使用上方固定名称。
+Torch 会拒绝非法 layout/mode、rank、广播、dtype、设备、旋转维，以及含
+NaN/Inf 的输入。算子仅用于推理，不支持 autograd。
 
-## ONNX OP 原型
+## ONNX ABI 与导出收窄
+
+默认 `ai.onnx` 域、opset 18：
 
 ```text
 ApplyRotaryPosEmb(
-    query: Tensor,
-    key: Tensor,
-    cos: Tensor,
-    sin: Tensor,
-    layout: int = 1,
-    rotary_mode: string = "half"
-) -> (
-    query_out: Tensor,
-    key_out: Tensor
-)
+    query, key, cos, sin,
+    layout: INT = 1,
+    rotary_mode: STRING = "half"
+) -> (query_out, key_out)
 ```
 
-## 输入
+节点固定有 4 个输入、2 个输出，属性名为 `layout`、`rotary_mode`。导出仅检查
+`layout ∈ {1,2,3,4}` 和三种 mode；具体 dtype/shape 边界由 Torch 前向及板端
+编译共同约束。属性不在上述集合时导出直接报错。
 
-| 名称 | 必选 | 支持类型 | 格式 | Shape | 说明 |
-| --- | --- | --- | --- | --- | --- |
-| `query` | 是 | `BFLOAT16`、`FLOAT16`、`FLOAT32` | `ND` | BSND 时为 `(B,S,Nq,D)`；TND 时为 `(T,Nq,D)` | Attention 的 Query；对最后一维应用旋转位置编码 |
-| `key` | 是 | `BFLOAT16`、`FLOAT16`、`FLOAT32` | `ND` | BSND 时为 `(B,S,Nk,D)`；TND 时为 `(T,Nk,D)` | Attention 的 Key；与 `query` 使用相同位置编码 |
-| `cos` | 是 | `BFLOAT16`、`FLOAT16`、`FLOAT32` | `ND` | N 维为 1，并可在 B 维广播 | 各 token、各旋转维度的余弦系数 |
-| `sin` | 是 | `BFLOAT16`、`FLOAT16`、`FLOAT32` | `ND` | 与 `cos` 相同 | 各 token、各旋转维度的正弦系数 |
+## B 端确定性用例
 
-四个输入的数据类型必须一致。
-
-## 输出
-
-| 名称 | 支持类型 | 格式 | Shape | 说明 |
-| --- | --- | --- | --- | --- |
-| `query_out` | 与 `query` 相同 | `ND` | 与 `query` 相同 | 应用 RoPE 后的 Query |
-| `key_out` | 与 `key` 相同 | `ND` | 与 `key` 相同 | 应用 RoPE 后的 Key |
-
-## 属性
-
-| 名称 | ONNX 类型 | 默认值 | 支持值 | 说明 |
-| --- | --- | --- | --- | --- |
-| `layout` | `INT` | `1` | `1=BSND`、`2=SBND`、`3=BNSD`、`4=TND` | 指定 B、S/T、N、D 各维在输入中的排列方式 |
-| `rotary_mode` | `STRING` | `"half"` | `"half"`、`"interleave"`、`"quarter"` | 指定最后一维的分组旋转方式：前后半区、相邻元素交错或四分区旋转 |
-
-## 前置条件与错误
-
-- `query`、`key`、`cos`、`sin` 必须位于同一设备并具有相同 dtype。
-- `query` 与 `key` 的 head dim 必须相同且为偶数；`cos`、`sin` 必须能按声明 layout 广播到 token 和旋转维。
-- 输入包含 NaN/Inf、layout 与 rank 不匹配或广播失败时必须显式报错。
-- 自定义算子不支持 autograd；反向传播必须抛出明确错误。
+`tests.hardware.custom_ops.apply_rotary_pos_emb` 生成 FLOAT32、BSND、half、
+GQA head 数用例，同时包含标准 ONNX、MDC ONNX、输入 bin 和 manifest。
