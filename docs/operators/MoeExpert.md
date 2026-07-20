@@ -39,13 +39,6 @@ down_proj(silu(gate_proj(x)) * up_proj(x))
 
 ## ONNX
 
-- GE/ONNX 名称：`MoeExpert`
+- ONNX OP：`MoeExpert`
 - opset：18
 - schema 真源：`mdc_llm_deploy.operators.contracts.schema.OPERATOR_SCHEMAS`
-- 浮点 FX 保留上述通用契约；量化 ONNX 在映射层适配当前 ATC ABI：
-  `x` 转为 INT8、`topk_ids` 转为 INT16、权重展平为一维。
-- ATC 量化 scale 顺序为一个输入激活 scale，随后按 expert 依次排列
-  `gate`、`up`、中间激活、`down`，总长度为 `1 + expert_count * 4`。
-
-ATC 支持范围以 B 端针对指定提交返回的工具版本、命令、退出码和决定性日志为准。
-验证结果只记录已实际执行的 dtype、expert 数和 top-k 组合。
