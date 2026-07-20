@@ -253,6 +253,18 @@ def _symbolic_is_none(value: Any) -> bool:
         return False
 
 
+def _symbolic_dtype(value: Any, name: str) -> str:
+    try:
+        dtype = value.type().scalarType()
+    except (AttributeError, RuntimeError) as error:
+        raise RuntimeError(
+            f"ONNX FusedInferAttentionScore requires tensor metadata for {name}"
+        ) from error
+    if dtype is None:
+        raise RuntimeError(f"ONNX FusedInferAttentionScore requires known {name} dtype")
+    return str(dtype)
+
+
 def _visibility(
     mask: torch.Tensor | None,
     query_lengths: torch.Tensor,
@@ -1058,6 +1070,15 @@ class FusedInferAttentionScore(CustomOp):
             raise RuntimeError(
                 f"Unsupported ONNX attention inputs: {', '.join(unsupported)}"
             )
+        query_dtype = _symbolic_dtype(query, "query")
+        key_dtype = _symbolic_dtype(key, "key")
+        value_dtype = _symbolic_dtype(value, "value")
+        if query_dtype not in {"Half", "BFloat16", "Char"}:
+            raise RuntimeError(
+                "ONNX FusedInferAttentionScore supports only FLOAT16, BFLOAT16, and INT8 Q/K/V"
+            )
+        if key_dtype != query_dtype or value_dtype != query_dtype:
+            raise RuntimeError("ONNX FusedInferAttentionScore Q/K/V dtypes must match")
         return graph.op(
             "FusedInferAttentionScore",
             *inputs,

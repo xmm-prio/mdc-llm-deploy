@@ -194,11 +194,82 @@ class _GraphRecorder:
         return object()
 
 
-def test_onnx_retains_optional_quantization_slots() -> None:
+class _SymbolicType:
+    def __init__(self, shape: tuple[int, ...], dtype: str) -> None:
+        self._shape = shape
+        self._dtype = dtype
+
+    def sizes(self) -> tuple[int, ...]:
+        return self._shape
+
+    def scalarType(self) -> str:  # noqa: N802
+        return self._dtype
+
+
+class _SymbolicValue:
+    def __init__(self, shape: tuple[int, ...], dtype: str) -> None:
+        self._type = _SymbolicType(shape, dtype)
+
+    def type(self) -> _SymbolicType:
+        return self._type
+
+
+def _mdc_symbolic_inputs(x_dtype: str = "Char") -> list[_SymbolicValue]:
+    return [
+        _SymbolicValue((1, 256), x_dtype),
+        _SymbolicValue((1, 2), "Short"),
+        _SymbolicValue((1, 2), "Half"),
+        _SymbolicValue((3 * 4 * 256, 256), "Char"),
+        _SymbolicValue((17,), "Float"),
+    ]
+
+
+def test_onnx_emits_real_mdc_six_slot_abi() -> None:
     graph = _GraphRecorder()
-    inputs = [object() for _ in range(4)]
+    inputs = _mdc_symbolic_inputs()
 
     output = MoeExpert.onnx(graph, *inputs)
 
     assert output is not None
-    assert graph.call == ("MoeExpert", (*inputs, None, None))
+    assert graph.call == ("MoeExpert", (*inputs, None))
+
+
+def test_onnx_rejects_floating_torch_contract() -> None:
+    graph = _GraphRecorder()
+
+    with pytest.raises(RuntimeError, match="x must be INT8"):
+        MoeExpert.onnx(graph, *_mdc_symbolic_inputs("Float"))
+
+
+def test_mdc_cpu_and_fake_use_fp16_output_contract() -> None:
+    x = torch.ones((1, 256), dtype=torch.int8)
+    ids = torch.tensor([[0]], dtype=torch.int16)
+    routing = torch.ones((1, 1), dtype=torch.float16)
+    weights = torch.ones((3 * 128, 256), dtype=torch.int8)
+    scales = torch.tensor([0.01, 0.02, 0.02, 0.001, 0.02], dtype=torch.float32)
+
+    output = MoeExpert.cpu(x, ids, routing, weights, scales)
+    meta_output = MoeExpert.fake(
+        x.to(device="meta"),
+        ids.to(device="meta"),
+        routing.to(device="meta"),
+        weights.to(device="meta"),
+        scales.to(device="meta"),
+    )
+
+    assert output.shape == (1, 256)
+    assert output.dtype == torch.float16
+    assert meta_output.shape == (1, 256)
+    assert meta_output.dtype == torch.float16
+
+
+def test_mdc_contract_rejects_quant_offsets() -> None:
+    with pytest.raises(ValueError, match="unsupported"):
+        MoeExpert.cpu(
+            torch.ones((1, 256), dtype=torch.int8),
+            torch.zeros((1, 1), dtype=torch.int16),
+            torch.ones((1, 1), dtype=torch.float16),
+            torch.ones((3 * 128, 256), dtype=torch.int8),
+            torch.ones(5, dtype=torch.float32),
+            torch.zeros(1, dtype=torch.int32),
+        )

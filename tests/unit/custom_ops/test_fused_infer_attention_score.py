@@ -271,3 +271,54 @@ def test_onnx_rejects_unsupported_optional_slots() -> None:
             0,
             0,
         )
+
+
+class _SymbolicType:
+    def __init__(self, dtype: str) -> None:
+        self._dtype = dtype
+
+    def scalarType(self) -> str:  # noqa: N802
+        return self._dtype
+
+
+class _SymbolicValue:
+    def __init__(self, dtype: str) -> None:
+        self._type = _SymbolicType(dtype)
+
+    def type(self) -> _SymbolicType:
+        return self._type
+
+
+def test_onnx_rejects_float32_qkv_but_torch_keeps_support() -> None:
+    arguments: list[object | None] = [
+        _SymbolicValue("Float"),
+        _SymbolicValue("Float"),
+        _SymbolicValue("Float"),
+        *([None] * 26),
+    ]
+
+    with pytest.raises(RuntimeError, match="only FLOAT16, BFLOAT16, and INT8"):
+        FusedInferAttentionScore.onnx.__wrapped__(
+            object(),
+            *arguments,
+            4,
+            0.5,
+            2_147_483_647,
+            2_147_483_647,
+            "BNSD",
+            2,
+            0,
+            0,
+            0,
+            0,
+            False,
+            0,
+            0,
+            0,
+        )
+
+    tensor = torch.ones(1, 1, 1, 4, dtype=torch.float32)
+    output, _ = FusedInferAttentionScore.cpu(
+        tensor, tensor, tensor, num_heads=1, input_layout="BNSD"
+    )
+    assert output.dtype == torch.float32

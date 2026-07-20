@@ -50,6 +50,7 @@ key_rope_antiquant_scale, dequant_scale_query, learnable_sink
 导出进一步收窄为：
 
 - 仅 `BNSD`；
+- Q/K/V dtype 仅允许 `FLOAT16`、`BFLOAT16`、`INT8`，且三者必须相同；
 - 仅 Q/K/V、mask、两个有效长度槽可非空；
 - `softmax_lse_flag` 必须为 false；
 - 窗口、稀疏、PagedAttention 和量化属性保持 Torch 默认值。
@@ -59,6 +60,6 @@ key_rope_antiquant_scale, dequant_scale_query, learnable_sink
 
 ## B 端确定性用例
 
-`tests.hardware.custom_ops.fused_infer_attention_score` 生成 FLOAT32 BNSD GQA、
+`tests.hardware.custom_ops.fused_infer_attention_score` 生成 FP16 BNSD GQA、
 广播 mask、batch 有效长度用例，同时包含标准 ONNX、MDC ONNX、输入 bin 和
 manifest。

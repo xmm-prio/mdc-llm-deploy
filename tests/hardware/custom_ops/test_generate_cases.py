@@ -22,7 +22,6 @@ _EXPECTED_CUSTOM_ABIS = {
     "apply_rotary_pos_emb": ("ApplyRotaryPosEmb", 4),
     "rms_norm": ("NPURmsNorm", 2),
     "fused_infer_attention_score": ("FusedInferAttentionScore", 29),
-    "moe_expert_float": ("MoeExpert", 6),
     "moe_expert_int8": ("MoeExpert", 6),
 }
 
@@ -69,6 +68,53 @@ def test_generated_onnx_models_have_expected_abis(generated_cases: Path) -> None
         assert len(nodes[0].input) == input_slot_count
 
 
+def test_moe_expert_case_matches_real_mdc_types_shapes_and_empty_offset(
+    generated_cases: Path,
+) -> None:
+    case_dir = generated_cases / "moe_expert_int8"
+    custom = onnx.load(case_dir / "custom.onnx")
+    golden = onnx.load(case_dir / "golden.onnx")
+    node = next(node for node in custom.graph.node if node.op_type == "MoeExpert")
+    inputs = {
+        value.name: (
+            value.type.tensor_type.elem_type,
+            tuple(dimension.dim_value for dimension in value.type.tensor_type.shape.dim),
+        )
+        for value in custom.graph.input
+    }
+
+    assert inputs == {
+        "x": (onnx.TensorProto.INT8, (1, 256)),
+        "topk_ids": (onnx.TensorProto.INT16, (1, 2)),
+        "topk_weight": (onnx.TensorProto.FLOAT16, (1, 2)),
+        "expert_weights": (onnx.TensorProto.INT8, (3072, 256)),
+        "quant_scales": (onnx.TensorProto.FLOAT, (17,)),
+    }
+    assert list(node.input) == [
+        "x",
+        "topk_ids",
+        "topk_weight",
+        "expert_weights",
+        "quant_scales",
+        "",
+    ]
+    assert custom.graph.output[0].type.tensor_type.elem_type == onnx.TensorProto.FLOAT16
+    assert golden.graph.output[0].type.tensor_type.elem_type == onnx.TensorProto.FLOAT16
+
+
+def test_attention_hardware_case_uses_fp16_qkv(generated_cases: Path) -> None:
+    custom = onnx.load(
+        generated_cases / "fused_infer_attention_score" / "custom.onnx"
+    )
+    input_types = {
+        value.name: value.type.tensor_type.elem_type for value in custom.graph.input
+    }
+
+    assert input_types["query"] == onnx.TensorProto.FLOAT16
+    assert input_types["key"] == onnx.TensorProto.FLOAT16
+    assert input_types["value"] == onnx.TensorProto.FLOAT16
+
+
 def test_input_generation_is_deterministic(tmp_path: Path) -> None:
     first = apply_rotary_pos_emb.generate(tmp_path / "first")
     second = apply_rotary_pos_emb.generate(tmp_path / "second")
@@ -87,7 +133,7 @@ def test_input_generation_is_deterministic(tmp_path: Path) -> None:
         apply_rotary_pos_emb.case_definition(),
         rms_norm.case_definition(),
         fused_infer_attention_score.case_definition(),
-        *moe_expert.case_definitions(),
+        moe_expert.case_definition(),
     ],
     ids=list(_EXPECTED_CUSTOM_ABIS),
 )

@@ -38,9 +38,9 @@ class _AttentionModule(torch.nn.Module):
 def test_registered_operator_runs_through_torch_compile() -> None:
     module = _AttentionModule()
     compiled = torch.compile(module, backend="eager", fullgraph=True)
-    query = torch.randn(1, 4, 2, 4)
-    key = torch.randn(1, 2, 3, 4)
-    value = torch.randn(1, 2, 3, 4)
+    query = torch.randn(1, 4, 2, 4, dtype=torch.float16)
+    key = torch.randn(1, 2, 3, 4, dtype=torch.float16)
+    value = torch.randn(1, 2, 3, 4, dtype=torch.float16)
 
     actual = compiled(query, key, value)
     expected = module(query, key, value)
@@ -69,9 +69,9 @@ def test_legacy_onnx_export_preserves_29_slots_and_all_attributes(
     tmp_path: Path,
 ) -> None:
     module = _AttentionModule()
-    query = torch.randn(1, 4, 2, 4)
-    key = torch.randn(1, 2, 3, 4)
-    value = torch.randn(1, 2, 3, 4)
+    query = torch.randn(1, 4, 2, 4, dtype=torch.float16)
+    key = torch.randn(1, 2, 3, 4, dtype=torch.float16)
+    value = torch.randn(1, 2, 3, 4, dtype=torch.float16)
     output_path = tmp_path / "attention.onnx"
 
     torch.onnx.export(

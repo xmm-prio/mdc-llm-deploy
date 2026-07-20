@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 
-import onnx
 import pytest
 import torch
 
@@ -57,7 +56,7 @@ def test_registered_operator_exports_with_torch_export() -> None:
 
 
 @pytest.mark.integration
-def test_registered_operator_exports_with_optional_onnx_slots() -> None:
+def test_registered_floating_operator_is_rejected_by_mdc_onnx_export() -> None:
     definition = register_custom_op(MoeExpert).definition
 
     class Model(torch.nn.Module):
@@ -70,22 +69,16 @@ def test_registered_operator_exports_with_optional_onnx_slots() -> None:
         ) -> torch.Tensor:
             return definition(x, topk_ids, topk_weight, expert_weights)
 
-    buffer = io.BytesIO()
-    torch.onnx.export(
-        Model(),
-        _case(),
-        buffer,
-        opset_version=18,
-        dynamo=False,
-        input_names=["x", "topk_ids", "topk_weight", "expert_weights"],
-        output_names=["out"],
-    )
-    model = onnx.load_model_from_string(buffer.getvalue())
-    node = next(node for node in model.graph.node if node.op_type == "MoeExpert")
-
-    assert node.domain == ""
-    assert list(node.input[:4]) == ["x", "topk_ids", "topk_weight", "expert_weights"]
-    assert list(node.input[4:]) == ["", ""]
+    with pytest.raises(RuntimeError, match="x must be INT8"):
+        torch.onnx.export(
+            Model(),
+            _case(),
+            io.BytesIO(),
+            opset_version=18,
+            dynamo=False,
+            input_names=["x", "topk_ids", "topk_weight", "expert_weights"],
+            output_names=["out"],
+        )
 
 
 @pytest.mark.integration
