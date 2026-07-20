@@ -11,6 +11,7 @@ from torch.onnx import symbolic_helper
 from .base import CustomOp
 
 _TRITON_RUNTIME: tuple[Any, Any] | None = None
+tl: Any = None
 
 
 def _load_triton_runtime() -> tuple[Any, Any]:
@@ -21,20 +22,20 @@ def _load_triton_runtime() -> tuple[Any, Any]:
 
     try:
         import triton  # type: ignore[import-not-found]
-        import triton.language as tl  # type: ignore[import-not-found]
+        import triton.language as triton_language  # type: ignore[import-not-found]
     except ImportError as error:
         raise RuntimeError("RmsNorm CUDA execution requires Triton") from error
+    globals()["tl"] = triton_language
 
-    @triton.jit  # type: ignore[misc]
-    def rms_norm_kernel(
-        x_ptr: Any,
-        gamma_ptr: Any,
-        y_ptr: Any,
-        rstd_ptr: Any,
-        epsilon: float,
-        normalized_size: tl.constexpr,
-        block_size: tl.constexpr,
-    ) -> None:
+    def rms_norm_kernel(  # type: ignore[no-untyped-def]
+        x_ptr,
+        gamma_ptr,
+        y_ptr,
+        rstd_ptr,
+        epsilon,
+        normalized_size,
+        block_size,
+    ):
         row = tl.program_id(0)
         columns = tl.arange(0, block_size)
         mask = columns < normalized_size
@@ -46,7 +47,14 @@ def _load_triton_runtime() -> tuple[Any, Any]:
         tl.store(y_ptr + offsets, x * rstd * gamma, mask=mask)
         tl.store(rstd_ptr + row, rstd)
 
-    _TRITON_RUNTIME = (triton, rms_norm_kernel)
+    rms_norm_kernel.__annotations__.update(
+        {
+            "normalized_size": triton_language.constexpr,
+            "block_size": triton_language.constexpr,
+        }
+    )
+    compiled_kernel = triton.jit(rms_norm_kernel)
+    _TRITON_RUNTIME = (triton, compiled_kernel)
     return _TRITON_RUNTIME
 
 

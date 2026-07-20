@@ -197,24 +197,23 @@ class MoeExpert(CustomOp):
         except ImportError as error:
             raise RuntimeError("MoeExpert CUDA execution requires Triton") from error
 
-        @triton.jit  # type: ignore[misc]
-        def gate_up_kernel(
-            x_ptr: Any,
-            ids_ptr: Any,
-            weights_ptr: Any,
-            scales_ptr: Any,
-            offsets_ptr: Any,
-            gate_ptr: Any,
-            up_ptr: Any,
-            hidden_size: int,
-            intermediate_size: int,
-            top_k: tl.constexpr,
-            packed_width: int,
-            scale_width: int,
-            quantized: tl.constexpr,
-            has_offsets: tl.constexpr,
-            block_h: tl.constexpr,
-        ) -> None:
+        def gate_up_kernel(  # type: ignore[no-untyped-def]
+            x_ptr,
+            ids_ptr,
+            weights_ptr,
+            scales_ptr,
+            offsets_ptr,
+            gate_ptr,
+            up_ptr,
+            hidden_size,
+            intermediate_size,
+            top_k,
+            packed_width,
+            scale_width,
+            quantized,
+            has_offsets,
+            block_h,
+        ):
             output_index = tl.program_id(0)
             route_index = output_index // intermediate_size
             intermediate_index = output_index % intermediate_size
@@ -246,14 +245,13 @@ class MoeExpert(CustomOp):
             tl.store(gate_ptr + output_index, gate_value)
             tl.store(up_ptr + output_index, up_value)
 
-        @triton.jit  # type: ignore[misc]
-        def swiglu_kernel(
-            gate_ptr: Any,
-            up_ptr: Any,
-            activated_ptr: Any,
-            value_count: int,
-            block: tl.constexpr,
-        ) -> None:
+        def swiglu_kernel(  # type: ignore[no-untyped-def]
+            gate_ptr,
+            up_ptr,
+            activated_ptr,
+            value_count,
+            block,
+        ):
             offsets = tl.program_id(0) * block + tl.arange(0, block)
             mask = offsets < value_count
             gate = tl.load(gate_ptr + offsets, mask=mask)
@@ -261,24 +259,23 @@ class MoeExpert(CustomOp):
             silu = gate * tl.sigmoid(gate)
             tl.store(activated_ptr + offsets, silu * up, mask=mask)
 
-        @triton.jit  # type: ignore[misc]
-        def down_kernel(
-            activated_ptr: Any,
-            ids_ptr: Any,
-            routing_ptr: Any,
-            weights_ptr: Any,
-            scales_ptr: Any,
-            offsets_ptr: Any,
-            output_ptr: Any,
-            hidden_size: int,
-            intermediate_size: int,
-            top_k: tl.constexpr,
-            packed_width: int,
-            scale_width: int,
-            quantized: tl.constexpr,
-            has_offsets: tl.constexpr,
-            block_i: tl.constexpr,
-        ) -> None:
+        def down_kernel(  # type: ignore[no-untyped-def]
+            activated_ptr,
+            ids_ptr,
+            routing_ptr,
+            weights_ptr,
+            scales_ptr,
+            offsets_ptr,
+            output_ptr,
+            hidden_size,
+            intermediate_size,
+            top_k,
+            packed_width,
+            scale_width,
+            quantized,
+            has_offsets,
+            block_i,
+        ):
             output_index = tl.program_id(0)
             token_index = output_index // hidden_size
             hidden_index = output_index % hidden_size
@@ -316,7 +313,32 @@ class MoeExpert(CustomOp):
                 )
             tl.store(output_ptr + output_index, accumulator)
 
-        cls._triton_kernels = (triton, gate_up_kernel, swiglu_kernel, down_kernel)
+        gate_up_kernel.__annotations__.update(
+            {
+                "top_k": tl.constexpr,
+                "quantized": tl.constexpr,
+                "has_offsets": tl.constexpr,
+                "block_h": tl.constexpr,
+            }
+        )
+        swiglu_kernel.__annotations__["block"] = tl.constexpr
+        down_kernel.__annotations__.update(
+            {
+                "top_k": tl.constexpr,
+                "quantized": tl.constexpr,
+                "has_offsets": tl.constexpr,
+                "block_i": tl.constexpr,
+            }
+        )
+        compiled_gate_up = triton.jit(gate_up_kernel)
+        compiled_swiglu = triton.jit(swiglu_kernel)
+        compiled_down = triton.jit(down_kernel)
+        cls._triton_kernels = (
+            triton,
+            compiled_gate_up,
+            compiled_swiglu,
+            compiled_down,
+        )
         return cls._triton_kernels
 
     @staticmethod

@@ -8,6 +8,8 @@ from torch.onnx import symbolic_helper
 
 from .base import CustomOp
 
+tl: Any = None
+
 
 class ApplyRotaryPosEmb(CustomOp):
     """Implement the fused MDC query/key rotary position embedding operator."""
@@ -144,34 +146,34 @@ class ApplyRotaryPosEmb(CustomOp):
             return cls._triton_kernel
         try:
             triton = importlib.import_module("triton")
-            tl = importlib.import_module("triton.language")
+            triton_language = importlib.import_module("triton.language")
         except ImportError as error:
             raise RuntimeError("Triton is required for ApplyRotaryPosEmb CUDA execution") from error
+        globals()["tl"] = triton_language
 
-        @triton.jit  # type: ignore[misc]
-        def kernel(
-            input_ptr: Any,
-            cos_ptr: Any,
-            sin_ptr: Any,
-            output_ptr: Any,
-            rows: Any,
-            head_dim: Any,
-            rotary_dim: Any,
-            dim0: Any,
-            dim1: Any,
-            dim2: Any,
-            cos_dim0: Any,
-            cos_dim1: Any,
-            cos_dim2: Any,
-            cos_stride0: Any,
-            cos_stride1: Any,
-            cos_stride2: Any,
-            cos_stride3: Any,
-            rank: tl.constexpr,  # type: ignore[name-defined]
-            head_axis: tl.constexpr,  # type: ignore[name-defined]
-            mode: tl.constexpr,  # type: ignore[name-defined]
-            block_size: tl.constexpr,  # type: ignore[name-defined]
-        ) -> None:
+        def kernel(  # type: ignore[no-untyped-def]
+            input_ptr,
+            cos_ptr,
+            sin_ptr,
+            output_ptr,
+            rows,
+            head_dim,
+            rotary_dim,
+            dim0,
+            dim1,
+            dim2,
+            cos_dim0,
+            cos_dim1,
+            cos_dim2,
+            cos_stride0,
+            cos_stride1,
+            cos_stride2,
+            cos_stride3,
+            rank,
+            head_axis,
+            mode,
+            block_size,
+        ):
             row = tl.program_id(0)
             column = tl.program_id(1) * block_size + tl.arange(0, block_size)
             mask = (row < rows) & (column < head_dim)
@@ -232,8 +234,17 @@ class ApplyRotaryPosEmb(CustomOp):
             )
             tl.store(output_ptr + input_offset, result, mask=mask)
 
-        cls._triton_kernel = kernel
-        return kernel
+        kernel.__annotations__.update(
+            {
+                "rank": triton_language.constexpr,
+                "head_axis": triton_language.constexpr,
+                "mode": triton_language.constexpr,
+                "block_size": triton_language.constexpr,
+            }
+        )
+        compiled_kernel = triton.jit(kernel)
+        cls._triton_kernel = compiled_kernel
+        return compiled_kernel
 
     @classmethod
     def cuda(
