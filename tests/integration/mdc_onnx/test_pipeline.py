@@ -95,14 +95,25 @@ def test_second_stage_failure_rolls_back_entire_pipeline() -> None:
 
 def test_conflicting_process_schema_fails_on_import() -> None:
     code = """
-from onnx import defs
+from onnx import defs, helper
 from onnx.defs import OpSchema
 parameter = OpSchema.FormalParameter
 defs.register_schema(OpSchema(
     "NPUAscendQuantV2", "", 18,
-    inputs=[parameter("wrong", "T")],
-    outputs=[parameter("wrong_out", "T")],
-    type_constraints=[("T", ["tensor(float)"], "wrong")],
+    inputs=[
+        parameter("x", "T"),
+        parameter("scale", "T"),
+        parameter("offset", "T", param_option=OpSchema.FormalParameterOption.Optional),
+    ],
+    outputs=[parameter("y", "TQ")],
+    type_constraints=[
+        ("T", ["tensor(float16)", "tensor(float)", "tensor(bfloat16)"], "external"),
+        ("TQ", ["tensor(uint8)"], "external"),
+    ],
+    attributes=[
+        OpSchema.Attribute("axis", helper.make_attribute("axis", -1), "external"),
+        OpSchema.Attribute("dtype", helper.make_attribute("dtype", 2), "external"),
+    ],
 ))
 import mdc_llm_deploy.mdc_onnx
 """
@@ -115,3 +126,62 @@ import mdc_llm_deploy.mdc_onnx
 
     assert result.returncode != 0
     assert "conflicting ONNX schema" in result.stderr
+    assert "NPUAscendQuantV2@18" in result.stderr
+
+
+def test_later_mdc_schema_conflict_prevents_earlier_schema_write() -> None:
+    code = """
+from onnx import defs
+from onnx.defs import OpSchema
+
+parameter = OpSchema.FormalParameter
+defs.register_schema(OpSchema(
+    "AscendDequant", "", 18,
+    inputs=[parameter("external", "tensor(float)")],
+    outputs=[parameter("external_output", "tensor(float)")],
+))
+try:
+    import mdc_llm_deploy.mdc_onnx
+except RuntimeError as error:
+    assert "conflicting ONNX schema" in str(error)
+    assert "AscendDequant@18" in str(error)
+else:
+    raise AssertionError("MDC import accepted a conflicting later schema")
+
+try:
+    defs.get_schema("NPUAscendQuantV2", 18, "")
+except defs.SchemaError:
+    pass
+else:
+    raise AssertionError("quant schema was written before batch preflight completed")
+
+external = defs.get_schema("AscendDequant", 18, "")
+assert external.inputs[0].name == "external"
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_equivalent_process_schema_registration_is_idempotent() -> None:
+    code = """
+import importlib
+import onnx
+import mdc_llm_deploy.mdc_onnx as mdc_onnx
+importlib.reload(mdc_onnx)
+schema = onnx.defs.get_schema("NPUAscendQuantV2", 18, "")
+assert schema.since_version == 18
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr

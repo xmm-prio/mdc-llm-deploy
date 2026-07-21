@@ -279,6 +279,487 @@ def test_existing_different_onnx_schema_is_rejected() -> None:
         _remove_schema(onnx_name)
 
 
+def test_profile_preflights_all_schemas_before_registering() -> None:
+    script = """
+import onnx
+import torch
+from onnx.defs import OpSchema
+from mdc_llm_deploy.custom_ops import (
+    OnnxOperatorSpec, OperatorPlugin, TorchOperatorSpec,
+    create_onnx_export_profile, register_operator,
+)
+
+def identity(input: torch.Tensor) -> torch.Tensor:
+    return input.clone()
+
+def translate(*args, **kwargs):
+    return args, kwargs
+
+def schema(name, output_count=1):
+    parameter = OpSchema.FormalParameter
+    return OpSchema(
+        name, "", 18,
+        inputs=[parameter("input", "T")],
+        outputs=[parameter(f"output_{index}", "T") for index in range(output_count)],
+        type_constraints=[("T", ["tensor(float)"], "type")],
+    )
+
+def plugin(name, onnx_name):
+    return OperatorPlugin(
+        name,
+        TorchOperatorSpec(
+            f"mdc_registry_preflight::{name}",
+            "(Tensor input) -> Tensor",
+            identity, identity, identity,
+        ),
+        OnnxOperatorSpec(schema(onnx_name), translate),
+    )
+
+first = plugin("first", "MdcRegistryPreflightFirst")
+second = plugin("second", "MdcRegistryPreflightSecond")
+register_operator(first)
+register_operator(second)
+onnx.defs.register_schema(schema(second.onnx.name, output_count=2))
+try:
+    create_onnx_export_profile(first.name, second.name)
+except ValueError as error:
+    assert str(error) == (
+        "ONNX schema 'MdcRegistryPreflightSecond' opset 18 is already "
+        "registered with a different contract"
+    )
+else:
+    raise AssertionError("profile accepted a conflicting later schema")
+
+try:
+    onnx.defs.get_schema(first.onnx.name, 18, "")
+except onnx.defs.SchemaError:
+    pass
+else:
+    raise AssertionError("first schema was written before preflight completed")
+assert len(onnx.defs.get_schema(second.onnx.name, 18, "").outputs) == 2
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_profile_rejects_conflicting_duplicate_batch_key_before_write() -> None:
+    script = """
+import onnx
+import torch
+from onnx.defs import OpSchema
+from mdc_llm_deploy.custom_ops import (
+    OnnxOperatorSpec, OperatorPlugin, TorchOperatorSpec,
+    create_onnx_export_profile, register_operator,
+)
+
+def identity(input: torch.Tensor) -> torch.Tensor:
+    return input.clone()
+
+def translate(*args, **kwargs):
+    return args, kwargs
+
+def schema(output_count):
+    parameter = OpSchema.FormalParameter
+    return OpSchema(
+        "MdcRegistryDuplicateConflict", "", 18,
+        inputs=[parameter("input", "T")],
+        outputs=[parameter(f"output_{index}", "T") for index in range(output_count)],
+        type_constraints=[("T", ["tensor(float)"], "type")],
+    )
+
+for name, output_count in (("first", 1), ("second", 2)):
+    register_operator(OperatorPlugin(
+        name,
+        TorchOperatorSpec(
+            f"mdc_registry_duplicate::{name}",
+            "(Tensor input) -> Tensor",
+            identity, identity, identity,
+        ),
+        OnnxOperatorSpec(schema(output_count), translate),
+    ))
+
+try:
+    create_onnx_export_profile("first", "second")
+except ValueError as error:
+    assert str(error) == (
+        "ONNX schema 'MdcRegistryDuplicateConflict' opset 18 is already "
+        "registered with a different contract"
+    )
+else:
+    raise AssertionError("profile accepted conflicting schemas in one batch")
+
+try:
+    onnx.defs.get_schema("MdcRegistryDuplicateConflict", 18, "")
+except onnx.defs.SchemaError:
+    pass
+else:
+    raise AssertionError("conflicting batch schema was registered")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_profile_deduplicates_equivalent_schema_writes_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    onnx_name = "MdcRegistryDuplicateEquivalent"
+    first = _plugin(
+        "registry_duplicate_equivalent_first",
+        qualified_name="mdc_registry_test::duplicate_equivalent_first",
+        onnx_name=onnx_name,
+    )
+    second = _plugin(
+        "registry_duplicate_equivalent_second",
+        qualified_name="mdc_registry_test::duplicate_equivalent_second",
+        onnx_name=onnx_name,
+    )
+    register_operator(first)
+    register_operator(second)
+    calls = 0
+    real_register = onnx.defs.register_schema
+
+    def counted_register(schema: OpSchema) -> None:
+        nonlocal calls
+        calls += 1
+        real_register(schema)
+
+    monkeypatch.setattr(onnx.defs, "register_schema", counted_register)
+    try:
+        profile = create_onnx_export_profile(first.name, second.name)
+
+        assert calls == 1
+        assert tuple(profile.operators) == (first.name, second.name)
+        assert profile.operators == {
+            first.name: first.onnx,
+            second.name: second.onnx,
+        }
+    finally:
+        _remove_schema(onnx_name)
+
+
+def test_profile_keeps_registered_prefix_when_later_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _plugin(
+        "registry_write_failure_first",
+        qualified_name="mdc_registry_test::write_failure_first",
+        onnx_name="MdcRegistryWriteFailureFirst",
+    )
+    second = _plugin(
+        "registry_write_failure_second",
+        qualified_name="mdc_registry_test::write_failure_second",
+        onnx_name="MdcRegistryWriteFailureSecond",
+    )
+    register_operator(first)
+    register_operator(second)
+    calls = 0
+    real_register = onnx.defs.register_schema
+
+    def fail_second_write(schema: OpSchema) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("third-party registry write failed")
+        real_register(schema)
+
+    monkeypatch.setattr(onnx.defs, "register_schema", fail_second_write)
+    try:
+        with pytest.raises(RuntimeError, match="third-party registry write failed"):
+            create_onnx_export_profile(first.name, second.name)
+
+        assert _get_schema(first.onnx.name) is not None
+        assert _get_schema(second.onnx.name) is None
+    finally:
+        _remove_schema(first.onnx.name)
+        _remove_schema(second.onnx.name)
+
+
+def test_equivalent_onnx_schema_with_different_docs_is_accepted() -> None:
+    script = """
+import onnx
+import torch
+from onnx.defs import OpSchema
+from mdc_llm_deploy.custom_ops import (
+    OnnxOperatorSpec, OperatorPlugin, TorchOperatorSpec,
+    create_onnx_export_profile, get_operator, register_operator,
+)
+
+def identity(input: torch.Tensor) -> torch.Tensor:
+    return input.clone()
+
+def translate(*args, **kwargs):
+    return args, kwargs
+
+parameter = OpSchema.FormalParameter
+onnx.defs.register_schema(OpSchema(
+    "MdcRegistryDocumentEquivalent", "", 18, doc="External documentation.",
+    inputs=[parameter("input", "T")],
+    outputs=[parameter("output", "T")],
+    type_constraints=[("T", ["tensor(float)"], "External type description.")],
+))
+schema = OpSchema(
+    "MdcRegistryDocumentEquivalent", "", 18, doc="Project documentation.",
+    inputs=[parameter("input", "T")],
+    outputs=[parameter("output", "T")],
+    type_constraints=[("T", ["tensor(float)"], "Project type description.")],
+)
+plugin = OperatorPlugin(
+    "document_equivalent",
+    TorchOperatorSpec(
+        "mdc_registry_subprocess::document_equivalent",
+        "(Tensor input) -> Tensor",
+        identity, identity, identity,
+    ),
+    OnnxOperatorSpec(schema, translate),
+)
+register_operator(plugin)
+profile = create_onnx_export_profile(plugin.name)
+dispatch_target = get_operator(plugin.name).torch.dispatch_target
+assert profile.operators == {plugin.name: plugin.onnx}
+assert profile.custom_translation_table == {dispatch_target: translate}
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_type_constraint_allowed_types_use_set_semantics() -> None:
+    script = """
+import onnx
+import torch
+from onnx.defs import OpSchema
+from mdc_llm_deploy.custom_ops import (
+    OnnxOperatorSpec, OperatorPlugin, TorchOperatorSpec,
+    create_onnx_export_profile, register_operator,
+)
+
+def identity(input: torch.Tensor) -> torch.Tensor:
+    return input.clone()
+
+def translate(*args, **kwargs):
+    return args, kwargs
+
+parameter = OpSchema.FormalParameter
+onnx.defs.register_schema(OpSchema(
+    "MdcRegistryConstraintSet", "", 18,
+    inputs=[parameter("input", "T")],
+    outputs=[parameter("output", "T")],
+    type_constraints=[
+        ("T", ["tensor(float16)", "tensor(float)", "tensor(float16)"], "type")
+    ],
+))
+schema = OpSchema(
+    "MdcRegistryConstraintSet", "", 18,
+    inputs=[parameter("input", "T")],
+    outputs=[parameter("output", "T")],
+    type_constraints=[("T", ["tensor(float)", "tensor(float16)"], "type")],
+)
+plugin = OperatorPlugin(
+    "constraint_set",
+    TorchOperatorSpec(
+        "mdc_registry_subprocess::constraint_set",
+        "(Tensor input) -> Tensor",
+        identity, identity, identity,
+    ),
+    OnnxOperatorSpec(schema, translate),
+)
+register_operator(plugin)
+profile = create_onnx_export_profile(plugin.name)
+assert profile.operators == {plugin.name: plugin.onnx}
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    (
+        "dimension",
+        "registered_parameter",
+        "expected_parameter",
+        "registered_attribute",
+        "expected_attribute",
+    ),
+    [
+        (
+            "parameter_type",
+            'parameter("input", "T")',
+            'parameter("input", "tensor(float)")',
+            'attribute("axis", attr_type.INT, "axis", required=True)',
+            'attribute("axis", attr_type.INT, "axis", required=True)',
+        ),
+        (
+            "parameter_option",
+            'parameter("input", "T")',
+            'parameter("input", "T", param_option=option.Optional)',
+            'attribute("axis", attr_type.INT, "axis", required=True)',
+            'attribute("axis", attr_type.INT, "axis", required=True)',
+        ),
+        (
+            "attribute_type",
+            'parameter("input", "T")',
+            'parameter("input", "T")',
+            'attribute("axis", attr_type.INT, "axis", required=True)',
+            'attribute("axis", attr_type.FLOAT, "axis", required=True)',
+        ),
+        (
+            "attribute_required",
+            'parameter("input", "T")',
+            'parameter("input", "T")',
+            'attribute("axis", attr_type.INT, "axis", required=True)',
+            'attribute("axis", attr_type.INT, "axis", required=False)',
+        ),
+    ],
+)
+def test_onnx_abi_dimension_conflicts_are_rejected(
+    dimension: str,
+    registered_parameter: str,
+    expected_parameter: str,
+    registered_attribute: str,
+    expected_attribute: str,
+) -> None:
+    script = f"""
+import onnx
+import torch
+from onnx.defs import OpSchema
+from mdc_llm_deploy.custom_ops import (
+    OnnxOperatorSpec, OperatorPlugin, TorchOperatorSpec,
+    create_onnx_export_profile, register_operator,
+)
+
+def identity(input: torch.Tensor) -> torch.Tensor:
+    return input.clone()
+
+def translate(*args, **kwargs):
+    return args, kwargs
+
+parameter = OpSchema.FormalParameter
+option = OpSchema.FormalParameterOption
+attribute = OpSchema.Attribute
+attr_type = OpSchema.AttrType
+onnx.defs.register_schema(OpSchema(
+    "MdcRegistryAbi{dimension.title()}", "", 18,
+    inputs=[{registered_parameter}],
+    outputs=[parameter("output", "T")],
+    type_constraints=[("T", ["tensor(float)"], "type")],
+    attributes=[{registered_attribute}],
+))
+schema = OpSchema(
+    "MdcRegistryAbi{dimension.title()}", "", 18,
+    inputs=[{expected_parameter}],
+    outputs=[parameter("output", "T")],
+    type_constraints=[("T", ["tensor(float)"], "type")],
+    attributes=[{expected_attribute}],
+)
+plugin = OperatorPlugin(
+    "abi_{dimension}",
+    TorchOperatorSpec(
+        "mdc_registry_subprocess::abi_{dimension}",
+        "(Tensor input) -> Tensor",
+        identity, identity, identity,
+    ),
+    OnnxOperatorSpec(schema, translate),
+)
+register_operator(plugin)
+try:
+    create_onnx_export_profile(plugin.name)
+except ValueError as error:
+    assert "different contract" in str(error)
+else:
+    raise AssertionError("{dimension} conflict was accepted")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_onnx_attribute_default_conflict_is_rejected() -> None:
+    script = """
+import onnx
+import torch
+from onnx import helper
+from onnx.defs import OpSchema
+from mdc_llm_deploy.custom_ops import (
+    OnnxOperatorSpec, OperatorPlugin, TorchOperatorSpec,
+    create_onnx_export_profile, register_operator,
+)
+
+def identity(input: torch.Tensor) -> torch.Tensor:
+    return input.clone()
+
+def translate(*args, **kwargs):
+    return args, kwargs
+
+parameter = OpSchema.FormalParameter
+attribute = OpSchema.Attribute
+onnx.defs.register_schema(OpSchema(
+    "MdcRegistryAttributeConflict", "", 18,
+    inputs=[parameter("input", "T")],
+    outputs=[parameter("output", "T")],
+    type_constraints=[("T", ["tensor(float)"], "type")],
+    attributes=[attribute("axis", helper.make_attribute("axis", 1), "external")],
+))
+schema = OpSchema(
+    "MdcRegistryAttributeConflict", "", 18,
+    inputs=[parameter("input", "T")],
+    outputs=[parameter("output", "T")],
+    type_constraints=[("T", ["tensor(float)"], "type")],
+    attributes=[attribute("axis", helper.make_attribute("axis", 2), "project")],
+)
+plugin = OperatorPlugin(
+    "attribute_conflict",
+    TorchOperatorSpec(
+        "mdc_registry_subprocess::attribute_conflict",
+        "(Tensor input) -> Tensor",
+        identity, identity, identity,
+    ),
+    OnnxOperatorSpec(schema, translate),
+)
+register_operator(plugin)
+try:
+    create_onnx_export_profile(plugin.name)
+except ValueError as error:
+    assert "different contract" in str(error)
+else:
+    raise AssertionError("attribute default conflict was accepted")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_local_schema_is_not_available_in_a_new_process() -> None:
     plugin = _plugin(
         "registry_process_boundary",

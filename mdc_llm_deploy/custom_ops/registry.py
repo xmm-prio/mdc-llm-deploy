@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from threading import RLock
 from types import MappingProxyType
 from typing import Any, NoReturn, Protocol, cast
 
-import onnx
 import torch
-from onnx.defs import OpSchema
 
+from .._onnx_schema_registry import OnnxSchemaConflictError, ensure_onnx_schemas
 from .base import OnnxOperatorSpec, OperatorPlugin, TorchOperatorSpec
 
 
@@ -56,22 +55,6 @@ class OnnxExportProfile:
 
     custom_translation_table: Mapping[Callable[..., Any], Callable[..., Any]]
     operators: Mapping[str, OnnxOperatorSpec]
-
-
-def _schema_fingerprint(schema: OpSchema) -> tuple[object, ...]:
-    return (
-        schema.name,
-        schema.domain,
-        schema.since_version,
-        schema.doc,
-        tuple(repr(parameter) for parameter in schema.inputs),
-        tuple(repr(parameter) for parameter in schema.outputs),
-        tuple(repr(constraint) for constraint in schema.type_constraints),
-        tuple(
-            (name, repr(attribute))
-            for name, attribute in sorted(schema.attributes.items())
-        ),
-    )
 
 
 class TorchOperatorRegistry:
@@ -120,34 +103,15 @@ class TorchOperatorRegistry:
 class OnnxSchemaRegistry:
     """Install selected default-domain schemas with conflict detection."""
 
-    def __init__(self) -> None:
-        self._schemas: dict[tuple[str, int], tuple[object, ...]] = {}
-        self._lock = RLock()
-
-    def register(self, spec: OnnxOperatorSpec) -> None:
-        """Register one local schema idempotently and reject structural conflicts."""
-        key = (spec.name, spec.opset)
-        fingerprint = _schema_fingerprint(spec.schema)
-        with self._lock:
-            known = self._schemas.get(key)
-            if known is not None:
-                if known != fingerprint:
-                    raise ValueError(
-                        f"ONNX schema {spec.name!r} opset {spec.opset} conflicts "
-                        "with its process-local registration"
-                    )
-                return
-
-            existing = _get_exact_schema(spec.name, spec.opset)
-            if existing is not None:
-                if _schema_fingerprint(existing) != fingerprint:
-                    raise ValueError(
-                        f"ONNX schema {spec.name!r} opset {spec.opset} is already "
-                        "registered with a different contract"
-                    )
-            else:
-                onnx.defs.register_schema(spec.schema)
-            self._schemas[key] = fingerprint
+    def register_all(self, specs: Iterable[OnnxOperatorSpec]) -> None:
+        """Preflight and register selected schemas as one project batch."""
+        try:
+            ensure_onnx_schemas(spec.schema for spec in specs)
+        except OnnxSchemaConflictError as error:
+            raise ValueError(
+                f"ONNX schema {error.name!r} opset {error.since_version} is already "
+                "registered with a different contract"
+            ) from None
 
 
 class OperatorRegistry:
@@ -195,10 +159,11 @@ class OperatorRegistry:
                 if name not in selected:
                     selected[name] = self.get(name)
 
+            self._onnx.register_all(entry.plugin.onnx for entry in selected.values())
+
             translations: dict[Callable[..., Any], Callable[..., Any]] = {}
             contracts: dict[str, OnnxOperatorSpec] = {}
             for name, entry in selected.items():
-                self._onnx.register(entry.plugin.onnx)
                 translations[entry.torch.dispatch_target] = entry.plugin.onnx.translation
                 contracts[name] = entry.plugin.onnx
 
@@ -206,14 +171,6 @@ class OperatorRegistry:
                 custom_translation_table=MappingProxyType(translations),
                 operators=MappingProxyType(contracts),
             )
-
-
-def _get_exact_schema(name: str, version: int) -> OpSchema | None:
-    try:
-        schema = onnx.defs.get_schema(name, version, "")
-    except onnx.defs.SchemaError:
-        return None
-    return schema if schema.since_version == version else None
 
 
 def _inference_only_backward(qualified_name: str) -> Callable[..., NoReturn]:

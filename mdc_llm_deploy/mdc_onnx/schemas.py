@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Final
 
-from onnx import defs, helper
+from onnx import helper
 from onnx.defs import OpSchema
+
+from .._onnx_schema_registry import ensure_onnx_schemas
 
 ASCEND_QUANT_OP: Final = "NPUAscendQuantV2"
 ASCEND_DEQUANT_OP: Final = "AscendDequant"
@@ -67,34 +69,9 @@ def _dequant_schema() -> OpSchema:
     )
 
 
-def _matches(schema: OpSchema, expected: OpSchema) -> bool:
-    return (
-        schema.name == expected.name
-        and schema.domain == expected.domain
-        and schema.since_version == expected.since_version
-        and [item.name for item in schema.inputs] == [item.name for item in expected.inputs]
-        and [item.name for item in schema.outputs] == [item.name for item in expected.outputs]
-        and set(schema.attributes) == set(expected.attributes)
-    )
-
-
 def register_schemas() -> None:
     """Register MDC schemas idempotently in the process-local ONNX registry."""
-    for schema in (_quant_schema(), _dequant_schema()):
-        try:
-            current = defs.get_schema(
-                schema.name,
-                schema.since_version,
-                schema.domain,
-            )
-        except defs.SchemaError:
-            defs.register_schema(schema)
-        else:
-            if not _matches(current, schema):
-                raise RuntimeError(
-                    f"conflicting ONNX schema already registered for "
-                    f"{schema.domain!r}::{schema.name}@{schema.since_version}"
-                )
+    ensure_onnx_schemas((_quant_schema(), _dequant_schema()))
 
 
 __all__ = [

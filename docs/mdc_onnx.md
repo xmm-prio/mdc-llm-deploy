@@ -46,6 +46,12 @@ assert processed is model
 `NPUAscendQuantV2` 和 `AscendDequant` 的默认 domain opset 18 schema。
 schema 不会写入序列化模型；其它进程使用 `onnx.checker` 前也需要导入本包。
 
+两个 schema 会先完成整批 ABI 预检，全部通过后才开始注册。预检失败时本次导入不会
+新增 schema。ONNX registry 不支持多 schema 事务；实际注册中途失败时，已成功注册的
+兼容前缀会保留，且不会通过注销模拟回滚。项目内注册由同一锁串行化，但第三方直接调用
+ONNX registry 不受该锁约束，仍可在预检和写入期间产生竞态。需要隔离此类外部修改时，
+应在独立 Python 进程中完成处理。
+
 ## 已知验证边界
 
 非对称激活的 offset 修正依赖 ATC 的 MatmulQuantToFixpipeFusion。当前自动验收覆盖
