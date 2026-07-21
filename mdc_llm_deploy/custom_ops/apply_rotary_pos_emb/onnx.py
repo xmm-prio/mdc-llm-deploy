@@ -4,58 +4,24 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-import onnx
 import onnxscript.ir as ir
-from onnx.defs import OpSchema
 from onnxscript import values
 
+from ...onnx.schemas import (
+    MDC_ONNX_OPSET,
+    ROTARY_POSITION_EMBEDDING_OP,
+    create_rotary_position_embedding_schema,
+)
 from .contract import HEAD_AXIS, LAYOUT_RANK, ROTARY_MODES
 
-ONNX_NAME = "ApplyRotaryPosEmb"
-ONNX_OPSET = 18
+ONNX_NAME = ROTARY_POSITION_EMBEDDING_OP
+ONNX_OPSET = MDC_ONNX_OPSET
 _MAX_HEAD_DIM = 1024
 _ONNX_DTYPES = frozenset(
     {ir.DataType.FLOAT16, ir.DataType.BFLOAT16, ir.DataType.FLOAT}
 )
 _LOCAL_OPSET = values.Opset("", ONNX_OPSET)
-
-
-def create_schema() -> OpSchema:
-    """Create the process-local default-domain schema."""
-    parameter = OpSchema.FormalParameter
-    attribute = OpSchema.Attribute
-    return OpSchema(
-        ONNX_NAME,
-        "",
-        ONNX_OPSET,
-        doc="Apply rotary position embeddings to query and key tensors.",
-        inputs=[
-            parameter("query", "T"),
-            parameter("key", "T"),
-            parameter("cos", "T"),
-            parameter("sin", "T"),
-        ],
-        outputs=[parameter("query_out", "T"), parameter("key_out", "T")],
-        type_constraints=[
-            (
-                "T",
-                ["tensor(float16)", "tensor(bfloat16)", "tensor(float)"],
-                "Supported MDC floating-point tensor types.",
-            )
-        ],
-        attributes=[
-            attribute(
-                "layout",
-                onnx.helper.make_attribute("layout", 1),
-                "Tensor layout: 1=BSND, 2=SBND, 3=BNSD, 4=TND.",
-            ),
-            attribute(
-                "rotary_mode",
-                onnx.helper.make_attribute("rotary_mode", "half"),
-                "Rotation pairing mode.",
-            ),
-        ],
-    )
+create_schema = create_rotary_position_embedding_schema
 
 
 def translate(

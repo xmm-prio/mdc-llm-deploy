@@ -186,7 +186,15 @@ def test_combined_dynamo_export_has_exact_default_domain_abis(
         "attention_key",
         "attention_value",
     )
-    assert tuple(nodes["FusedInferAttentionScore"].output) == ("attention",)
+    fia_outputs = tuple(nodes["FusedInferAttentionScore"].output)
+    assert len(fia_outputs) == 2
+    assert all(fia_outputs)
+    assert any(
+        node.op_type in {"Cast", "CastLike"}
+        and node.input[0] == fia_outputs[0]
+        and "attention" in node.output
+        for node in model.graph.node
+    )
     assert tuple(nodes["MoeExpert"].input) == (
         "moe_input",
         "topk_ids",
@@ -209,10 +217,22 @@ def test_combined_dynamo_export_has_exact_default_domain_abis(
     }
     assert attributes["NPURmsNorm"] == {"epsilon": pytest.approx(1e-5)}
     assert attributes["FusedInferAttentionScore"] == {
+        "antiquant_mode": 0,
+        "block_size": 0,
+        "inner_precise": 0,
         "input_layout": b"BNSD",
+        "key_antiquant_mode": 0,
+        "next_tokens": 2147483647,
         "num_heads": 4,
         "num_key_value_heads": 2,
+        "out_dtype": 0,
+        "pre_tokens": 2147483647,
+        "pse_type": 0,
+        "query_quant_mode": 0,
         "scale": pytest.approx(0.5),
+        "softmax_lse_flag": 0,
+        "sparse_mode": 0,
+        "value_antiquant_mode": 0,
     }
     assert attributes["MoeExpert"] == {}
 

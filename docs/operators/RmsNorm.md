@@ -5,8 +5,10 @@
 - `contract.py`：Torch 宽契约；
 - `kernels.py`：CPU/CUDA kernel；
 - `fake.py`：FakeTensor 元数据推导；
-- `onnx.py`：ONNX 窄契约、本地 schema 与 Dynamo translation；
+- `onnx.py`：ONNX 窄契约与 Dynamo translation；
 - `registration.py`：不可变插件描述及 Torch 注册。
+
+`NPURmsNorm` schema 由 `mdc_llm_deploy.onnx.schemas` 统一声明和注册。
 
 导入 `mdc_llm_deploy.custom_ops.rms_norm` 只注册 RmsNorm 的 Torch 算子。
 调用 `create_onnx_export_profile("rms_norm")` 后，才在当前进程注册默认域

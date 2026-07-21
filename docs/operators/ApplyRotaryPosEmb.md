@@ -23,6 +23,7 @@ NaN/Inf 的输入。算子仅用于推理，不支持 autograd。
 
 ## Dynamo ONNX ABI 与导出收窄
 
+`ApplyRotaryPosEmb` schema 由 `mdc_llm_deploy.onnx.schemas` 统一声明和按需注册。
 默认 `ai.onnx` 域、opset 18：
 
 ```text

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from onnx.defs import OpSchema
 from onnxscript.values import Opset
+
+from ...onnx.schemas import create_moe_expert_schema
 
 _OPSET18 = Opset("", 18)
 
@@ -84,26 +85,4 @@ def translate(
     )
 
 
-def create_schema() -> OpSchema:
-    """Create local opset-18 schema for five-input MDC MoeExpert."""
-    parameter = OpSchema.FormalParameter
-    return OpSchema(
-        "MoeExpert",
-        "",
-        18,
-        doc="Fully quantized MDC routed SwiGLU expert operator.",
-        inputs=[
-            parameter("x", "T_INT8"),
-            parameter("topk_ids", "T_INT16"),
-            parameter("topk_weight", "T_FLOAT16"),
-            parameter("expert_weights", "T_INT8"),
-            parameter("quant_scales", "T_FLOAT32"),
-        ],
-        outputs=[parameter("out", "T_FLOAT16")],
-        type_constraints=[
-            ("T_INT8", ["tensor(int8)"], "INT8 tensors."),
-            ("T_INT16", ["tensor(int16)"], "INT16 tensors."),
-            ("T_FLOAT16", ["tensor(float16)"], "FLOAT16 tensors."),
-            ("T_FLOAT32", ["tensor(float)"], "FLOAT32 tensors."),
-        ],
-    )
+create_schema = create_moe_expert_schema

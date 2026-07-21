@@ -199,6 +199,17 @@ def _weight_source(
     return dq, producer
 
 
+def _is_quantized_weight(producer: NodeProto | None, index: GraphIndex) -> bool:
+    if producer is None:
+        return False
+    if producer.op_type == "DequantizeLinear":
+        return True
+    if producer.op_type != "Transpose" or not producer.input:
+        return False
+    transpose_input = index.producer(producer.input[0])
+    return transpose_input is not None and transpose_input.op_type == "DequantizeLinear"
+
+
 def _broadcast_parameter(parameter: np.ndarray, shape: tuple[int, ...], axis: int) -> np.ndarray:
     if parameter.size == 1:
         return parameter.reshape(())
@@ -268,10 +279,7 @@ def _build_plan(matmul: NodeProto, index: GraphIndex) -> _LoweringPlan | None:
     activation_dq = index.producer(matmul.input[0])
     weight_candidate = index.producer(matmul.input[1])
     activation_quantized = activation_dq is not None and activation_dq.op_type == "DequantizeLinear"
-    weight_quantized = weight_candidate is not None and weight_candidate.op_type in {
-        "DequantizeLinear",
-        "Transpose",
-    }
+    weight_quantized = _is_quantized_weight(weight_candidate, index)
     if not activation_quantized and not weight_quantized:
         return None
     if not activation_quantized or not weight_quantized:

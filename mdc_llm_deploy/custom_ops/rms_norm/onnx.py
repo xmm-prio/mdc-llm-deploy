@@ -5,46 +5,14 @@ from __future__ import annotations
 import math
 from typing import cast
 
-from onnx import helper
-from onnx.defs import OpSchema
 from onnxscript import ir, values
+
+from ...onnx.schemas import create_rms_norm_schema
 
 _LOCAL_OPSET = values.Opset("", 18)
 _SUPPORTED_DTYPES = frozenset(
     {ir.DataType.FLOAT16, ir.DataType.BFLOAT16, ir.DataType.FLOAT}
 )
-
-
-def create_schema() -> OpSchema:
-    """Create the process-local default-domain NPURmsNorm schema."""
-    parameter = OpSchema.FormalParameter
-    epsilon = OpSchema.Attribute(
-        "epsilon",
-        helper.make_attribute("epsilon", 1e-6),
-        "Positive normalization epsilon.",
-    )
-    return OpSchema(
-        "NPURmsNorm",
-        "",
-        18,
-        doc="Apply RMS normalization over the trailing dimensions described by gamma.",
-        inputs=[
-            parameter("x", "T"),
-            parameter("gamma", "T"),
-        ],
-        outputs=[
-            parameter("y", "T"),
-            parameter("rstd", "tensor(float)"),
-        ],
-        type_constraints=[
-            (
-                "T",
-                ["tensor(float16)", "tensor(bfloat16)", "tensor(float)"],
-                "Supported floating-point tensor types.",
-            )
-        ],
-        attributes=[epsilon],
-    )
 
 
 def _static_shape(value: ir.Value, name: str) -> tuple[int, ...]:
@@ -94,4 +62,4 @@ def translate(
     return cast(tuple[ir.Value, ir.Value], outputs)
 
 
-ONNX_SCHEMA = create_schema()
+ONNX_SCHEMA = create_rms_norm_schema()

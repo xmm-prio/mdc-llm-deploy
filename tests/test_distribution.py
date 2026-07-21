@@ -7,7 +7,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DOCUMENT_LINK_PATTERN = re.compile(r"\[[^\]]+\]\(([^)]+\.md)\)")
 EXPECTED_DOCUMENTS = {
-    "docs/mdc_onnx.md",
+    "docs/onnx.md",
     "docs/operators/ApplyRotaryPosEmb.md",
     "docs/operators/AscendDequant.md",
     "docs/operators/AscendQuantV2.md",

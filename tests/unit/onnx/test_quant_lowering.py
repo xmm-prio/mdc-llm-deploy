@@ -5,7 +5,7 @@ import onnx
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
-from mdc_llm_deploy.mdc_onnx import lower_qdq
+from mdc_llm_deploy.onnx import lower_qdq
 
 
 def _model(
@@ -199,6 +199,28 @@ def test_half_quantized_matmul_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="activation and weight must both"):
         lower_qdq(model)
+
+
+def test_unquantized_attention_transpose_is_ignored() -> None:
+    graph = helper.make_graph(
+        [
+            helper.make_node("Transpose", ["key"], ["key_t"], perm=[0, 1, 3, 2]),
+            helper.make_node("MatMul", ["query", "key_t"], ["score"]),
+        ],
+        "attention",
+        [
+            helper.make_tensor_value_info("query", TensorProto.FLOAT16, [1, 4, 3, 8]),
+            helper.make_tensor_value_info("key", TensorProto.FLOAT16, [1, 4, 3, 8]),
+        ],
+        [helper.make_tensor_value_info("score", TensorProto.FLOAT16, [1, 4, 3, 3])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    original = model.SerializeToString()
+
+    returned = lower_qdq(model)
+
+    assert returned is model
+    assert model.SerializeToString() == original
 
 
 def test_quantized_gemm_is_rejected() -> None:

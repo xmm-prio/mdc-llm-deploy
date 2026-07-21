@@ -80,7 +80,7 @@ def test_registered_operator_runs_through_fullgraph_compile_and_export() -> None
 
 
 @pytest.mark.integration
-def test_dynamo_onnx_emits_three_input_single_output_fia_and_constant(
+def test_dynamo_onnx_emits_complete_fia_abi_and_constant_lse(
     tmp_path: Path,
 ) -> None:
     profile = create_onnx_export_profile(PLUGIN_NAME)
@@ -104,7 +104,13 @@ def test_dynamo_onnx_emits_three_input_single_output_fia_and_constant(
     node = nodes[0]
     assert node.domain == ""
     assert list(node.input) == ["query", "key", "value"]
-    assert len(node.output) == 1
+    assert len(node.output) == 2
+    assert any(
+        producer.op_type in {"Cast", "CastLike"}
+        and producer.input[0] == node.output[0]
+        and model.graph.output[0].name in producer.output
+        for producer in model.graph.node
+    )
     assert {attribute.name for attribute in node.attribute} == ONNX_ATTRIBUTE_NAMES
     lse_output = model.graph.output[1].name
     assert any(

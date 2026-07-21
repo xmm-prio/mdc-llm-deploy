@@ -10,7 +10,7 @@ from typing import Any, NoReturn, Protocol, cast
 
 import torch
 
-from .._onnx_schema_registry import OnnxSchemaConflictError, ensure_onnx_schemas
+from ..onnx.schemas import OnnxSchemaConflictError, register_schema_objects
 from .base import OnnxOperatorSpec, OperatorPlugin, TorchOperatorSpec
 
 
@@ -106,7 +106,7 @@ class OnnxSchemaRegistry:
     def register_all(self, specs: Iterable[OnnxOperatorSpec]) -> None:
         """Preflight and register selected schemas as one project batch."""
         try:
-            ensure_onnx_schemas(spec.schema for spec in specs)
+            register_schema_objects(spec.schema for spec in specs)
         except OnnxSchemaConflictError as error:
             raise ValueError(
                 f"ONNX schema {error.name!r} opset {error.since_version} is already "

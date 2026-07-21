@@ -22,6 +22,13 @@ from mdc_llm_deploy.custom_ops import (
     register_operator,
     registered_operators,
 )
+from mdc_llm_deploy.onnx.schemas import (
+    ALL_SCHEMA_NAMES,
+    CANN_FIA_SOURCE_COMMIT,
+    CANN_FIA_SOURCE_URL,
+    FUSED_INFER_ATTENTION_SCORE_OP,
+    create_fused_infer_attention_score_schema,
+)
 
 
 def _identity_cpu(input: torch.Tensor) -> torch.Tensor:
@@ -809,6 +816,166 @@ def test_package_import_does_not_load_operator_modules() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_central_fia_schema_matches_frozen_cann_master_proto() -> None:
+    schema = create_fused_infer_attention_score_schema()
+
+    assert CANN_FIA_SOURCE_COMMIT == "606a5ddb67c67d93c137a7b474fa7a5edd05f7c9"
+    assert CANN_FIA_SOURCE_COMMIT in CANN_FIA_SOURCE_URL
+    assert schema.name == FUSED_INFER_ATTENTION_SCORE_OP
+    assert schema.domain == ""
+    assert schema.since_version == 18
+    assert [parameter.name for parameter in schema.inputs] == [
+        "query",
+        "key",
+        "value",
+        "pse_shift",
+        "atten_mask",
+        "actual_seq_lengths",
+        "actual_seq_lengths_kv",
+        "dequant_scale1",
+        "quant_scale1",
+        "dequant_scale2",
+        "quant_scale2",
+        "quant_offset2",
+        "antiquant_scale",
+        "antiquant_offset",
+        "block_table",
+        "query_padding_size",
+        "kv_padding_size",
+        "key_antiquant_scale",
+        "key_antiquant_offset",
+        "value_antiquant_scale",
+        "value_antiquant_offset",
+        "key_shared_prefix",
+        "value_shared_prefix",
+        "actual_shared_prefix_len",
+        "query_rope",
+        "key_rope",
+        "key_rope_antiquant_scale",
+        "dequant_scale_query",
+        "learnable_sink",
+        "q_start_idx",
+        "kv_start_idx",
+    ]
+    assert all(
+        parameter.option == OpSchema.FormalParameterOption.Optional
+        for parameter in schema.inputs[3:]
+    )
+    assert [parameter.name for parameter in schema.outputs] == [
+        "attention_out",
+        "softmax_lse",
+    ]
+    assert set(schema.attributes) == {
+        "num_heads",
+        "scale",
+        "pre_tokens",
+        "next_tokens",
+        "input_layout",
+        "num_key_value_heads",
+        "sparse_mode",
+        "inner_precise",
+        "block_size",
+        "antiquant_mode",
+        "softmax_lse_flag",
+        "key_antiquant_mode",
+        "value_antiquant_mode",
+        "query_quant_mode",
+        "pse_type",
+        "out_dtype",
+    }
+    assert schema.attributes["num_heads"].required
+    assert onnx.helper.get_attribute_value(
+        schema.attributes["inner_precise"].default_value
+    ) == 1
+
+
+def test_central_schema_import_is_lazy_and_selected_registration_checks_model() -> None:
+    script = """
+import onnx
+from mdc_llm_deploy.onnx.schemas import (
+    ALL_SCHEMA_NAMES, RMS_NORM_OP, register_schemas,
+)
+
+for name in ALL_SCHEMA_NAMES:
+    try:
+        onnx.defs.get_schema(name, 18, "")
+    except onnx.defs.SchemaError:
+        pass
+    else:
+        raise AssertionError(f"schema registered during import: {name}")
+
+register_schemas(RMS_NORM_OP)
+assert onnx.defs.get_schema(RMS_NORM_OP, 18, "").since_version == 18
+for name in ALL_SCHEMA_NAMES:
+    if name == RMS_NORM_OP:
+        continue
+    try:
+        onnx.defs.get_schema(name, 18, "")
+    except onnx.defs.SchemaError:
+        pass
+    else:
+        raise AssertionError(f"unselected schema registered: {name}")
+
+model = onnx.helper.make_model(
+    onnx.helper.make_graph(
+        [onnx.helper.make_node(
+            RMS_NORM_OP, ["x", "gamma"], ["y", "rstd"], epsilon=1e-6
+        )],
+        "cold-process-schema-check",
+        [
+            onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT16, [1, 8]),
+            onnx.helper.make_tensor_value_info("gamma", onnx.TensorProto.FLOAT16, [8]),
+        ],
+        [
+            onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT16, [1, 8]),
+            onnx.helper.make_tensor_value_info("rstd", onnx.TensorProto.FLOAT, [1]),
+        ],
+    ),
+    opset_imports=[onnx.helper.make_opsetid("", 18)],
+)
+onnx.checker.check_model(model, full_check=True)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_central_registry_rejects_unknown_schema_name_without_writes() -> None:
+    script = """
+import onnx
+from mdc_llm_deploy.onnx.schemas import ALL_SCHEMA_NAMES, register_schemas
+
+try:
+    register_schemas("MissingMdcSchema")
+except KeyError as error:
+    assert "MissingMdcSchema" in str(error)
+else:
+    raise AssertionError("unknown schema name was accepted")
+
+for name in ALL_SCHEMA_NAMES:
+    try:
+        onnx.defs.get_schema(name, 18, "")
+    except onnx.defs.SchemaError:
+        pass
+    else:
+        raise AssertionError(f"schema written after selection failure: {name}")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert len(ALL_SCHEMA_NAMES) == 6
 
 
 def _get_schema(name: str) -> OpSchema | None:

@@ -1,4 +1,4 @@
-"""Generate deterministic MC62 QDQ lowering ATC cases."""
+"""Generate deterministic MC62 ONNX transformation ATC cases."""
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from mdc_llm_deploy.mdc_onnx import process_onnx
+from mdc_llm_deploy.onnx import process_onnx
+
+from . import qwen3_fia_cases
 
 _K = 32
 _M = 16
@@ -83,7 +85,7 @@ def _qdq_model(activation_zero_point: int) -> onnx.ModelProto:
     return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
 
 
-def generate_all(output_root: Path) -> tuple[Path, ...]:
+def generate_qdq_cases(output_root: Path) -> tuple[Path, ...]:
     """Generate symmetric and asymmetric activation cases atomically."""
     output_root = output_root.resolve()
     cases = (("symmetric", 0), ("asymmetric", 7))
@@ -121,14 +123,21 @@ def generate_all(output_root: Path) -> tuple[Path, ...]:
     return tuple(generated)
 
 
+def generate_all(output_root: Path) -> tuple[Path, ...]:
+    """Generate QDQ and Qwen3 FIA ATC validation cases."""
+    qdq_cases = generate_qdq_cases(output_root)
+    qwen3_bundle = qwen3_fia_cases.generate(output_root)
+    return (*qdq_cases, qwen3_bundle)
+
+
 def main() -> None:
     """Run command-line ATC case generation."""
-    parser = argparse.ArgumentParser(description="生成 MDC ONNX QDQ lowering 的 ATC 验证模型。")
+    parser = argparse.ArgumentParser(description="生成 MDC ONNX 的确定性 ATC 验证模型。")
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("artifacts/mdc_onnx"),
-        help="输出目录, 默认 artifacts/mdc_onnx。",
+        default=Path("artifacts/onnx"),
+        help="输出目录, 默认 artifacts/onnx。",
     )
     arguments = parser.parse_args()
     generate_all(arguments.output)

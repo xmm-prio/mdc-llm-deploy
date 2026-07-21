@@ -129,8 +129,8 @@ def test_plugin_keeps_torch_and_onnx_contracts_separate() -> None:
     assert REGISTERED_OPERATOR.plugin is PLUGIN
     assert len(TORCH_INPUT_SLOTS) == 29
     assert PLUGIN.onnx.schema.name == "FusedInferAttentionScore"
-    assert len(PLUGIN.onnx.schema.inputs) == 3
-    assert len(PLUGIN.onnx.schema.outputs) == 1
+    assert len(PLUGIN.onnx.schema.inputs) == 31
+    assert len(PLUGIN.onnx.schema.outputs) == 2
     assert set(PLUGIN.onnx.schema.attributes) == ONNX_ATTRIBUTE_NAMES
 
 

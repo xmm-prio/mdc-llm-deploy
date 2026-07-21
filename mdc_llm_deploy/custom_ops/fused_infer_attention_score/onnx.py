@@ -3,52 +3,25 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import onnx
-from onnx.defs import OpSchema
 from onnxscript import opset18 as op
 from onnxscript.values import Opset
 
+from ...onnx.schemas import (
+    FUSED_INFER_ATTENTION_SCORE_OP,
+    create_fused_infer_attention_score_schema,
+)
 from .contract import MAX_TOKENS, TORCH_INPUT_SLOTS
 
-ONNX_OP_NAME: Final = "FusedInferAttentionScore"
+ONNX_OP_NAME: Final = FUSED_INFER_ATTENTION_SCORE_OP
 ONNX_ATTRIBUTE_NAMES: Final = frozenset(
-    {"num_heads", "scale", "input_layout", "num_key_value_heads"}
+    create_fused_infer_attention_score_schema().attributes
 )
 _LOCAL_OPSET = Opset("", 18)
 
-
-def create_schema() -> OpSchema:
-    """Create the process-local default-domain FIA schema."""
-    parameter = OpSchema.FormalParameter
-    attribute = OpSchema.Attribute
-    attr_type = OpSchema.AttrType
-    return OpSchema(
-        ONNX_OP_NAME,
-        "",
-        18,
-        doc="MC62 float decode fused inference attention.",
-        inputs=[
-            parameter("query", "T"),
-            parameter("key", "T"),
-            parameter("value", "T"),
-        ],
-        outputs=[parameter("attention_out", "T")],
-        type_constraints=[
-            (
-                "T",
-                ["tensor(float16)", "tensor(bfloat16)"],
-                "Supported MC62 float decode tensor types.",
-            )
-        ],
-        attributes=[
-            attribute("num_heads", attr_type.INT, "Query head count."),
-            attribute("scale", attr_type.FLOAT, "Attention score scale."),
-            attribute("input_layout", attr_type.STRING, "Input tensor layout."),
-            attribute("num_key_value_heads", attr_type.INT, "Key/value head count."),
-        ],
-    )
+create_schema = create_fused_infer_attention_score_schema
 
 
 def _shape(value: Any, name: str) -> tuple[int | None, ...]:
@@ -226,15 +199,22 @@ def translate(
         )
     _validate_qkv(query, key, value, num_heads, num_key_value_heads)
 
-    attention_out = _LOCAL_OPSET.FusedInferAttentionScore(
-        query,
-        key,
-        value,
-        num_heads=num_heads,
-        scale=scale,
-        input_layout=input_layout,
-        num_key_value_heads=num_key_value_heads,
+    attention_out, _unused_softmax_lse = cast(
+        tuple[Any, Any],
+        _LOCAL_OPSET.FusedInferAttentionScore(
+            query,
+            key,
+            value,
+            num_heads=num_heads,
+            scale=scale,
+            input_layout=input_layout,
+            num_key_value_heads=num_key_value_heads,
+            inner_precise=inner_precise,
+            _outputs=2,
+        ),
     )
+    typed_attention_out = op.CastLike(attention_out, query)
+    typed_attention_out.shape = query.shape
     softmax_lse = op.Constant(
         value=onnx.helper.make_tensor(
             "softmax_lse",
@@ -243,4 +223,4 @@ def translate(
             [0.0],
         )
     )
-    return attention_out, softmax_lse
+    return typed_attention_out, softmax_lse

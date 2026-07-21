@@ -67,9 +67,9 @@ shellingham==1.5.4
 six==1.17.0
 sympy==1.14.0
 tokenizers==0.22.2
-torch==2.8.0+cpu
+torch==2.12.0
 tqdm==4.68.4
-transformers==5.9.0
+transformers==5.14.0
 typer==0.27.0
 typing_extensions==4.15.0
 tzdata==2026.3

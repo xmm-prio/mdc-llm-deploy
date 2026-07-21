@@ -5,7 +5,8 @@ import onnx
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
-from mdc_llm_deploy.mdc_onnx.opset_downgrade import downgrade_opset
+from mdc_llm_deploy.onnx.opset_downgrade import downgrade_opset
+from mdc_llm_deploy.onnx.schemas import ASCEND_QUANT_OP, register_schemas
 
 
 def _identity_model(opset: int = 21) -> onnx.ModelProto:
@@ -29,8 +30,9 @@ def test_downgrade_opset_in_place() -> None:
 
 
 def test_mdc_default_domain_schema_is_accepted() -> None:
+    register_schemas(ASCEND_QUANT_OP)
     model = _identity_model()
-    model.graph.node[0].op_type = "NPUAscendQuantV2"
+    model.graph.node[0].op_type = ASCEND_QUANT_OP
     model.graph.node[0].input.append("scale")
     model.graph.node[0].attribute.append(helper.make_attribute("dtype", 2))
     model.graph.initializer.append(

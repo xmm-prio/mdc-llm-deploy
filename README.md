@@ -18,7 +18,7 @@ MDC LLM Deploy 是面向 MDC 部署的 Transformers-compatible LLM 压缩与 ONN
 ```python
 import onnx
 
-from mdc_llm_deploy.mdc_onnx import process_onnx
+from mdc_llm_deploy.onnx import process_onnx
 
 model = onnx.load("model.onnx")
 processed = process_onnx(model)
@@ -27,7 +27,19 @@ assert processed is model
 
 该流程原地修改并返回同一模型。任一步失败时抛出异常，输入模型保持不变。支持范围、
 处理顺序、schema 生命周期及硬件准确度验证边界见
-[MDC ONNX 图处理](docs/mdc_onnx.md)。
+[MDC ONNX 图处理](docs/onnx.md)。
+
+需要单独观察融合结果时，可直接运行融合编排器：
+
+```python
+from mdc_llm_deploy.onnx import run_fusion_passes
+
+report = run_fusion_passes(model)
+print(report.counts)
+```
+
+独立编排器固定按 RMSNorm、RoPE、FIA 顺序原地执行。后续 pass 失败时，前序成功结果
+保留；需要全流程失败回滚时应使用 `process_onnx`。
 
 ## Custom operators
 

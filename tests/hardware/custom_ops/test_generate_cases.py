@@ -34,12 +34,24 @@ _EXPECTED_CUSTOM_ABIS = {
     "fused_infer_attention_score": (
         "FusedInferAttentionScore",
         ("query", "key", "value"),
-        ("attention_out",),
+        2,
         {
+            "antiquant_mode": 0,
+            "block_size": 0,
+            "inner_precise": 0,
             "input_layout": b"BNSD",
+            "key_antiquant_mode": 0,
+            "next_tokens": 2_147_483_647,
             "num_heads": 8,
             "num_key_value_heads": 8,
+            "out_dtype": 0,
+            "pre_tokens": 2_147_483_647,
+            "pse_type": 0,
+            "query_quant_mode": 0,
             "scale": pytest.approx(0.125),
+            "softmax_lse_flag": 0,
+            "sparse_mode": 0,
+            "value_antiquant_mode": 0,
         },
     ),
     "moe_expert_int8": (
@@ -98,7 +110,10 @@ def test_generated_onnx_models_have_expected_abis(generated_cases: Path) -> None
         node = nodes[0]
         assert node.domain == ""
         assert tuple(node.input) == expected_inputs
-        assert tuple(node.output) == expected_outputs
+        if isinstance(expected_outputs, int):
+            assert len(node.output) == expected_outputs
+        else:
+            assert tuple(node.output) == expected_outputs
         assert {
             attribute.name: onnx.helper.get_attribute_value(attribute)
             for attribute in node.attribute
@@ -163,13 +178,14 @@ def test_attention_hardware_case_matches_mc62_float_decode_reference(
     node = next(
         node for node in custom.graph.node if node.op_type == "FusedInferAttentionScore"
     )
-    assert len(node.output) == 1
-    assert {attribute.name for attribute in node.attribute} == {
-        "num_heads",
-        "scale",
-        "input_layout",
-        "num_key_value_heads",
-    }
+    assert len(node.output) == 2
+    assert any(
+        producer.op_type in {"Cast", "CastLike"}
+        and producer.input[0] == node.output[0]
+        and custom.graph.output[0].name in producer.output
+        for producer in custom.graph.node
+    )
+    assert len(node.attribute) == 16
     assert len(custom.graph.output) == 1
 
 
