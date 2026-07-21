@@ -7,8 +7,8 @@
 
 ## 源码映射
 
-- Python reference：`mdc_llm_deploy.operators.ascend_dequant`
-- 集中 schema 键：`OPERATOR_SCHEMAS["AscendDequant"]`
+- lowering：`mdc_llm_deploy.mdc_onnx.quant_lowering`
+- ONNX schema：`mdc_llm_deploy.mdc_onnx.schemas`
 - 源码函数使用 snake_case，ONNX `op_type` 使用上方固定名称。
 
 ## ONNX OP 原型
