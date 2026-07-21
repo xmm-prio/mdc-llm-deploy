@@ -1,5 +1,6 @@
 """MDC-specific ONNX graph transformations."""
 
+from .compatibility_lowering import lower_opset_compatibility
 from .fusion_pass import FusionPassResult, FusionReport, run_fusion_passes
 from .opset_downgrade import downgrade_opset
 from .pipeline import process_onnx
@@ -10,6 +11,7 @@ __all__ = [
     "FusionPassResult",
     "FusionReport",
     "downgrade_opset",
+    "lower_opset_compatibility",
     "lower_qdq",
     "process_onnx",
     "register_schemas",

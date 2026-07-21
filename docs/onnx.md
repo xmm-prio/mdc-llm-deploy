@@ -16,15 +16,21 @@ assert processed is model
 
 1. 将受支持的 static W8A8 MatMul QDQ 子图 lowering 为
    `NPUAscendQuantV2 + INT8 MatMul + AscendDequant`；
-2. 验证剩余标准算子可由 opset 18 表达，并把默认 domain opset 降至 18；
-3. 固定按 RMSNorm、RoPE、FIA 顺序运行融合；
-4. 扫描主图及子图，只注册实际出现的 MDC custom-op schema；
-5. 运行最终 ONNX checker，并确认主图无残余 QDQ。
+2. 执行 MDC parser compatibility lowering：把静态 `Split.num_outputs` 精确转换为
+   opset 18 的 `split` 常量输入；
+3. 验证剩余标准算子可由 opset 18 表达，并把默认 domain opset 降至 18；
+4. 固定按 RMSNorm、RoPE、FIA 顺序运行融合；
+5. 扫描主图及子图，只注册实际出现的 MDC custom-op schema；
+6. 运行最终 ONNX checker，并确认主图无残余 QDQ。
 
 lowering 产生的 custom op 会在 opset 检查前按需注册；融合新产生的 schema 会在最终
 checker 前再次按需注册。导入包本身仍无 registry 副作用。整个流程先处理模型副本，
 全部成功后才写回；任一步失败时抛出异常，传入模型字节保持不变，返回值始终是原
 `ModelProto` 对象。
+
+`Split.num_outputs` lowering 保留 ONNX 对非整除轴的定义：前段使用向上取整的块长，
+最后一段接收剩余元素。输入轴必须是已知静态维度；动态维度无法在不引入运行时 shape
+子图的前提下精确转换，因此会明确报错，不生成语义近似图。
 
 ## 融合编排器
 
@@ -100,3 +106,24 @@ ONNX registry 不受该锁约束，仍可在预检和写入期间产生竞态。
 非对称激活的 offset 修正依赖 ATC 的 MatmulQuantToFixpipeFusion。当前自动验收覆盖
 图结构、参数转换和 MC62CM12AA ATC 编译；ATC 编译不能证明非对称路径的最终数值精度，
 该项需要后续真机精度验证。
+
+Qwen3 FIA 硬件 bundle 同时包含：
+
+- `models/`：完整模型，结果用于全图验收；
+- `fia_slices/`：从每个完整模型的真实融合结果裁出的单节点 FIA ABI 编译切片，仅用于
+  隔离 FIA schema、输入槽位和属性能否被 ATC 接受，不能替代完整模型验收；
+- `atc_fusion_switch.json`：关闭
+  `VenBatchMatMulActEltwiseFusionPassManager` 和
+  `VenBatchMatMulEltwiseFusionPassManager`。
+
+CANN 9.1.0 的上述 vendor fusion 会把 Qwen3 MLP MatMul 子图替换成
+`VenFusedBatchMatMulV3`。MC62 安装中的该算子源码调用 `SetFixShiftValue`，但配套
+AscendC `MatmulImpl` 不提供该成员，属于 CANN 组件内部 ABI 不一致。ATC 的
+`--custom_fusion=off` 不会关闭这两个 vendor pass；编译完整模型时还需传入
+`--fusion_switch_file=atc_fusion_switch.json`。该开关只禁用有缺陷的图融合，不改
+ONNX 语义。
+
+CANN 9.1.0 的 MC62 算子库还不支持 Qwen3 MoE 路由子图中的 INT64 `RealDiv`：
+`TopK` 产生的 INT64 索引经过整除后供 `GatherND` 使用，而该环境的 `RealDiv` 仅接收
+INT32 等类型。当前不通过插入窄化转换改变模型语义；因此 MoE 完整图仍记为环境阻塞，
+FIA slice 编译成功也不能覆盖该失败。

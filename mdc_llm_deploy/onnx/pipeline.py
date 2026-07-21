@@ -8,6 +8,7 @@ import onnx
 from onnx import GraphProto, NodeProto
 
 from ._graph import clone_model
+from .compatibility_lowering import lower_opset_compatibility_core
 from .fusion_pass import run_fusion_passes
 from .opset_downgrade import downgrade_opset_core
 from .quant_lowering import lower_qdq_core
@@ -60,6 +61,7 @@ def process_onnx(model: onnx.ModelProto) -> onnx.ModelProto:
     working = clone_model(model)
     lower_qdq_core(working)
     _register_required_schemas(working)
+    lower_opset_compatibility_core(working)
     downgrade_opset_core(working)
     run_fusion_passes(working)
     _register_required_schemas(working)

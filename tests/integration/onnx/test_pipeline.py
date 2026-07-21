@@ -90,6 +90,11 @@ def test_pipeline_stage_order(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(pipeline, "lower_qdq_core", stage("lower"))
     monkeypatch.setattr(pipeline, "_register_required_schemas", stage("register"))
+    monkeypatch.setattr(
+        pipeline,
+        "lower_opset_compatibility_core",
+        stage("compatibility"),
+    )
     monkeypatch.setattr(pipeline, "downgrade_opset_core", stage("downgrade"))
     monkeypatch.setattr(pipeline, "run_fusion_passes", stage("fusion"))
     monkeypatch.setattr(pipeline, "_validate_final_graph", stage("checker"))
@@ -99,6 +104,7 @@ def test_pipeline_stage_order(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls == [
         "lower",
         "register",
+        "compatibility",
         "downgrade",
         "fusion",
         "register",
@@ -106,7 +112,10 @@ def test_pipeline_stage_order(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
 
 
-@pytest.mark.parametrize("failing_stage", ["lower", "downgrade", "fusion", "checker"])
+@pytest.mark.parametrize(
+    "failing_stage",
+    ["lower", "compatibility", "downgrade", "fusion", "checker"],
+)
 def test_pipeline_failure_rolls_back_original_model(
     monkeypatch: pytest.MonkeyPatch,
     failing_stage: str,
@@ -120,6 +129,7 @@ def test_pipeline_failure_rolls_back_original_model(
 
     target = {
         "lower": "lower_qdq_core",
+        "compatibility": "lower_opset_compatibility_core",
         "downgrade": "downgrade_opset_core",
         "fusion": "run_fusion_passes",
         "checker": "_validate_final_graph",
