@@ -1,1 +1,0 @@
-"""Custom operator unit tests."""

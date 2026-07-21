@@ -12,7 +12,6 @@ EXPECTED_DOCUMENTS = {
     "docs/operators/AscendDequant.md",
     "docs/operators/AscendQuantV2.md",
     "docs/operators/FusedInferAttentionScore.md",
-    "docs/operators/MoeExpert.md",
     "docs/operators/RmsNorm.md",
 }
 

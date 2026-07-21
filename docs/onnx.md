@@ -81,9 +81,9 @@ runner 的明确契约，不等同于 `process_onnx` 的全流程原子契约。
 ## Schema 生命周期
 
 全部自定义 schema 集中在 `mdc_llm_deploy.onnx.schemas`，包括量化、
-`NPURmsNorm`、`ApplyRotaryPosEmb`、`FusedInferAttentionScore` 和
-`MoeExpert`。导入 `mdc_llm_deploy.onnx` 或 schema 包都不会修改 ONNX
-进程内 registry。调用方按节点名显式注册：
+`NPURmsNorm`、`ApplyRotaryPosEmb` 和 `FusedInferAttentionScore`。导入
+`mdc_llm_deploy.onnx` 或 schema 包都不会修改 ONNX 进程内 registry。
+调用方按节点名显式注册：
 
 ```python
 from mdc_llm_deploy.onnx.schemas import register_schemas

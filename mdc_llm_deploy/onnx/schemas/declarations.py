@@ -16,7 +16,6 @@ ASCEND_DEQUANT_OP: Final = "AscendDequant"
 RMS_NORM_OP: Final = "NPURmsNorm"
 ROTARY_POSITION_EMBEDDING_OP: Final = "ApplyRotaryPosEmb"
 FUSED_INFER_ATTENTION_SCORE_OP: Final = "FusedInferAttentionScore"
-MOE_EXPERT_OP: Final = "MoeExpert"
 
 CANN_FIA_SOURCE_COMMIT: Final = "606a5ddb67c67d93c137a7b474fa7a5edd05f7c9"
 CANN_FIA_SOURCE_URL: Final = (
@@ -323,30 +322,6 @@ def create_fused_infer_attention_score_schema() -> OpSchema:
     )
 
 
-def create_moe_expert_schema() -> OpSchema:
-    """Create the fully quantized routed-expert schema."""
-    return OpSchema(
-        MOE_EXPERT_OP,
-        "",
-        MDC_ONNX_OPSET,
-        doc="Fully quantized MDC routed SwiGLU expert operator.",
-        inputs=[
-            _parameter("x", "T_INT8"),
-            _parameter("topk_ids", "T_INT16"),
-            _parameter("topk_weight", "T_FLOAT16"),
-            _parameter("expert_weights", "T_INT8"),
-            _parameter("quant_scales", "T_FLOAT32"),
-        ],
-        outputs=[_parameter("out", "T_FLOAT16")],
-        type_constraints=[
-            ("T_INT8", ["tensor(int8)"], "INT8 tensors."),
-            ("T_INT16", ["tensor(int16)"], "INT16 tensors."),
-            ("T_FLOAT16", ["tensor(float16)"], "FLOAT16 tensors."),
-            ("T_FLOAT32", ["tensor(float)"], "FLOAT32 tensors."),
-        ],
-    )
-
-
 SCHEMA_FACTORIES = MappingProxyType(
     {
         ASCEND_QUANT_OP: create_ascend_quant_schema,
@@ -354,7 +329,6 @@ SCHEMA_FACTORIES = MappingProxyType(
         RMS_NORM_OP: create_rms_norm_schema,
         ROTARY_POSITION_EMBEDDING_OP: create_rotary_position_embedding_schema,
         FUSED_INFER_ATTENTION_SCORE_OP: create_fused_infer_attention_score_schema,
-        MOE_EXPERT_OP: create_moe_expert_schema,
     }
 )
 
@@ -370,7 +344,6 @@ __all__ = [
     "CANN_FIA_SOURCE_URL",
     "FUSED_INFER_ATTENTION_SCORE_OP",
     "MDC_ONNX_OPSET",
-    "MOE_EXPERT_OP",
     "QUANTIZATION_SCHEMA_NAMES",
     "RMS_NORM_OP",
     "ROTARY_POSITION_EMBEDDING_OP",
@@ -378,7 +351,6 @@ __all__ = [
     "create_ascend_dequant_schema",
     "create_ascend_quant_schema",
     "create_fused_infer_attention_score_schema",
-    "create_moe_expert_schema",
     "create_rms_norm_schema",
     "create_rotary_position_embedding_schema",
 ]
