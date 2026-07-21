@@ -1,20 +1,22 @@
-"""Generic registration orchestration for inference-only custom operators."""
+"""Thread-safe Torch registration and local ONNX export-profile orchestration."""
 
 from __future__ import annotations
 
-import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from threading import RLock
+from types import MappingProxyType
 from typing import Any, NoReturn, Protocol, cast
 
+import onnx
 import torch
+from onnx.defs import OpSchema
 
-from .base import CustomOp
+from .base import OnnxOperatorSpec, OperatorPlugin, TorchOperatorSpec
 
 
 class CustomOpDefinition(Protocol):
-    """Describe the public registration surface returned by custom_op."""
+    """Describe Torch's custom-op definition methods used by this registry."""
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Invoke the custom operator."""
@@ -25,129 +27,220 @@ class CustomOpDefinition(Protocol):
         """Attach one device kernel."""
 
     def register_fake(self, fn: Callable[..., Any]) -> Callable[..., Any]:
-        """Attach one FakeTensor/MetaTensor implementation."""
+        """Attach one FakeTensor implementation."""
 
     def register_autograd(self, backward: Callable[..., Any]) -> None:
         """Attach one autograd implementation."""
 
 
 @dataclass(frozen=True, slots=True)
-class RegisteredCustomOp:
-    """Hold the class contract and its PyTorch custom-op definition."""
+class RegisteredTorchOperator:
+    """Hold one immutable Torch contract and its process-local registration."""
 
-    operator_type: type[CustomOp]
+    spec: TorchOperatorSpec
     definition: CustomOpDefinition
+    dispatch_target: Callable[..., Any]
 
 
-class CustomOpRegistry:
-    """Register independent custom-op classes through one generic pipeline."""
+@dataclass(frozen=True, slots=True)
+class RegisteredOperator:
+    """Hold one plugin and its eagerly created Torch registration."""
+
+    plugin: OperatorPlugin
+    torch: RegisteredTorchOperator
+
+
+@dataclass(frozen=True, slots=True)
+class OnnxExportProfile:
+    """Expose selected ONNX contracts and a read-only Dynamo translation table."""
+
+    custom_translation_table: Mapping[Callable[..., Any], Callable[..., Any]]
+    operators: Mapping[str, OnnxOperatorSpec]
+
+
+def _schema_fingerprint(schema: OpSchema) -> tuple[object, ...]:
+    return (
+        schema.name,
+        schema.domain,
+        schema.since_version,
+        schema.doc,
+        tuple(repr(parameter) for parameter in schema.inputs),
+        tuple(repr(parameter) for parameter in schema.outputs),
+        tuple(repr(constraint) for constraint in schema.type_constraints),
+        tuple(
+            (name, repr(attribute))
+            for name, attribute in sorted(schema.attributes.items())
+        ),
+    )
+
+
+class TorchOperatorRegistry:
+    """Register broad Torch execution contracts without ONNX side effects."""
 
     def __init__(self) -> None:
-        self._entries: dict[str, RegisteredCustomOp] = {}
+        self._entries: dict[str, RegisteredTorchOperator] = {}
         self._lock = RLock()
 
-    def register(self, operator_type: type[CustomOp]) -> RegisteredCustomOp:
-        """Register one operator, returning the existing entry when repeated."""
-        self._validate(operator_type)
-        name = operator_type.qualified_name
-
+    def register(self, spec: TorchOperatorSpec) -> RegisteredTorchOperator:
+        """Register one Torch contract or return its existing registration."""
         with self._lock:
-            existing = self._entries.get(name)
+            existing = self._entries.get(spec.qualified_name)
             if existing is not None:
-                if existing.operator_type is not operator_type:
-                    raise ValueError(f"Custom operator {name!r} has a different registered class")
+                if existing.spec != spec:
+                    raise ValueError(
+                        f"Torch operator {spec.qualified_name!r} has a conflicting contract"
+                    )
                 return existing
 
             definition = cast(
                 CustomOpDefinition,
                 torch.library.custom_op(
-                    name,
-                    operator_type.cpu,
+                    spec.qualified_name,
+                    spec.cpu_kernel,
                     mutates_args=(),
                     device_types="cpu",
-                    schema=operator_type.schema,
+                    schema=spec.schema,
                 ),
             )
-            definition.register_kernel("cuda", operator_type.cuda)
-            definition.register_fake(operator_type.meta)
-            definition.register_autograd(self._inference_only_backward(name))
-            register_onnx_symbolic = cast(
-                Callable[[str, Callable[..., Any], int], None],
-                torch.onnx.register_custom_op_symbolic,  # type: ignore[attr-defined]
+            definition.register_kernel("cuda", spec.cuda_kernel)
+            definition.register_fake(spec.fake_kernel)
+            definition.register_autograd(
+                _inference_only_backward(spec.qualified_name)
             )
-            register_onnx_symbolic(
-                name,
-                operator_type.onnx,
-                operator_type.onnx_opset,
+            namespace, _, operator_name = spec.qualified_name.partition("::")
+            dispatch_target = cast(
+                Callable[..., Any],
+                getattr(getattr(torch.ops, namespace), operator_name).default,
             )
-
-            entry = RegisteredCustomOp(operator_type=operator_type, definition=definition)
-            self._entries[name] = entry
+            entry = RegisteredTorchOperator(spec, definition, dispatch_target)
+            self._entries[spec.qualified_name] = entry
             return entry
 
-    def register_many(
-        self, *operator_types: type[CustomOp]
-    ) -> tuple[RegisteredCustomOp, ...]:
-        """Register operator classes in the supplied order."""
-        return tuple(self.register(operator_type) for operator_type in operator_types)
 
-    def get(self, qualified_name: str) -> RegisteredCustomOp:
-        """Return one registered entry by qualified name."""
+class OnnxSchemaRegistry:
+    """Install selected default-domain schemas with conflict detection."""
+
+    def __init__(self) -> None:
+        self._schemas: dict[tuple[str, int], tuple[object, ...]] = {}
+        self._lock = RLock()
+
+    def register(self, spec: OnnxOperatorSpec) -> None:
+        """Register one local schema idempotently and reject structural conflicts."""
+        key = (spec.name, spec.opset)
+        fingerprint = _schema_fingerprint(spec.schema)
+        with self._lock:
+            known = self._schemas.get(key)
+            if known is not None:
+                if known != fingerprint:
+                    raise ValueError(
+                        f"ONNX schema {spec.name!r} opset {spec.opset} conflicts "
+                        "with its process-local registration"
+                    )
+                return
+
+            existing = _get_exact_schema(spec.name, spec.opset)
+            if existing is not None:
+                if _schema_fingerprint(existing) != fingerprint:
+                    raise ValueError(
+                        f"ONNX schema {spec.name!r} opset {spec.opset} is already "
+                        "registered with a different contract"
+                    )
+            else:
+                onnx.defs.register_schema(spec.schema)
+            self._schemas[key] = fingerprint
+
+
+class OperatorRegistry:
+    """Coordinate independently loaded plugins and lazily built ONNX profiles."""
+
+    def __init__(self) -> None:
+        self._operators: dict[str, RegisteredOperator] = {}
+        self._torch = TorchOperatorRegistry()
+        self._onnx = OnnxSchemaRegistry()
+        self._lock = RLock()
+
+    def register(self, plugin: OperatorPlugin) -> RegisteredOperator:
+        """Register only the plugin's broad Torch contract."""
+        with self._lock:
+            existing = self._operators.get(plugin.name)
+            if existing is not None:
+                if existing.plugin != plugin:
+                    raise ValueError(
+                        f"Operator plugin {plugin.name!r} has a conflicting contract"
+                    )
+                return existing
+            torch_entry = self._torch.register(plugin.torch)
+            entry = RegisteredOperator(plugin, torch_entry)
+            self._operators[plugin.name] = entry
+            return entry
+
+    def get(self, name: str) -> RegisteredOperator:
+        """Return one loaded plugin by its public name."""
         with self._lock:
             try:
-                return self._entries[qualified_name]
+                return self._operators[name]
             except KeyError:
-                raise KeyError(f"Custom operator {qualified_name!r} is not registered") from None
+                raise KeyError(f"Operator plugin {name!r} is not loaded") from None
 
-    def entries(self) -> tuple[RegisteredCustomOp, ...]:
-        """Return an immutable snapshot of registered entries."""
+    def entries(self) -> tuple[RegisteredOperator, ...]:
+        """Return an immutable snapshot of loaded plugins."""
         with self._lock:
-            return tuple(self._entries.values())
+            return tuple(self._operators.values())
 
-    @staticmethod
-    def _validate(operator_type: type[CustomOp]) -> None:
-        if not inspect.isclass(operator_type) or not issubclass(operator_type, CustomOp):
-            raise TypeError("operator_type must be a CustomOp subclass")
-        if inspect.isabstract(operator_type):
-            raise TypeError("operator_type must implement every CustomOp interface")
+    def create_profile(self, *operator_names: str) -> OnnxExportProfile:
+        """Register selected ONNX schemas and build their Dynamo translations."""
+        with self._lock:
+            selected: dict[str, RegisteredOperator] = {}
+            for name in operator_names:
+                if name not in selected:
+                    selected[name] = self.get(name)
 
-        name = operator_type.qualified_name
-        namespace, separator, operator_name = name.partition("::")
-        if separator != "::" or not namespace or not operator_name or "::" in operator_name:
-            raise ValueError("qualified_name must use the 'namespace::operator' form")
-        if not operator_type.schema:
-            raise ValueError("schema must not be empty")
-        if operator_type.onnx_opset <= 0:
-            raise ValueError("onnx_opset must be positive")
+            translations: dict[Callable[..., Any], Callable[..., Any]] = {}
+            contracts: dict[str, OnnxOperatorSpec] = {}
+            for name, entry in selected.items():
+                self._onnx.register(entry.plugin.onnx)
+                translations[entry.torch.dispatch_target] = entry.plugin.onnx.translation
+                contracts[name] = entry.plugin.onnx
 
-    @staticmethod
-    def _inference_only_backward(qualified_name: str) -> Callable[..., NoReturn]:
-        def backward(_context: object, *_grad_outputs: object) -> NoReturn:
-            raise RuntimeError(f"Custom operator {qualified_name!r} is inference-only")
-
-        return backward
+            return OnnxExportProfile(
+                custom_translation_table=MappingProxyType(translations),
+                operators=MappingProxyType(contracts),
+            )
 
 
-_REGISTRY = CustomOpRegistry()
+def _get_exact_schema(name: str, version: int) -> OpSchema | None:
+    try:
+        schema = onnx.defs.get_schema(name, version, "")
+    except onnx.defs.SchemaError:
+        return None
+    return schema if schema.since_version == version else None
 
 
-def register_custom_op(operator_type: type[CustomOp]) -> RegisteredCustomOp:
-    """Register one custom-op class in the process-wide registry."""
-    return _REGISTRY.register(operator_type)
+def _inference_only_backward(qualified_name: str) -> Callable[..., NoReturn]:
+    def backward(_context: object, *_grad_outputs: object) -> NoReturn:
+        raise RuntimeError(f"Custom operator {qualified_name!r} is inference-only")
+
+    return backward
 
 
-def register_custom_ops(
-    *operator_types: type[CustomOp],
-) -> tuple[RegisteredCustomOp, ...]:
-    """Register custom-op classes incrementally in the process-wide registry."""
-    return _REGISTRY.register_many(*operator_types)
+_REGISTRY = OperatorRegistry()
 
 
-def get_custom_op(qualified_name: str) -> RegisteredCustomOp:
-    """Return one process-wide custom-op registration."""
-    return _REGISTRY.get(qualified_name)
+def register_operator(plugin: OperatorPlugin) -> RegisteredOperator:
+    """Load one plugin's Torch contract into the process-wide registry."""
+    return _REGISTRY.register(plugin)
 
 
-def registered_custom_ops() -> tuple[RegisteredCustomOp, ...]:
-    """Return a snapshot of process-wide custom-op registrations."""
+def get_operator(name: str) -> RegisteredOperator:
+    """Return one process-wide loaded operator plugin."""
+    return _REGISTRY.get(name)
+
+
+def registered_operators() -> tuple[RegisteredOperator, ...]:
+    """Return an immutable snapshot of process-wide loaded plugins."""
     return _REGISTRY.entries()
+
+
+def create_onnx_export_profile(*operator_names: str) -> OnnxExportProfile:
+    """Create an ONNX profile for already loaded operator plugins."""
+    return _REGISTRY.create_profile(*operator_names)

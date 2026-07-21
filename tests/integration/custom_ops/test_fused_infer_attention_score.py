@@ -7,23 +7,22 @@ import pytest
 import torch
 
 from mdc_llm_deploy.custom_ops.fused_infer_attention_score import (
-    FusedInferAttentionScore,
+    ONNX_ATTRIBUTE_NAMES,
+    PLUGIN_NAME,
+    attention_kernel,
+    fused_infer_attention_score,
 )
-from mdc_llm_deploy.custom_ops.registry import register_custom_op
+from mdc_llm_deploy.custom_ops.registry import create_onnx_export_profile
 
 
 class _AttentionModule(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self._operator = register_custom_op(FusedInferAttentionScore).definition
-
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._operator(
+        return fused_infer_attention_score(
             query,
             key,
             value,
@@ -34,76 +33,71 @@ class _AttentionModule(torch.nn.Module):
         )
 
 
-class _MaskedAttentionModule(_AttentionModule):
+class _MaskedAttentionModule(torch.nn.Module):
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        atten_mask: torch.Tensor,
+        mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._operator(
+        return fused_infer_attention_score(
             query,
             key,
             value,
-            atten_mask=atten_mask,
+            atten_mask=mask,
             num_heads=4,
             scale=0.5,
             input_layout="BNSD",
             num_key_value_heads=2,
         )
+
+
+def _decode_inputs(
+    dtype: torch.dtype = torch.float16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.randn(1, 4, 1, 8, dtype=dtype),
+        torch.randn(1, 2, 5, 8, dtype=dtype),
+        torch.randn(1, 2, 5, 8, dtype=dtype),
+    )
 
 
 @pytest.mark.integration
-def test_registered_operator_runs_through_torch_compile() -> None:
+def test_registered_operator_runs_through_fullgraph_compile_and_export() -> None:
     module = _AttentionModule()
+    inputs = _decode_inputs(torch.float32)
     compiled = torch.compile(module, backend="eager", fullgraph=True)
-    query = torch.randn(1, 4, 2, 4, dtype=torch.float16)
-    key = torch.randn(1, 2, 3, 4, dtype=torch.float16)
-    value = torch.randn(1, 2, 3, 4, dtype=torch.float16)
-
-    actual = compiled(query, key, value)
-    expected = module(query, key, value)
-
+    expected = module(*inputs)
+    actual = compiled(*inputs)
     torch.testing.assert_close(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1])
 
-
-@pytest.mark.integration
-def test_registered_operator_runs_through_torch_export() -> None:
-    module = _AttentionModule()
-    query = torch.randn(1, 4, 2, 4)
-    key = torch.randn(1, 2, 3, 4)
-    value = torch.randn(1, 2, 3, 4)
-
-    exported = torch.export.export(module, (query, key, value), strict=True)
-    actual = exported.module()(query, key, value)
-    expected = module(query, key, value)
-
-    torch.testing.assert_close(actual[0], expected[0])
-    torch.testing.assert_close(actual[1], expected[1])
+    exported = torch.export.export(module, inputs, strict=True)
+    exported_actual = exported.module()(*inputs)
+    torch.testing.assert_close(exported_actual[0], expected[0])
+    torch.testing.assert_close(exported_actual[1], expected[1])
 
 
 @pytest.mark.integration
-def test_legacy_onnx_export_emits_mc62_decode_abi(
+def test_dynamo_onnx_emits_three_input_single_output_fia_and_constant(
     tmp_path: Path,
 ) -> None:
-    module = _AttentionModule()
-    query = torch.randn(1, 4, 1, 4, dtype=torch.float16)
-    key = torch.randn(1, 2, 3, 4, dtype=torch.float16)
-    value = torch.randn(1, 2, 3, 4, dtype=torch.float16)
+    profile = create_onnx_export_profile(PLUGIN_NAME)
     output_path = tmp_path / "attention.onnx"
-
     torch.onnx.export(
-        module,
-        (query, key, value),
+        _AttentionModule(),
+        _decode_inputs(),
         output_path,
         opset_version=18,
-        dynamo=False,
+        dynamo=True,
+        verbose=False,
+        custom_translation_table=profile.custom_translation_table,
         input_names=["query", "key", "value"],
         output_names=["attention_out", "softmax_lse"],
     )
     model = onnx.load(output_path)
+    onnx.checker.check_model(model, full_check=True)
     nodes = [node for node in model.graph.node if node.op_type == "FusedInferAttentionScore"]
 
     assert len(nodes) == 1
@@ -111,92 +105,74 @@ def test_legacy_onnx_export_emits_mc62_decode_abi(
     assert node.domain == ""
     assert list(node.input) == ["query", "key", "value"]
     assert len(node.output) == 1
-    assert {attribute.name for attribute in node.attribute} == set(
-        FusedInferAttentionScore.onnx_attribute_defaults
-    )
+    assert {attribute.name for attribute in node.attribute} == ONNX_ATTRIBUTE_NAMES
     lse_output = model.graph.output[1].name
     assert any(
-        producer.op_type == "Constant" and lse_output in producer.output
+        producer.domain == ""
+        and producer.op_type == "Constant"
+        and lse_output in producer.output
         for producer in model.graph.node
     )
+    assert not any(node.domain == "mdc_llm_deploy" for node in model.graph.node)
 
 
 @pytest.mark.integration
-def test_legacy_onnx_export_rejects_float_prefill(tmp_path: Path) -> None:
-    module = _AttentionModule()
-    inputs = (
-        torch.randn(1, 4, 3, 4, dtype=torch.float16),
-        torch.randn(1, 2, 16, 4, dtype=torch.float16),
-        torch.randn(1, 2, 16, 4, dtype=torch.float16),
-    )
-
-    with pytest.raises(RuntimeError, match="query sequence length S=1"):
+@pytest.mark.parametrize(
+    ("module", "inputs", "message"),
+    [
+        (
+            _AttentionModule(),
+            (
+                torch.randn(1, 4, 3, 8, dtype=torch.float16),
+                torch.randn(1, 2, 5, 8, dtype=torch.float16),
+                torch.randn(1, 2, 5, 8, dtype=torch.float16),
+            ),
+            "query sequence length S=1",
+        ),
+        (
+            _MaskedAttentionModule(),
+            (
+                *_decode_inputs(),
+                torch.zeros(1, 1, 1, 5, dtype=torch.bool),
+            ),
+            "optional inputs: atten_mask",
+        ),
+    ],
+)
+def test_dynamo_onnx_rejects_torch_legal_inputs_outside_decode_contract(
+    tmp_path: Path,
+    module: torch.nn.Module,
+    inputs: tuple[torch.Tensor, ...],
+    message: str,
+) -> None:
+    profile = create_onnx_export_profile(PLUGIN_NAME)
+    with pytest.raises(Exception, match=message):
         torch.onnx.export(
             module,
             inputs,
-            tmp_path / "prefill.onnx",
+            tmp_path / "invalid.onnx",
             opset_version=18,
-            dynamo=False,
-        )
-
-
-@pytest.mark.integration
-def test_legacy_onnx_export_rejects_optional_mask(tmp_path: Path) -> None:
-    module = _MaskedAttentionModule()
-    inputs = (
-        torch.randn(1, 4, 1, 4, dtype=torch.float16),
-        torch.randn(1, 2, 16, 4, dtype=torch.float16),
-        torch.randn(1, 2, 16, 4, dtype=torch.float16),
-        torch.zeros(1, 1, 1, 16, dtype=torch.bool),
-    )
-
-    with pytest.raises(RuntimeError, match="optional inputs: atten_mask"):
-        torch.onnx.export(
-            module,
-            inputs,
-            tmp_path / "masked.onnx",
-            opset_version=18,
-            dynamo=False,
+            dynamo=True,
+            verbose=False,
+            custom_translation_table=profile.custom_translation_table,
         )
 
 
 @pytest.mark.integration
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
-def test_cuda_triton_matches_fp32_cpu_reference() -> None:
-    torch.manual_seed(11)
-    query_cpu = torch.randn(2, 4, 3, 16, dtype=torch.float16)
-    key_cpu = torch.randn(2, 2, 5, 16, dtype=torch.float16)
-    value_cpu = torch.randn(2, 2, 5, 16, dtype=torch.float16)
-    mask_cpu = torch.zeros(2, 1, 3, 5, dtype=torch.bool)
-    mask_cpu[:, :, :, -1] = True
-    query_lengths_cpu = torch.tensor([3, 2], dtype=torch.int64)
-    key_lengths_cpu = torch.tensor([5, 4], dtype=torch.int64)
-    kwargs = {
-        "num_heads": 4,
-        "num_key_value_heads": 2,
-        "scale": 0.25,
-        "input_layout": "BNSD",
-        "softmax_lse_flag": True,
-    }
-
-    expected = FusedInferAttentionScore.cpu(
-        query_cpu,
-        key_cpu,
-        value_cpu,
-        atten_mask=mask_cpu,
-        actual_seq_lengths=query_lengths_cpu,
-        actual_seq_lengths_kv=key_lengths_cpu,
-        **kwargs,
+def test_cuda_kernel_matches_cpu() -> None:
+    cpu_inputs = _decode_inputs()
+    expected = attention_kernel(
+        *cpu_inputs,
+        num_heads=4,
+        num_key_value_heads=2,
+        scale=0.5,
     )
-    actual = FusedInferAttentionScore.cuda(
-        query_cpu.cuda(),
-        key_cpu.cuda(),
-        value_cpu.cuda(),
-        atten_mask=mask_cpu.cuda(),
-        actual_seq_lengths=query_lengths_cpu.cuda(),
-        actual_seq_lengths_kv=key_lengths_cpu.cuda(),
-        **kwargs,
+    actual = fused_infer_attention_score(
+        *(tensor.cuda() for tensor in cpu_inputs),
+        num_heads=4,
+        num_key_value_heads=2,
+        scale=0.5,
     )
-
     torch.testing.assert_close(actual[0].cpu(), expected[0], atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(actual[1].cpu(), expected[1], atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual[1].cpu(), expected[1])

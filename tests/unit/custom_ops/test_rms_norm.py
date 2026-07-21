@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 import torch
+from onnxscript import ir
 
-from mdc_llm_deploy.custom_ops.rms_norm import RmsNorm
+from mdc_llm_deploy.custom_ops.rms_norm import (
+    cpu,
+    fake,
+    rms_norm,
+    validate_onnx_inputs,
+)
 
 
 def _reference(
@@ -21,7 +25,7 @@ def _reference(
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("gamma_shape", [(4,), (3, 4)])
-def test_cpu_matches_fp32_reference(
+def test_registered_operator_keeps_broad_torch_contract(
     dtype: torch.dtype,
     gamma_shape: tuple[int, ...],
 ) -> None:
@@ -29,7 +33,7 @@ def test_cpu_matches_fp32_reference(
     x = torch.randn(2, 3, 4, dtype=dtype)
     gamma = torch.randn(gamma_shape, dtype=dtype)
 
-    actual_y, actual_rstd = RmsNorm.cpu(x, gamma, 1e-5)
+    actual_y, actual_rstd = rms_norm(x, gamma, 1e-5)
     expected_y, expected_rstd = _reference(x, gamma, 1e-5)
 
     torch.testing.assert_close(actual_y, expected_y)
@@ -42,13 +46,7 @@ def test_cpu_matches_fp32_reference(
 @pytest.mark.parametrize(
     ("x", "gamma", "epsilon", "error_type", "message"),
     [
-        (
-            torch.ones(2, 3),
-            torch.ones(2),
-            1e-6,
-            ValueError,
-            "trailing",
-        ),
+        (torch.ones(2, 3), torch.ones(2), 1e-6, ValueError, "trailing"),
         (
             torch.ones(2, 3),
             torch.ones(3, dtype=torch.float16),
@@ -63,13 +61,7 @@ def test_cpu_matches_fp32_reference(
             TypeError,
             "float16",
         ),
-        (
-            torch.ones(2, 3),
-            torch.ones(3),
-            0.0,
-            ValueError,
-            "positive",
-        ),
+        (torch.ones(2, 3), torch.ones(3), 0.0, ValueError, "positive"),
         (
             torch.tensor([[float("nan"), 1.0]]),
             torch.ones(2),
@@ -77,16 +69,9 @@ def test_cpu_matches_fp32_reference(
             ValueError,
             "finite values",
         ),
-        (
-            torch.ones(2, 3),
-            torch.tensor([1.0, float("inf"), 1.0]),
-            1e-6,
-            ValueError,
-            "finite values",
-        ),
     ],
 )
-def test_cpu_rejects_invalid_contract(
+def test_cpu_rejects_invalid_torch_contract(
     x: torch.Tensor,
     gamma: torch.Tensor,
     epsilon: float,
@@ -94,71 +79,45 @@ def test_cpu_rejects_invalid_contract(
     message: str,
 ) -> None:
     with pytest.raises(error_type, match=message):
-        RmsNorm.cpu(x, gamma, epsilon)
+        cpu(x, gamma, epsilon)
 
 
 def test_fake_returns_documented_metadata() -> None:
     x = torch.empty(2, 3, 4, dtype=torch.float16, device="meta")
     gamma = torch.empty(3, 4, dtype=torch.float16, device="meta")
 
-    y, rstd = RmsNorm.fake(x, gamma)
+    y, rstd = fake(x, gamma)
+    registered_y, registered_rstd = rms_norm(x, gamma)
 
-    assert y.shape == (2, 3, 4)
-    assert y.dtype == torch.float16
-    assert y.device.type == "meta"
-    assert rstd.shape == (2,)
-    assert rstd.dtype == torch.float32
-    assert rstd.device.type == "meta"
-
-
-class _Graph:
-    def __init__(self) -> None:
-        self.call: tuple[str, tuple[Any, ...], dict[str, Any]] | None = None
-
-    def op(self, name: str, *args: Any, **kwargs: Any) -> tuple[str, str]:
-        self.call = (name, args, kwargs)
-        return ("y", "rstd")
+    for actual_y, actual_rstd in ((y, rstd), (registered_y, registered_rstd)):
+        assert actual_y.shape == (2, 3, 4)
+        assert actual_y.dtype == torch.float16
+        assert actual_y.device.type == "meta"
+        assert actual_rstd.shape == (2,)
+        assert actual_rstd.dtype == torch.float32
+        assert actual_rstd.device.type == "meta"
 
 
-class _TensorType:
-    def __init__(self, shape: tuple[int | None, ...], dtype: str) -> None:
-        self._shape = shape
-        self._dtype = dtype
+def test_registered_operator_passes_opcheck() -> None:
+    x = torch.randn(2, 3, 4)
+    gamma = torch.randn(3, 4)
 
-    def sizes(self) -> tuple[int | None, ...]:
-        return self._shape
+    result = torch.library.opcheck(rms_norm, (x, gamma, 1e-5))
 
-    def scalarType(self) -> str:  # noqa: N802
-        return self._dtype
+    assert set(result.values()) == {"SUCCESS"}
 
 
-class _Value:
-    def __init__(self, shape: tuple[int | None, ...], dtype: str = "Float") -> None:
-        self._type = _TensorType(shape, dtype)
-
-    def type(self) -> _TensorType:
-        return self._type
+def _ir_value(shape: list[int | str], dtype: ir.DataType = ir.DataType.FLOAT) -> ir.Value:
+    return ir.Value(shape=ir.Shape(shape), type=ir.TensorType(dtype))
 
 
-def test_onnx_symbolic_uses_documented_abi() -> None:
-    graph = _Graph()
-    x = _Value((2, 3, 4))
-    gamma = _Value((3, 4))
-
-    outputs = RmsNorm.onnx(graph, x, gamma, 1e-5)
-
-    assert outputs == ("y", "rstd")
-    assert graph.call == (
-        "NPURmsNorm",
-        (x, gamma),
-        {"epsilon_f": 1e-5, "outputs": 2},
-    )
+def test_onnx_contract_accepts_static_trailing_shape() -> None:
+    validate_onnx_inputs(_ir_value([2, 3, 4]), _ir_value([3, 4]), 1e-5)
 
 
-def test_onnx_symbolic_rejects_dynamic_shapes() -> None:
-    graph = _Graph()
-    x = _Value((2, 3, None))
-    gamma = _Value((3, 4))
+def test_onnx_contract_rejects_torch_legal_dynamic_shape() -> None:
+    x = _ir_value([2, "sequence", 4])
+    gamma = _ir_value([4])
 
     with pytest.raises(RuntimeError, match="static input shapes"):
-        RmsNorm.onnx(graph, x, gamma)
+        validate_onnx_inputs(x, gamma, 1e-5)

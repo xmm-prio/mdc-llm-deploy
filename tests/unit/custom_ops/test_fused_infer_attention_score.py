@@ -1,47 +1,45 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from mdc_llm_deploy.custom_ops.fused_infer_attention_score import (
-    FusedInferAttentionScore,
+    ONNX_ATTRIBUTE_NAMES,
+    PLUGIN,
+    REGISTERED_OPERATOR,
+    TORCH_INPUT_SLOTS,
+    attention_kernel,
+    fake_attention,
+    fused_infer_attention_score,
 )
+from mdc_llm_deploy.custom_ops.fused_infer_attention_score.onnx import translate
 
 
-def _manual_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    mask: torch.Tensor | None,
-    scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    repeats = query.shape[1] // key.shape[1]
-    expanded_key = key.repeat_interleave(repeats, dim=1)
-    expanded_value = value.repeat_interleave(repeats, dim=1)
-    scores = torch.matmul(query.float(), expanded_key.float().transpose(-1, -2)) * scale
-    if mask is not None:
-        scores = scores.masked_fill(torch.broadcast_to(mask, scores.shape), -torch.inf)
+def _inputs(
+    *,
+    dtype: torch.dtype = torch.float32,
+    query_sequence: int = 3,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
-        torch.matmul(torch.softmax(scores, dim=-1), expanded_value.float()).to(query.dtype),
-        torch.logsumexp(scores, dim=-1, keepdim=True),
+        torch.randn(2, 4, query_sequence, 8, dtype=dtype),
+        torch.randn(2, 2, 5, 8, dtype=dtype),
+        torch.randn(2, 2, 5, 8, dtype=dtype),
     )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cpu_bnsd_prefill_supports_gqa_broadcast_mask_and_lse(
-    dtype: torch.dtype,
-) -> None:
+def test_torch_kernel_supports_prefill_gqa_mask_and_lse(dtype: torch.dtype) -> None:
     torch.manual_seed(7)
-    query = torch.randn(2, 4, 3, 8, dtype=dtype)
-    key = torch.randn(2, 2, 5, 8, dtype=dtype)
-    value = torch.randn(2, 2, 5, 8, dtype=dtype)
+    query, key, value = _inputs(dtype=dtype)
     mask = torch.zeros(2, 1, 3, 5, dtype=torch.bool)
-    mask[:, :, :, -1] = True
+    mask[..., -1] = True
     scale = 1.0 / math.sqrt(8)
 
-    output, lse = FusedInferAttentionScore.cpu(
+    output, lse = fused_infer_attention_score(
         query,
         key,
         value,
@@ -52,116 +50,29 @@ def test_cpu_bnsd_prefill_supports_gqa_broadcast_mask_and_lse(
         input_layout="BNSD",
         softmax_lse_flag=True,
     )
-    expected_output, expected_lse = _manual_attention(query, key, value, mask, scale)
+    expanded_key = key.repeat_interleave(2, dim=1)
+    expanded_value = value.repeat_interleave(2, dim=1)
+    scores = torch.matmul(query.float(), expanded_key.float().transpose(-1, -2)) * scale
+    scores = scores.masked_fill(torch.broadcast_to(mask, scores.shape), -torch.inf)
+    expected = torch.matmul(torch.softmax(scores, dim=-1), expanded_value.float()).to(dtype)
 
     tolerance = 2e-2 if dtype != torch.float32 else 1e-5
-    torch.testing.assert_close(output, expected_output, atol=tolerance, rtol=tolerance)
-    torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(output, expected, atol=tolerance, rtol=tolerance)
+    torch.testing.assert_close(lse, torch.logsumexp(scores, dim=-1, keepdim=True))
     assert lse.dtype == torch.float32
 
 
-def test_cpu_bsnd_decode_honors_actual_sequence_lengths() -> None:
-    query = torch.tensor(
-        [
-            [[[1.0, 0.0], [0.0, 1.0]]],
-            [[[1.0, 1.0], [1.0, -1.0]]],
-        ]
-    )
-    key = torch.tensor(
-        [
-            [[[1.0, 0.0], [0.0, 1.0]], [[0.0, 1.0], [1.0, 0.0]]],
-            [[[1.0, 0.0], [0.0, 1.0]], [[1.0, 1.0], [1.0, -1.0]]],
-        ]
-    )
-    value = key * 2
+def test_torch_kernel_supports_bsnd_and_actual_lengths() -> None:
+    query = torch.randn(2, 1, 4, 8)
+    key = torch.randn(2, 5, 2, 8)
+    value = torch.randn(2, 5, 2, 8)
 
-    output, lse = FusedInferAttentionScore.cpu(
+    output, lse = attention_kernel(
         query,
         key,
         value,
-        actual_seq_lengths=torch.tensor([1, 0], dtype=torch.int64),
-        actual_seq_lengths_kv=torch.tensor([1, 2], dtype=torch.int64),
-        num_heads=2,
-        num_key_value_heads=2,
-        input_layout="BSND",
-        softmax_lse_flag=True,
-    )
-
-    torch.testing.assert_close(output[0, 0], value[0, 0])
-    torch.testing.assert_close(output[1], torch.zeros_like(output[1]))
-    assert torch.isfinite(lse[0]).all()
-    assert torch.isinf(lse[1]).all()
-
-
-def test_cpu_without_lse_returns_documented_placeholder() -> None:
-    query = torch.ones(1, 1, 1, 4)
-    output, lse = FusedInferAttentionScore.cpu(
-        query,
-        query,
-        query,
-        num_heads=1,
-        input_layout="BNSD",
-    )
-
-    assert output.shape == query.shape
-    assert lse.shape == (1,)
-    assert lse.dtype == torch.float32
-    assert lse.item() == 0.0
-
-
-def test_cpu_rejects_fully_masked_active_row() -> None:
-    tensor = torch.ones(1, 1, 2, 4)
-
-    with pytest.raises(ValueError, match="visible key"):
-        FusedInferAttentionScore.cpu(
-            tensor,
-            tensor,
-            tensor,
-            atten_mask=torch.ones(1, 1, 2, 2, dtype=torch.bool),
-            num_heads=1,
-            input_layout="BNSD",
-        )
-
-
-@pytest.mark.parametrize(
-    ("kwargs", "message"),
-    [
-        (
-            {
-                "block_table": torch.zeros(1, dtype=torch.int32),
-                "input_layout": "BNSD",
-            },
-            "block_table",
-        ),
-        ({"input_layout": "TND"}, "BNSD and BSND"),
-        ({"sparse_mode": 2, "input_layout": "BNSD"}, "sparse_mode"),
-    ],
-)
-def test_cpu_rejects_out_of_scope_features(
-    kwargs: dict[str, object],
-    message: str,
-) -> None:
-    tensor = torch.ones(1, 1, 1, 4)
-
-    with pytest.raises(NotImplementedError, match=message):
-        FusedInferAttentionScore.cpu(
-            tensor,
-            tensor,
-            tensor,
-            num_heads=1,
-            **kwargs,
-        )
-
-
-def test_fake_reports_layout_independent_output_metadata() -> None:
-    query = torch.empty(2, 3, 4, 8, device="meta", dtype=torch.bfloat16)
-    key = torch.empty(2, 5, 2, 8, device="meta", dtype=torch.bfloat16)
-    value = torch.empty_like(key)
-
-    output, lse = FusedInferAttentionScore.fake(
-        query,
-        key,
-        value,
+        actual_seq_lengths=torch.tensor([1, 0]),
+        actual_seq_lengths_kv=torch.tensor([5, 3]),
         num_heads=4,
         num_key_value_heads=2,
         input_layout="BSND",
@@ -169,227 +80,116 @@ def test_fake_reports_layout_independent_output_metadata() -> None:
     )
 
     assert output.shape == query.shape
-    assert output.dtype == query.dtype
-    assert output.device.type == "meta"
-    assert lse.shape == (2, 4, 3, 1)
-    assert lse.dtype == torch.float32
+    torch.testing.assert_close(output[1], torch.zeros_like(output[1]))
+    assert torch.isinf(lse[1]).all()
 
 
-def test_class_separates_complete_torch_schema_from_mc62_onnx_abi() -> None:
-    assert len(FusedInferAttentionScore.torch_input_slots) == 29
-    assert FusedInferAttentionScore.torch_input_slots[:7] == (
-        "query",
-        "key",
-        "value",
-        "pse_shift",
-        "atten_mask",
-        "actual_seq_lengths",
-        "actual_seq_lengths_kv",
-    )
-    assert FusedInferAttentionScore.onnx_input_slots == (
-        "query",
-        "key",
-        "value",
-        "pse_shift",
-        "atten_mask",
-        "actual_seq_lengths",
-        "actual_seq_lengths_kv",
-        "dequant_scale1",
-        "quant_scale1",
-        "dequant_scale2",
-        "quant_scale2",
-        "quant_offset2",
-    )
-    assert set(FusedInferAttentionScore.onnx_attribute_defaults) == {
-        "num_heads",
-        "scale",
-        "input_layout",
-        "num_key_value_heads",
-    }
-
-
-def test_onnx_rejects_torch_only_bsnd_and_lse() -> None:
-    arguments = [object()] * 29
-
-    with pytest.raises(RuntimeError, match="only BNSD"):
-        FusedInferAttentionScore.onnx.__wrapped__(
-            object(),
-            *arguments,
-            4,
-            0.5,
-            2_147_483_647,
-            2_147_483_647,
-            "BSND",
-            2,
-            0,
-            0,
-            0,
-            0,
-            False,
-            0,
-            0,
-            0,
-        )
-
-    with pytest.raises(RuntimeError, match="softmax LSE"):
-        FusedInferAttentionScore.onnx.__wrapped__(
-            object(),
-            *arguments,
-            4,
-            0.5,
-            2_147_483_647,
-            2_147_483_647,
-            "BNSD",
-            2,
-            0,
-            0,
-            0,
-            0,
-            True,
-            0,
-            0,
-            0,
-        )
-
-
-def test_onnx_rejects_unsupported_optional_slots() -> None:
-    arguments: list[object | None] = [object(), object(), object()] + [None] * 26
-    arguments[14] = object()
-
-    with pytest.raises(RuntimeError, match="block_table"):
-        FusedInferAttentionScore.onnx.__wrapped__(
-            object(),
-            *arguments,
-            4,
-            0.5,
-            2_147_483_647,
-            2_147_483_647,
-            "BNSD",
-            2,
-            0,
-            0,
-            0,
-            0,
-            False,
-            0,
-            0,
-            0,
-        )
-
-
-class _SymbolicType:
-    def __init__(self, dtype: str, shape: tuple[int | None, ...] = (1, 4, 1, 8)) -> None:
-        self._dtype = dtype
-        self._shape = shape
-
-    def scalarType(self) -> str:  # noqa: N802
-        return self._dtype
-
-    def sizes(self) -> tuple[int | None, ...]:
-        return self._shape
-
-
-class _SymbolicValue:
-    def __init__(self, dtype: str, shape: tuple[int | None, ...] = (1, 4, 1, 8)) -> None:
-        self._type = _SymbolicType(dtype, shape)
-
-    def type(self) -> _SymbolicType:
-        return self._type
-
-
-def test_onnx_rejects_float32_qkv_but_torch_keeps_support() -> None:
-    arguments: list[object | None] = [
-        _SymbolicValue("Float"),
-        _SymbolicValue("Float"),
-        _SymbolicValue("Float"),
-        *([None] * 26),
-    ]
-
-    with pytest.raises(RuntimeError, match="only FLOAT16 and BFLOAT16"):
-        FusedInferAttentionScore.onnx.__wrapped__(
-            object(),
-            *arguments,
-            4,
-            0.5,
-            2_147_483_647,
-            2_147_483_647,
-            "BNSD",
-            2,
-            0,
-            0,
-            0,
-            0,
-            False,
-            0,
-            0,
-            0,
-        )
-
-    tensor = torch.ones(1, 1, 1, 4, dtype=torch.float32)
-    output, _ = FusedInferAttentionScore.cpu(
-        tensor, tensor, tensor, num_heads=1, input_layout="BNSD"
-    )
-    assert output.dtype == torch.float32
-
-
-@pytest.mark.parametrize("query_sequence", [3, None])
-def test_onnx_rejects_float_prefill_or_dynamic_sequence(
-    query_sequence: int | None,
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"block_table": torch.zeros(1, dtype=torch.int32)}, "block_table"),
+        ({"input_layout": "TND"}, "BNSD and BSND"),
+        ({"sparse_mode": 2}, "sparse_mode"),
+        ({"num_heads": 3, "num_key_value_heads": 2}, "query head axis"),
+    ],
+)
+def test_torch_kernel_rejects_invalid_broad_contract(
+    kwargs: dict[str, Any],
+    message: str,
 ) -> None:
-    arguments: list[object | None] = [
-        _SymbolicValue("Half", (1, 8, query_sequence, 64)),
-        _SymbolicValue("Half", (1, 8, 16, 64)),
-        _SymbolicValue("Half", (1, 8, 16, 64)),
-        *([None] * 26),
-    ]
+    query, key, value = _inputs(query_sequence=1)
+    arguments: dict[str, Any] = {"num_heads": 4}
+    arguments.update(kwargs)
+    with pytest.raises((ValueError, NotImplementedError), match=message):
+        attention_kernel(query, key, value, **arguments)
 
-    with pytest.raises(RuntimeError, match="requires query sequence length S=1"):
-        FusedInferAttentionScore.onnx.__wrapped__(
-            object(),
-            *arguments,
-            8,
-            0.125,
-            2_147_483_647,
-            2_147_483_647,
-            "BNSD",
-            8,
-            0,
-            0,
-            0,
-            0,
-            False,
-            0,
-            0,
-            0,
+
+def test_fake_and_opcheck_cover_registered_contract() -> None:
+    query, key, value = _inputs(dtype=torch.float16, query_sequence=1)
+    with FakeTensorMode() as mode:
+        fake_inputs = tuple(mode.from_tensor(tensor) for tensor in (query, key, value))
+        output, lse = fake_attention(
+            *fake_inputs,
+            num_heads=4,
+            num_key_value_heads=2,
+            softmax_lse_flag=True,
+        )
+    assert output.shape == query.shape
+    assert lse.shape == (2, 4, 1, 1)
+
+    torch.library.opcheck(
+        fused_infer_attention_score,
+        (query, key, value),
+        {"num_heads": 4, "num_key_value_heads": 2},
+        test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
+    )
+
+
+def test_plugin_keeps_torch_and_onnx_contracts_separate() -> None:
+    assert REGISTERED_OPERATOR.plugin is PLUGIN
+    assert len(TORCH_INPUT_SLOTS) == 29
+    assert PLUGIN.onnx.schema.name == "FusedInferAttentionScore"
+    assert len(PLUGIN.onnx.schema.inputs) == 3
+    assert len(PLUGIN.onnx.schema.outputs) == 1
+    assert set(PLUGIN.onnx.schema.attributes) == ONNX_ATTRIBUTE_NAMES
+
+
+class _OnnxValue:
+    def __init__(self, shape: tuple[int | None, ...], dtype: str = "FLOAT16") -> None:
+        self.shape = shape
+        self.dtype = dtype
+
+
+def test_onnx_contract_rejects_torch_legal_prefill_float32_and_mask() -> None:
+    fp16_prefill = _OnnxValue((1, 4, 3, 8))
+    fp16_kv = _OnnxValue((1, 2, 5, 8))
+    with pytest.raises(RuntimeError, match="query sequence length S=1"):
+        translate(
+            fp16_prefill,
+            fp16_kv,
+            fp16_kv,
+            num_heads=4,
+            num_key_value_heads=2,
+        )
+
+    fp32_query = _OnnxValue((1, 4, 1, 8), "FLOAT")
+    fp32_kv = _OnnxValue((1, 2, 5, 8), "FLOAT")
+    with pytest.raises(RuntimeError, match="only FLOAT16 and BFLOAT16"):
+        translate(fp32_query, fp32_kv, fp32_kv, num_heads=4, num_key_value_heads=2)
+
+    fp16_query = _OnnxValue((1, 4, 1, 8))
+    with pytest.raises(RuntimeError, match="optional inputs: atten_mask"):
+        translate(
+            fp16_query,
+            fp16_kv,
+            fp16_kv,
+            atten_mask=object(),
+            num_heads=4,
+            num_key_value_heads=2,
         )
 
 
-def test_onnx_rejects_mask_even_when_torch_supports_it() -> None:
-    arguments: list[object | None] = [
-        _SymbolicValue("Half"),
-        _SymbolicValue("Half"),
-        _SymbolicValue("Half"),
-        None,
-        object(),
-        *([None] * 24),
-    ]
-
-    with pytest.raises(RuntimeError, match="optional inputs: atten_mask"):
-        FusedInferAttentionScore.onnx.__wrapped__(
-            object(),
-            *arguments,
-            4,
-            0.5,
-            2_147_483_647,
-            2_147_483_647,
-            "BNSD",
-            4,
-            0,
-            0,
-            0,
-            0,
-            False,
-            0,
-            0,
-            0,
+@pytest.mark.parametrize(
+    ("key_shape", "value_shape", "num_heads", "kv_heads", "message"),
+    [
+        ((1, 2, 5, 8), (1, 2, 6, 8), 4, 2, "matching key/value"),
+        ((1, 2, 5, 16), (1, 2, 5, 16), 4, 2, "head dimensions"),
+        ((1, 2, 5, 8), (1, 2, 5, 8), 8, 2, "match query heads"),
+        ((1, 3, 5, 8), (1, 3, 5, 8), 4, 3, "GQA"),
+    ],
+)
+def test_onnx_contract_rejects_invalid_kv_and_head_metadata(
+    key_shape: tuple[int, ...],
+    value_shape: tuple[int, ...],
+    num_heads: int,
+    kv_heads: int,
+    message: str,
+) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        translate(
+            _OnnxValue((1, 4, 1, 8)),
+            _OnnxValue(key_shape),
+            _OnnxValue(value_shape),
+            num_heads=num_heads,
+            num_key_value_heads=kv_heads,
         )

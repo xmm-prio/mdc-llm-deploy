@@ -19,10 +19,35 @@ from tests.hardware.custom_ops.common import CaseDefinition
 from tests.hardware.custom_ops.generate_cases import generate_all
 
 _EXPECTED_CUSTOM_ABIS = {
-    "apply_rotary_pos_emb": ("ApplyRotaryPosEmb", 4),
-    "rms_norm": ("NPURmsNorm", 2),
-    "fused_infer_attention_score": ("FusedInferAttentionScore", 3),
-    "moe_expert_int8": ("MoeExpert", 6),
+    "apply_rotary_pos_emb": (
+        "ApplyRotaryPosEmb",
+        ("query", "key", "cos", "sin"),
+        ("query_out", "key_out"),
+        {"layout": 1, "rotary_mode": b"half"},
+    ),
+    "rms_norm": (
+        "NPURmsNorm",
+        ("x", "gamma"),
+        ("y", "rstd"),
+        {"epsilon": pytest.approx(1e-5)},
+    ),
+    "fused_infer_attention_score": (
+        "FusedInferAttentionScore",
+        ("query", "key", "value"),
+        ("attention_out",),
+        {
+            "input_layout": b"BNSD",
+            "num_heads": 8,
+            "num_key_value_heads": 8,
+            "scale": pytest.approx(0.125),
+        },
+    ),
+    "moe_expert_int8": (
+        "MoeExpert",
+        ("x", "topk_ids", "topk_weight", "expert_weights", "quant_scales"),
+        ("out",),
+        {},
+    ),
 }
 
 
@@ -55,20 +80,32 @@ def test_generate_all_writes_complete_manifests(generated_cases: Path) -> None:
 
 
 def test_generated_onnx_models_have_expected_abis(generated_cases: Path) -> None:
-    for case_name, (custom_op_type, input_slot_count) in _EXPECTED_CUSTOM_ABIS.items():
+    for case_name, (
+        custom_op_type,
+        expected_inputs,
+        expected_outputs,
+        expected_attributes,
+    ) in _EXPECTED_CUSTOM_ABIS.items():
         case_dir = generated_cases / case_name
         golden = onnx.load(case_dir / "golden.onnx")
         custom = onnx.load(case_dir / "custom.onnx")
-        onnx.checker.check_model(golden)
+        onnx.checker.check_model(golden, full_check=True)
+        onnx.checker.check_model(custom, full_check=True)
         assert [(opset.domain, opset.version) for opset in golden.opset_import] == [("", 18)]
         assert [(opset.domain, opset.version) for opset in custom.opset_import] == [("", 18)]
         nodes = [node for node in custom.graph.node if node.op_type == custom_op_type]
         assert len(nodes) == 1
-        assert nodes[0].domain == ""
-        assert len(nodes[0].input) == input_slot_count
+        node = nodes[0]
+        assert node.domain == ""
+        assert tuple(node.input) == expected_inputs
+        assert tuple(node.output) == expected_outputs
+        assert {
+            attribute.name: onnx.helper.get_attribute_value(attribute)
+            for attribute in node.attribute
+        } == expected_attributes
 
 
-def test_moe_expert_case_matches_real_mdc_types_shapes_and_empty_offset(
+def test_moe_expert_case_matches_real_five_input_mdc_types_and_shapes(
     generated_cases: Path,
 ) -> None:
     case_dir = generated_cases / "moe_expert_int8"
@@ -96,7 +133,6 @@ def test_moe_expert_case_matches_real_mdc_types_shapes_and_empty_offset(
         "topk_weight",
         "expert_weights",
         "quant_scales",
-        "",
     ]
     assert custom.graph.output[0].type.tensor_type.elem_type == onnx.TensorProto.FLOAT16
     assert golden.graph.output[0].type.tensor_type.elem_type == onnx.TensorProto.FLOAT16

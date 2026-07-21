@@ -1,10 +1,10 @@
 # MoeExpert
 
-源码：`mdc_llm_deploy/custom_ops/moe_expert.py`。
+源码：`mdc_llm_deploy/custom_ops/moe_expert/`。
 
 ## 两套独立契约
 
-类内保留两套明确隔离的契约：
+独立插件保留两套明确隔离的契约：
 
 - 通用 Torch 契约用于 CPU/CUDA 推理，支持浮点 `x`、浮点或 INT8 权重。
 - MDC ONNX 契约用于板端全量化部署，严格匹配 `MoeExpert::OpDef`。
@@ -34,14 +34,14 @@ MoeExpert(
 
 Routing expert id 必须合法且同 token 内不重复；权重必须非负、有限，每行和为 1。
 
-## MDC ONNX 六槽 ABI
+## MDC ONNX 五输入 ABI
 
-默认 `ai.onnx` 域、opset 18，固定六个输入槽：
+默认 `ai.onnx` 域、opset 18，固定五个实际输入：
 
 ```text
 MoeExpert(
     x, topk_ids, topk_weight, expert_weights,
-    quant_scales, quant_offsets?
+    quant_scales
 ) -> out
 ```
 
@@ -53,7 +53,8 @@ MoeExpert(
 - `quant_scales`：必填 FP32 `[1+4E]`。第 0 项为 `tokenScale`；之后每个
   expert 依次为 `gateWScale`、`upWScale`、`activationScale`、
   `downWScale`；运行时要求所有 scale 有限且为正数。
-- `quant_offsets`：当前板端不支持且内核不读取，必须保留为空槽。
+- ONNX ABI 不包含 `quant_offsets`，也不再序列化尾部空槽。旧六槽模型不属于
+  当前契约。
 - `E=(len(quant_scales)-1)/4`，
   `I=expert_weights.shape[0]/(3E)`。
 - 输出：FP16 `[T,H]`。
@@ -70,10 +71,21 @@ MoeExpert(
    `activationScale*downWScale`。
 4. 按 FP16 `topk_weight` 加权累加，输出转 FP16。
 
-CPU golden/Fake 与 CUDA Triton 均接受此全量化契约。
+CPU/Fake/CUDA 均接受此全量化 Torch 契约。
+
+## 导出与注册
+
+导入 `mdc_llm_deploy.custom_ops.moe_expert` 只注册 MoeExpert 的 Torch op。
+导出前调用 `create_onnx_export_profile("moe_expert")`，并将返回的
+`custom_translation_table` 传给 `torch.onnx.export`。仅支持
+`dynamo=True`；本地 `OpSchema` 在创建 profile 时按需注册，不写入模型。
+
+Torch schema 仍保留可选 `quant_offsets`，用于普通 INT8-weight 分支。ONNX
+translation 只有五个参数，因此旧六槽调用会被拒绝。浮点和普通 INT8-weight
+Torch 输入合法，但不属于 MDC ONNX 直出子集。
 
 ## B 端确定性用例
 
 `tests.hardware.custom_ops.moe_expert` 只生成一个真实 MDC INT8 用例：
-`T=1,H=256,I=256,E=4,K=2`。用例包含标准 ONNX golden、六槽 MDC ONNX、
-输入 bin 和 manifest；`quant_offsets` 序列化为空槽。
+`T=1,H=256,I=256,E=4,K=2`。用例包含标准 ONNX golden、五输入 MDC ONNX、
+输入 bin 和 manifest；不生成 `quant_offsets`。

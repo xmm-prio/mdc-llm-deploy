@@ -6,8 +6,7 @@ from pathlib import Path
 
 import torch
 
-from mdc_llm_deploy.custom_ops.registry import register_custom_op
-from mdc_llm_deploy.custom_ops.rms_norm import RmsNorm
+from mdc_llm_deploy.custom_ops.rms_norm import rms_norm
 
 from .common import CaseDefinition, generate_case, seeded_generator
 
@@ -23,14 +22,10 @@ class _GoldenModel(torch.nn.Module):
 
 
 class _CustomModel(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self._operator = register_custom_op(RmsNorm).definition
-
     def forward(
         self, x: torch.Tensor, gamma: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._operator(x, gamma, _EPSILON)
+        return rms_norm(x, gamma, _EPSILON)
 
 
 def case_definition() -> CaseDefinition:
@@ -46,6 +41,7 @@ def case_definition() -> CaseDefinition:
         },
         output_names=("y", "rstd"),
         description="FLOAT32、末维归一化的确定性 RMSNorm 用例。",
+        operator_names=("rms_norm",),
     )
 
 

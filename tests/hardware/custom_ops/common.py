@@ -11,6 +11,8 @@ from pathlib import Path
 import onnx
 import torch
 
+from mdc_llm_deploy.custom_ops import create_onnx_export_profile
+
 
 @dataclass(frozen=True)
 class CaseDefinition:
@@ -22,6 +24,7 @@ class CaseDefinition:
     inputs: Mapping[str, torch.Tensor]
     output_names: Sequence[str]
     description: str
+    operator_names: tuple[str, ...]
     opset_version: int = 18
 
 
@@ -32,17 +35,22 @@ def _export_model(
     output_names: Sequence[str],
     path: Path,
     opset_version: int,
+    operator_names: tuple[str, ...] = (),
 ) -> None:
     model.eval()
+    profile = create_onnx_export_profile(*operator_names)
     torch.onnx.export(
         model,
         inputs,
         path,
         opset_version=opset_version,
-        dynamo=False,
+        dynamo=True,
+        verbose=False,
         input_names=input_names,
         output_names=list(output_names),
-        do_constant_folding=False,
+        external_data=False,
+        optimize=False,
+        custom_translation_table=dict(profile.custom_translation_table),
     )
 
 
@@ -83,9 +91,11 @@ def generate_case(definition: CaseDefinition, output_root: Path) -> Path:
             definition.output_names,
             temporary_dir / "custom.onnx",
             definition.opset_version,
+            definition.operator_names,
         )
 
-        onnx.checker.check_model(temporary_dir / "golden.onnx")
+        onnx.checker.check_model(temporary_dir / "golden.onnx", full_check=True)
+        onnx.checker.check_model(temporary_dir / "custom.onnx", full_check=True)
         input_manifest = {
             name: _write_tensor(temporary_dir / f"{name}.bin", tensor)
             for name, tensor in definition.inputs.items()

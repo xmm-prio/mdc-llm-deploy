@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import torch
 
-from mdc_llm_deploy.custom_ops.moe_expert import MoeExpert
-from mdc_llm_deploy.custom_ops.registry import register_custom_op
+from mdc_llm_deploy.custom_ops.moe_expert import moe_expert
 
 from .common import CaseDefinition, generate_case, seeded_generator
 
@@ -68,10 +68,6 @@ class _GoldenModel(torch.nn.Module):
 
 
 class _CustomModel(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self._operator = register_custom_op(MoeExpert).definition
-
     def forward(
         self,
         x: torch.Tensor,
@@ -80,17 +76,20 @@ class _CustomModel(torch.nn.Module):
         expert_weights: torch.Tensor,
         quant_scales: torch.Tensor,
     ) -> torch.Tensor:
-        return self._operator(
-            x,
-            topk_ids,
-            topk_weight,
-            expert_weights,
-            quant_scales,
+        return cast(
+            torch.Tensor,
+            moe_expert(
+                x,
+                topk_ids,
+                topk_weight,
+                expert_weights,
+                quant_scales,
+            ),
         )
 
 
 def case_definition() -> CaseDefinition:
-    """Build the real six-slot fully quantized MDC ABI case."""
+    """Build the real five-input fully quantized MDC ABI case."""
     generator = seeded_generator(113)
     expert_scales = torch.tensor(
         [
@@ -129,8 +128,9 @@ def case_definition() -> CaseDefinition:
         output_names=("out",),
         description=(
             "MDC 全量化 ABI: INT8 token/权重、INT16 top-k、FP16 routing、"
-            "1+4E FP32 scales, quant_offsets 空槽。"
+            "1+4E FP32 scales; 无 quant_offsets 输入。"
         ),
+        operator_names=("moe_expert",),
     )
 
 

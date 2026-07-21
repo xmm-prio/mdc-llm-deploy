@@ -6,8 +6,7 @@ from pathlib import Path
 
 import torch
 
-from mdc_llm_deploy.custom_ops.apply_rotary_pos_emb import ApplyRotaryPosEmb
-from mdc_llm_deploy.custom_ops.registry import register_custom_op
+from mdc_llm_deploy.custom_ops.apply_rotary_pos_emb import apply_rotary_pos_emb
 
 from .common import CaseDefinition, generate_case, seeded_generator
 
@@ -28,10 +27,6 @@ class _GoldenModel(torch.nn.Module):
 
 
 class _CustomModel(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self._operator = register_custom_op(ApplyRotaryPosEmb).definition
-
     def forward(
         self,
         query: torch.Tensor,
@@ -39,7 +34,7 @@ class _CustomModel(torch.nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._operator(query, key, cos, sin, 1, "half")
+        return apply_rotary_pos_emb(query, key, cos, sin, 1, "half")
 
 
 def case_definition() -> CaseDefinition:
@@ -58,6 +53,7 @@ def case_definition() -> CaseDefinition:
         },
         output_names=("query_out", "key_out"),
         description="BSND、half 模式、GQA head 数的确定性 RoPE 用例。",
+        operator_names=("apply_rotary_pos_emb",),
     )
 
 

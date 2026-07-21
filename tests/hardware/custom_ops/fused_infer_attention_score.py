@@ -8,9 +8,8 @@ from pathlib import Path
 import torch
 
 from mdc_llm_deploy.custom_ops.fused_infer_attention_score import (
-    FusedInferAttentionScore,
+    fused_infer_attention_score,
 )
-from mdc_llm_deploy.custom_ops.registry import register_custom_op
 
 from .common import CaseDefinition, generate_case, seeded_generator
 
@@ -33,17 +32,13 @@ class _GoldenModel(torch.nn.Module):
 
 
 class _CustomModel(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self._operator = register_custom_op(FusedInferAttentionScore).definition
-
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
     ) -> torch.Tensor:
-        attention_out, _ = self._operator(
+        attention_out, _ = fused_infer_attention_score(
             query,
             key,
             value,
@@ -88,6 +83,7 @@ def case_definition() -> CaseDefinition:
             "MC62 BNSD FP16 Decode MHA: B=1、heads=8、query seq=1、"
             "KV seq=16、head dim=64, 无可选输入。"
         ),
+        operator_names=("fused_infer_attention_score",),
     )
 
 

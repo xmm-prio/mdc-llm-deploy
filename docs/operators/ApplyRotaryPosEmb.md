@@ -1,6 +1,8 @@
 # ApplyRotaryPosEmb
 
-源码：`mdc_llm_deploy/custom_ops/apply_rotary_pos_emb.py`。
+源码：`mdc_llm_deploy/custom_ops/apply_rotary_pos_emb/`。导入该算子包只注册
+`mdc_llm_deploy::apply_rotary_pos_emb`，不会注册其他算子；创建包含
+`apply_rotary_pos_emb` 的 ONNX export profile 时才安装进程内本地 schema。
 
 ## Torch CPU/CUDA 支持范围
 
@@ -19,7 +21,7 @@
 Torch 会拒绝非法 layout/mode、rank、广播、dtype、设备、旋转维，以及含
 NaN/Inf 的输入。算子仅用于推理，不支持 autograd。
 
-## ONNX ABI 与导出收窄
+## Dynamo ONNX ABI 与导出收窄
 
 默认 `ai.onnx` 域、opset 18：
 
@@ -31,11 +33,24 @@ ApplyRotaryPosEmb(
 ) -> (query_out, key_out)
 ```
 
-节点固定有 4 个输入、2 个输出，属性名为 `layout`、`rotary_mode`。导出仅检查
-`layout ∈ {1,2,3,4}` 和三种 mode；具体 dtype/shape 边界由 Torch 前向及板端
-编译共同约束。属性不在上述集合时导出直接报错。
+节点固定有 4 个输入、2 个输出，属性名为 `layout`、`rotary_mode`。仅支持
+`torch.onnx.export(..., dynamo=True, opset_version=18)`，调用方必须传入
+`create_onnx_export_profile("apply_rotary_pos_emb")` 返回的
+`custom_translation_table`。不提供 legacy symbolic。
+
+ONNX 直出边界独立收窄：
+
+- 四个输入必须具有静态 shape、相同 dtype 和相同 rank；dtype 限于
+  `FLOAT16`、`BFLOAT16`、`FLOAT`。
+- layout、rank、query/key shape、cos/sin 广播关系与 Torch 契约相同。
+- query/key head dim 相同且不超过 1024；旋转维仍须满足 mode 对应整除规则。
+
+这些限制不进入 Torch kernel 或 Fake 路径。例如 head dim 大于 1024 仍可执行
+eager、Fake、`torch.compile` 和 `torch.export`，但 Dynamo ONNX 导出会拒绝。
+本地 `OpSchema` 只存在于当前进程；新进程调用 checker 前必须重新创建 profile。
 
 ## B 端确定性用例
 
-`tests.hardware.custom_ops.apply_rotary_pos_emb` 生成 FLOAT32、BSND、half、
-GQA head 数用例，同时包含标准 ONNX、MDC ONNX、输入 bin 和 manifest。
+`tests.hardware.custom_ops.apply_rotary_pos_emb` 定义 FLOAT32、BSND、half、
+GQA head 数确定性用例。硬件 artifact 的统一 Dynamo 生成流程由后续跨算子集成
+波次接入；本任务不代表 ATC 或真机验证通过。

@@ -1,39 +1,77 @@
-"""Contracts for incrementally registered inference-only custom operators."""
+"""Immutable contracts for independently loaded custom-operator plugins."""
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import Any, ClassVar
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from onnx.defs import OpSchema
+
+Kernel = Callable[..., Any]
+OnnxTranslation = Callable[..., Any]
 
 
-class CustomOp(ABC):
-    """Define one custom operator without coupling it to registry orchestration."""
+@dataclass(frozen=True, slots=True)
+class TorchOperatorSpec:
+    """Describe broad Torch execution without ONNX export restrictions."""
 
-    qualified_name: ClassVar[str]
-    schema: ClassVar[str]
-    onnx_opset: ClassVar[int] = 18
+    qualified_name: str
+    schema: str
+    cpu_kernel: Kernel
+    cuda_kernel: Kernel
+    fake_kernel: Kernel
 
-    @staticmethod
-    @abstractmethod
-    def cpu(*args: Any, **kwargs: Any) -> Any:
-        """Execute the CPU kernel."""
+    def __post_init__(self) -> None:
+        namespace, separator, operator_name = self.qualified_name.partition("::")
+        if separator != "::" or not namespace or not operator_name or "::" in operator_name:
+            raise ValueError("qualified_name must use the 'namespace::operator' form")
+        if not self.schema:
+            raise ValueError("schema must not be empty")
 
-    @staticmethod
-    @abstractmethod
-    def cuda(*args: Any, **kwargs: Any) -> Any:
-        """Execute the CUDA kernel."""
 
-    @staticmethod
-    @abstractmethod
-    def fake(*args: Any, **kwargs: Any) -> Any:
-        """Infer output metadata for FakeTensor and MetaTensor execution."""
+@dataclass(frozen=True, slots=True)
+class OnnxOperatorSpec:
+    """Describe one narrow default-domain ONNX direct-export contract."""
 
-    @classmethod
-    def meta(cls, *args: Any, **kwargs: Any) -> Any:
-        """Delegate MetaTensor execution to the shared abstract implementation."""
-        return cls.fake(*args, **kwargs)
+    schema: OpSchema
+    translation: OnnxTranslation
 
-    @staticmethod
-    @abstractmethod
-    def onnx(*args: Any, **kwargs: Any) -> Any:
-        """Build the ONNX representation for this operator."""
+    def __post_init__(self) -> None:
+        if self.schema.domain:
+            raise ValueError("ONNX operator schema must use the default domain")
+        if self.schema.since_version != 18:
+            raise ValueError("ONNX operator schema must target opset 18")
+
+    @property
+    def name(self) -> str:
+        """Return the emitted ONNX operator name."""
+        return self.schema.name
+
+    @property
+    def opset(self) -> int:
+        """Return the emitted ONNX opset version."""
+        return self.schema.since_version
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorPlugin:
+    """Bind broad Torch execution to one narrow ONNX export contract."""
+
+    name: str
+    torch: TorchOperatorSpec
+    onnx: OnnxOperatorSpec
+
+    def __post_init__(self) -> None:
+        if not self.name or self.name.strip() != self.name:
+            raise ValueError("plugin name must be a non-empty normalized string")
+        if "::" in self.name:
+            raise ValueError("plugin name must not contain a namespace separator")
+
+
+class OperatorPluginContract(Protocol):
+    """Allow immutable plugin-compatible descriptions from operator packages."""
+
+    name: str
+    torch: TorchOperatorSpec
+    onnx: OnnxOperatorSpec
