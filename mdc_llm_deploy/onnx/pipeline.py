@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import onnx
 from onnx import GraphProto, NodeProto
 
+from .._observability import get_logger, log_stage, progress_task
 from ._graph import clone_model
 from .compatibility_lowering import lower_opset_compatibility_core
 from .fusion_pass import run_fusion_passes
@@ -15,6 +16,7 @@ from .quant_lowering import lower_qdq_core
 from .schemas import ALL_SCHEMA_NAMES, register_schemas
 
 _CUSTOM_SCHEMA_NAMES = frozenset(ALL_SCHEMA_NAMES)
+_logger = get_logger(__name__)
 
 
 def _nodes(graph: GraphProto) -> Iterator[NodeProto]:
@@ -54,19 +56,47 @@ def _validate_final_graph(model: onnx.ModelProto) -> None:
     onnx.checker.check_model(model)
 
 
-def process_onnx(model: onnx.ModelProto) -> onnx.ModelProto:
+def _run_stage(
+    model: onnx.ModelProto,
+    name: str,
+    operation: Callable[[onnx.ModelProto], object],
+) -> None:
+    before = sum(1 for _ in _nodes(model.graph))
+    with log_stage(_logger, f"ONNX {name}", details=f"nodes={before}"):
+        operation(model)
+    after = sum(1 for _ in _nodes(model.graph))
+    _logger.info("ONNX %s node change: before=%d after=%d delta=%+d", name, before, after, after - before)
+
+
+def process_onnx(
+    model: onnx.ModelProto,
+    *,
+    show_progress: bool = True,
+) -> onnx.ModelProto:
     """Run the atomic MDC pipeline in place and return the same ModelProto."""
     if not isinstance(model, onnx.ModelProto):
         raise TypeError("model must be an onnx.ModelProto")
     working = clone_model(model)
-    lower_qdq_core(working)
-    _register_required_schemas(working)
-    lower_opset_compatibility_core(working)
-    downgrade_opset_core(working)
-    run_fusion_passes(working)
-    _register_required_schemas(working)
-    _validate_final_graph(working)
+    stages: tuple[tuple[str, Callable[[onnx.ModelProto], object]], ...] = (
+        ("QDQ lowering", lower_qdq_core),
+        ("schema registration before lowering", _register_required_schemas),
+        ("compatibility lowering", lower_opset_compatibility_core),
+        ("opset downgrade", downgrade_opset_core),
+        ("fusion", run_fusion_passes),
+        ("schema registration after fusion", _register_required_schemas),
+        ("final validation", _validate_final_graph),
+    )
+    _logger.info("ONNX pipeline started: nodes=%d", sum(1 for _ in _nodes(working.graph)))
+    with progress_task(
+        "Processing ONNX pipeline",
+        total=len(stages),
+        show_progress=show_progress,
+    ) as advance:
+        for name, operation in stages:
+            _run_stage(working, name, operation)
+            advance()
     model.CopyFrom(working)
+    _logger.info("ONNX pipeline completed: nodes=%d", sum(1 for _ in _nodes(model.graph)))
     return model
 
 

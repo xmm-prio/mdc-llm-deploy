@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import pytest
 import torch
 from torch import Tensor, nn
@@ -66,6 +68,48 @@ def test_three_stage_api_is_in_place_and_tracks_state() -> None:
     assert model.observed_grad_enabled is False
     assert convert(model) is model
     assert quantization_state(model) is QuantizationState.CONVERTED
+
+
+def test_calibration_progress_and_stage_logs_can_be_controlled(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    model = _RecordingModel()
+    prepare(model, MinMaxConfig())
+    capsys.readouterr()
+
+    with caplog.at_level("INFO", logger="mdc_llm_deploy.quantization.api"):
+        calibrate(model, [{"inputs": torch.ones(1, 2)}], show_progress=True)
+
+    captured = capsys.readouterr()
+    assert "Calibrating batches" in captured.out + captured.err
+    assert "Quantization calibration completed" in caplog.text
+
+    second_model = _RecordingModel()
+    prepare(second_model, MinMaxConfig())
+    capsys.readouterr()
+    calibrate(second_model, [{"inputs": torch.ones(1, 2)}], show_progress=False)
+
+    captured = capsys.readouterr()
+    assert "Calibrating batches" not in captured.out + captured.err
+
+
+def test_calibration_progress_does_not_preconsume_generator() -> None:
+    model = _RecordingModel()
+    events: list[str] = []
+
+    def batches() -> Iterator[dict[str, Tensor]]:
+        events.append("started")
+        yield {"inputs": torch.ones(1, 2)}
+        events.append("finished")
+
+    prepared_batches = batches()
+    prepare(model, MinMaxConfig())
+    assert events == []
+
+    calibrate(model, prepared_batches, show_progress=False)
+
+    assert events == ["started", "finished"]
 
 
 def test_lifecycle_rejects_out_of_order_operations() -> None:

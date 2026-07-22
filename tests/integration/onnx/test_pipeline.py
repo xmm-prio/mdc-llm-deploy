@@ -77,6 +77,23 @@ def test_process_onnx_runs_complete_atomic_pipeline() -> None:
     onnx.checker.check_model(model)
 
 
+def test_pipeline_progress_and_stage_logs_can_be_controlled(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with caplog.at_level("INFO", logger="mdc_llm_deploy.onnx.pipeline"):
+        process_onnx(_identity_model(), show_progress=True)
+
+    captured = capsys.readouterr()
+    assert "Processing ONNX pipeline" in captured.out + captured.err
+    assert "ONNX pipeline completed" in caplog.text
+    assert "ONNX final validation completed" in caplog.text
+
+    process_onnx(_identity_model(), show_progress=False)
+    captured = capsys.readouterr()
+    assert "Processing ONNX pipeline" not in captured.out + captured.err
+
+
 def test_pipeline_stage_order(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
     model = _identity_model()

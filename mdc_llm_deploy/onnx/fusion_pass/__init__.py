@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from time import perf_counter
 from typing import Final
 
 import onnx
 
+from ..._observability import get_logger
 from .apply_rotary_pos_emb import (
     APPLY_ROTARY_POS_EMB_FUSION_PASS,
     ApplyRotaryPosEmbFusionPass,
@@ -19,6 +21,7 @@ from .fused_infer_attention_score import (
 )
 from .rms_norm import RMS_NORM_FUSION_PASS, RmsNormFusionPass, fuse_rms_norm
 
+_logger = get_logger(__name__)
 _FUSION_PASSES: Final[tuple[FusionPass, ...]] = (
     RMS_NORM_FUSION_PASS,
     APPLY_ROTARY_POS_EMB_FUSION_PASS,
@@ -30,7 +33,25 @@ def run_fusion_passes(model: onnx.ModelProto) -> FusionReport:
     """Run every fusion pass in stable order, preserving prior successful rewrites."""
     if not isinstance(model, onnx.ModelProto):
         raise TypeError("model must be an onnx.ModelProto")
-    return FusionReport(tuple(fusion_pass.apply(model) for fusion_pass in _FUSION_PASSES))
+    results: list[FusionPassResult] = []
+    for fusion_pass in _FUSION_PASSES:
+        started_at = perf_counter()
+        result = fusion_pass.apply(model)
+        results.append(result)
+        _logger.info(
+            "Fusion pass %s completed in %.3fs: fused_count=%d",
+            result.pass_name,
+            perf_counter() - started_at,
+            result.fused_count,
+        )
+        _logger.debug(
+            "Fusion pass %s fused nodes: %s",
+            result.pass_name,
+            result.fused_node_names,
+        )
+    report = FusionReport(tuple(results))
+    _logger.info("Fusion passes completed: total_fused_count=%d", report.total_fused_count)
+    return report
 
 
 __all__ = [

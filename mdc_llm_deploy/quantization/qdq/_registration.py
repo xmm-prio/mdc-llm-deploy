@@ -10,11 +10,14 @@ from typing import cast
 import torch
 from torch import Tensor
 
+from ..._observability import get_logger
+
 _EXPECTED_TORCH_VERSION = "2.12.0"
 _OPERATOR_NAME = "mdc_llm_deploy::qdq"
 _INT8_ONNX_DTYPE = 3
 _REGISTRATION_LOCK = threading.Lock()
 _operator: Callable[[Tensor, Tensor, Tensor | None, int | None], Tensor] | None = None
+_logger = get_logger(__name__)
 _OnnxAttribute = (
     int
     | float
@@ -27,12 +30,14 @@ _OnnxAttribute = (
 )
 
 
-def require_supported_torch_version() -> None:
-    """Require the exact Torch release validated by the QDQ representation."""
+def warn_unvalidated_torch_version() -> None:
+    """Warn when Torch differs from the release validated for QDQ export."""
     installed = metadata.version("torch")
     if installed != _EXPECTED_TORCH_VERSION:
-        raise RuntimeError(
-            f"QDQ export requires torch=={_EXPECTED_TORCH_VERSION}; found torch=={installed}"
+        _logger.warning(
+            "QDQ export was validated with torch==%s; continuing with unvalidated torch==%s",
+            _EXPECTED_TORCH_VERSION,
+            installed,
         )
 
 
@@ -122,7 +127,7 @@ def register_qdq_operator() -> Callable[[Tensor, Tensor, Tensor | None, int | No
         if operator is not None:
             return operator
 
-        require_supported_torch_version()
+        warn_unvalidated_torch_version()
         if _OPERATOR_NAME in torch._C._dispatch_get_all_op_names():
             raise RuntimeError(f"Custom operator registration conflict: {_OPERATOR_NAME} already exists")
         custom_operator = torch.library.custom_op(
@@ -140,4 +145,4 @@ def register_qdq_operator() -> Callable[[Tensor, Tensor, Tensor | None, int | No
         return _operator
 
 
-__all__ = ["register_qdq_operator", "require_supported_torch_version"]
+__all__ = ["register_qdq_operator", "warn_unvalidated_torch_version"]

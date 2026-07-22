@@ -1,0 +1,63 @@
+"""Shared logging and terminal progress primitives."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from time import perf_counter
+
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Return a library logger without configuring application-wide handlers."""
+    return logging.getLogger(name)
+
+
+@contextmanager
+def log_stage(
+    logger: logging.Logger,
+    stage: str,
+    *,
+    details: str = "",
+) -> Iterator[None]:
+    """Log one stage boundary, duration, and failure without hiding exceptions."""
+    suffix = f" ({details})" if details else ""
+    logger.info("%s started%s", stage, suffix)
+    started_at = perf_counter()
+    try:
+        yield
+    except Exception:
+        logger.exception("%s failed after %.3fs%s", stage, perf_counter() - started_at, suffix)
+        raise
+    logger.info("%s completed in %.3fs%s", stage, perf_counter() - started_at, suffix)
+
+
+@contextmanager
+def progress_task(
+    description: str,
+    *,
+    total: int | None,
+    show_progress: bool,
+) -> Iterator[Callable[[], None]]:
+    """Create one optional Rich progress task and return its advance callback."""
+    if not show_progress:
+        yield lambda: None
+        return
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+    ) as progress:
+        task_id = progress.add_task(description, total=total)
+
+        def advance() -> None:
+            progress.advance(task_id)
+
+        yield advance
+
+
+__all__ = ["get_logger", "log_stage", "progress_task"]

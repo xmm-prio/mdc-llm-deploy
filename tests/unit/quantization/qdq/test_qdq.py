@@ -16,7 +16,7 @@ from transformers.exporters import OnnxConfig, OnnxExporter
 from mdc_llm_deploy.quantization.qdq import (
     qdq,
     register_qdq_operator,
-    require_supported_torch_version,
+    warn_unvalidated_torch_version,
 )
 
 _REPOSITORY_ROOT = Path(__file__).parents[4]
@@ -132,7 +132,10 @@ def test_fake_and_meta_kernels_preserve_tensor_metadata() -> None:
     assert meta_output.device.type == "meta"
 
 
-def test_version_gate_uses_distribution_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_version_mismatch_warns_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     calls: list[str] = []
 
     def fake_version(distribution_name: str) -> str:
@@ -144,10 +147,15 @@ def test_version_gate_uses_distribution_metadata(monkeypatch: pytest.MonkeyPatch
         fake_version,
     )
 
-    with pytest.raises(RuntimeError, match=r"requires torch==2\.12\.0"):
-        require_supported_torch_version()
+    with caplog.at_level(
+        "WARNING",
+        logger="mdc_llm_deploy.quantization.qdq._registration",
+    ):
+        warn_unvalidated_torch_version()
 
     assert calls == ["torch"]
+    assert "validated with torch==2.12.0" in caplog.text
+    assert "unvalidated torch==2.12.0+build" in caplog.text
 
 
 def test_lazy_registration_is_thread_safe_and_idempotent() -> None:

@@ -9,10 +9,12 @@ from typing import Any
 
 from torch import Tensor, nn
 
+from .._observability import get_logger, log_stage
 from .base import CalibrationBatch, QuantizationConfig, QuantizationState, Quantizer
 from .minmax import MinMaxConfig, MinMaxQuantizer
 
 _SESSION_ATTRIBUTE = "_mdc_quantization_session"
+_logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -35,7 +37,12 @@ def prepare(model: nn.Module, config: QuantizationConfig) -> nn.Module:
     if _session(model) is not None:
         raise RuntimeError("model already has an active quantization lifecycle")
     quantizer = _create_quantizer(config)
-    quantizer.prepare(model)
+    with log_stage(
+        _logger,
+        "Quantization prepare",
+        details=f"quantizer={type(quantizer).__qualname__}",
+    ):
+        quantizer.prepare(model)
     setattr(model, _SESSION_ATTRIBUTE, _QuantizationSession(quantizer))
     return model
 
@@ -43,15 +50,29 @@ def prepare(model: nn.Module, config: QuantizationConfig) -> nn.Module:
 def calibrate(
     model: nn.Module,
     batches: Iterable[CalibrationBatch] = (),
+    *,
+    show_progress: bool = True,
 ) -> nn.Module:
     """Calibrate a prepared model in place and return the same object."""
-    _required_session(model).quantizer.calibrate(model, batches)
+    quantizer = _required_session(model).quantizer
+    with log_stage(
+        _logger,
+        "Quantization calibration",
+        details=f"quantizer={type(quantizer).__qualname__}",
+    ):
+        quantizer.calibrate(model, batches, show_progress=show_progress)
     return model
 
 
 def convert(model: nn.Module) -> nn.Module:
     """Convert a calibrated model in place and return the same object."""
-    _required_session(model).quantizer.convert(model)
+    quantizer = _required_session(model).quantizer
+    with log_stage(
+        _logger,
+        "Quantization conversion",
+        details=f"quantizer={type(quantizer).__qualname__}",
+    ):
+        quantizer.convert(model)
     return model
 
 
@@ -59,15 +80,19 @@ def quantize(
     model: nn.Module,
     config: QuantizationConfig,
     batches: Iterable[CalibrationBatch] = (),
+    *,
+    show_progress: bool = True,
 ) -> nn.Module:
     """Run prepare, calibrate, and convert in place."""
     started = False
+    _logger.info("Quantization workflow started")
     try:
         prepare(model, config)
         started = True
-        calibrate(model, batches)
+        calibrate(model, batches, show_progress=show_progress)
         convert(model)
     except Exception:
+        lifecycle_state_removed = False
         session = _session(model)
         if (
             started
@@ -75,7 +100,13 @@ def quantize(
             and session.quantizer.state is not QuantizationState.CONVERTED
         ):
             delattr(model, _SESSION_ATTRIBUTE)
+            lifecycle_state_removed = True
+        _logger.error(
+            "Quantization workflow failed: lifecycle_state_removed=%s",
+            lifecycle_state_removed,
+        )
         raise
+    _logger.info("Quantization workflow completed")
     return model
 
 
@@ -88,7 +119,12 @@ def load_quantized_state_dict(
     if _session(model) is not None:
         raise RuntimeError("model already has an active quantization lifecycle")
     quantizer = MinMaxQuantizer(config)
-    quantizer.restore(model, state_dict)
+    with log_stage(
+        _logger,
+        "Quantized checkpoint restore",
+        details=f"quantizer={type(quantizer).__qualname__}",
+    ):
+        quantizer.restore(model, state_dict)
     setattr(model, _SESSION_ATTRIBUTE, _QuantizationSession(quantizer))
     return model
 

@@ -52,10 +52,12 @@ class Quantizer(ABC, Generic[ConfigT]):
         self,
         model: nn.Module,
         batches: Iterable[CalibrationBatch],
+        *,
+        show_progress: bool = True,
     ) -> nn.Module:
         """Collect runtime statistics from model invocation batches."""
         self._require_state(QuantizationState.PREPARED, "calibrate")
-        self._calibrate(model, batches)
+        self._calibrate(model, batches, show_progress=show_progress)
         self._state = QuantizationState.CALIBRATED
         return model
 
@@ -81,6 +83,8 @@ class Quantizer(ABC, Generic[ConfigT]):
         self,
         model: nn.Module,
         batches: Iterable[CalibrationBatch],
+        *,
+        show_progress: bool,
     ) -> None:
         """Collect algorithm-specific runtime statistics."""
 

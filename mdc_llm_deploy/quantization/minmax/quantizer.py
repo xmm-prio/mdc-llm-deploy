@@ -9,11 +9,14 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
+from ..._observability import get_logger
 from ..base import CalibrationBatch, QuantizationState, Quantizer, run_calibration
 from .config import MinMaxConfig
 from .linear import MinMaxLinear
 from .observer import MinMaxObserver
 from .qparams import _QParamBinding, _QParamSpec
+
+_logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -91,11 +94,22 @@ class MinMaxQuantizer(Quantizer[MinMaxConfig]):
             raise ValueError("target selector did not match any Linear modules")
         self._model_reference = weakref.ref(model)
         self._targets = tuple(prepared)
+        _logger.info(
+            "MinMax target discovery completed: linear_modules=%d selected_targets=%d",
+            len(grouped),
+            len(prepared),
+        )
+        _logger.debug(
+            "Selected MinMax targets: %s",
+            tuple(name for target in prepared for name in target.names),
+        )
 
     def _calibrate(
         self,
         model: nn.Module,
         batches: Iterable[CalibrationBatch],
+        *,
+        show_progress: bool,
     ) -> None:
         self._validate_model(model)
         self._validate_structure(model)
@@ -120,7 +134,7 @@ class MinMaxQuantizer(Quantizer[MinMaxConfig]):
                     current_observer.observe(inputs)
 
                 handles.append(target.module.register_forward_pre_hook(observe_input))
-            run_calibration(model, batches)
+            run_calibration(model, batches, show_progress=show_progress)
         finally:
             for handle in handles:
                 handle.remove()
@@ -208,6 +222,7 @@ class MinMaxQuantizer(Quantizer[MinMaxConfig]):
             for replacement in reversed(applied):
                 setattr(replacement.parent, replacement.attribute, replacement.original)
             raise
+        _logger.info("MinMax conversion replaced %d module locations", len(applied))
 
     def restore(self, model: nn.Module, state_dict: Mapping[str, Tensor]) -> nn.Module:
         """Rebuild converted wrappers from frozen checkpoint qparams."""
