@@ -7,6 +7,7 @@ from pathlib import Path
 
 import onnx
 import torch
+from accelerate.utils import send_to_device
 from torch.onnx import ONNXProgram
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 from transformers.exporters import OnnxConfig, OnnxExporter
@@ -16,11 +17,14 @@ from mdc_llm_deploy.quantization import MinMaxConfig, quantize
 
 MODEL_ID = "Qwen/Qwen3-8B"
 SEQUENCE_LENGTH = 3072
+VOCAB_SIZE = 1024
 
 
-def load_one_layer(model_id: str) -> PreTrainedModel:
-    """Load pretrained Qwen3-8B weights into a one-layer model."""
+def load_one_layer(model_id: str, vocab_size: int) -> PreTrainedModel:
+    """Load pretrained Qwen3-8B weights into a one-layer, small-vocabulary model."""
     config = AutoConfig.from_pretrained(model_id)
+    if vocab_size > config.vocab_size:
+        raise ValueError(f"vocab_size cannot exceed source vocabulary size {config.vocab_size}")
     config.num_hidden_layers = 1
     config.use_cache = True
     model = AutoModelForCausalLM.from_pretrained(
@@ -30,6 +34,7 @@ def load_one_layer(model_id: str) -> PreTrainedModel:
         low_cpu_mem_usage=True,
     )
     model.set_attn_implementation("eager")
+    model.resize_token_embeddings(vocab_size, mean_resizing=False)
     return model.eval()
 
 
@@ -77,8 +82,7 @@ def export_graphs(
         external_data=False,
     )
     generation_inputs = {
-        "input_ids": inputs["input_ids"],
-        "attention_mask": inputs["attention_mask"],
+        "inputs": inputs["input_ids"]
     }
     return OnnxExporter().export_for_generation(
         model,
@@ -94,7 +98,7 @@ def save_external(
 ) -> None:
     """Save one ONNX graph and all its weights as one external data file."""
     model_path = output_dir / f"{component}.onnx"
-    data_name = f"{component}.data"
+    data_name = f"{component}.onnx.data"
     data_path = output_dir / data_name
     model_path.unlink(missing_ok=True)
     data_path.unlink(missing_ok=True)
@@ -108,16 +112,22 @@ def save_external(
     )
 
 
-def main(model_id: str, output_dir: Path) -> None:
+def main(model_id: str, output_dir: Path, vocab_size: int) -> None:
     """Run loading, quantization, export, processing, and serialization."""
+    if vocab_size <= 0:
+        raise ValueError("vocab_size must be positive")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading one layer from {model_id}")
-    model = load_one_layer(model_id)
-    inputs = random_inputs(model)
+    model = load_one_layer(model_id, vocab_size).cuda()
+    inputs = send_to_device(random_inputs(model), device="cuda")
 
     print("Calibrating and converting symmetric per-tensor W8A8")
     quantize_w8a8(model, inputs)
+
+    model = model.cpu()
+    inputs = send_to_device(inputs, device="cpu")
+    torch.cuda.empty_cache()
 
     print("Exporting static prefill and decode graphs")
     programs = export_graphs(model, inputs)
@@ -142,9 +152,15 @@ def parse_args() -> argparse.Namespace:
         default=Path("output/qwen3_8b_w8a8"),
         help="Directory for ONNX graphs and external weights",
     )
+    parser.add_argument(
+        "--vocab-size",
+        type=int,
+        default=VOCAB_SIZE,
+        help="Number of leading vocabulary rows to retain",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(args.model, args.output_dir)
+    main(args.model, args.output_dir, args.vocab_size)

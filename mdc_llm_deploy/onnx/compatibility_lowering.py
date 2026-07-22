@@ -110,14 +110,47 @@ def _lower_split(
     node.attribute.remove(num_outputs)
 
 
+def _lower_expand(
+    graph: GraphProto,
+    node: NodeProto,
+    shapes: Mapping[str, tuple[int, ...]],
+) -> None:
+    input_shape = shapes.get(node.input[0])
+    output_shape = shapes.get(node.output[0])
+    if input_shape is None or output_shape is None or len(input_shape) != len(output_shape):
+        return
+    if input_shape == output_shape:
+        node.op_type = "Identity"
+        del node.input[1:]
+        return
+
+    repeats: list[int] = []
+    for source, target in zip(input_shape, output_shape, strict=True):
+        if source == target:
+            repeats.append(1)
+        elif source == 1:
+            repeats.append(target)
+        else:
+            return
+    repeats_name = _unique_name(graph, f"{node.name or node.output[0]}_repeats")
+    graph.initializer.append(
+        numpy_helper.from_array(np.asarray(repeats, dtype=np.int64), repeats_name)
+    )
+    node.op_type = "Tile"
+    node.input[1] = repeats_name
+
+
 def _lower_graph(
     graph: GraphProto,
     inherited_shapes: Mapping[str, tuple[int, ...]],
 ) -> None:
     shapes = _known_shapes(graph, inherited_shapes)
     for node in graph.node:
-        if node.domain in ("", "ai.onnx") and node.op_type == "Split":
-            _lower_split(graph, node, shapes)
+        if node.domain in ("", "ai.onnx"):
+            if node.op_type == "Split":
+                _lower_split(graph, node, shapes)
+            elif node.op_type == "Expand":
+                _lower_expand(graph, node, shapes)
         for attribute in node.attribute:
             if attribute.type == AttributeProto.GRAPH:
                 _lower_graph(attribute.g, shapes)
@@ -128,6 +161,12 @@ def _lower_graph(
 
 def lower_opset_compatibility_core(model: onnx.ModelProto) -> onnx.ModelProto:
     """Mutate a working model to remove MDC parser-incompatible ONNX forms."""
+    inferred = onnx.shape_inference.infer_shapes(
+        model,
+        strict_mode=False,
+        data_prop=True,
+    )
+    model.CopyFrom(inferred)
     _lower_graph(model.graph, {})
     return model
 

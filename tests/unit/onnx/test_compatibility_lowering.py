@@ -171,3 +171,49 @@ def test_existing_split_input_is_unchanged() -> None:
     lower_opset_compatibility(model)
 
     assert model.SerializeToString() == original
+
+
+def test_static_expand_is_lowered_to_tile() -> None:
+    graph = helper.make_graph(
+        [
+            helper.make_node("Max", ["x", "target"], ["max_output"]),
+            helper.make_node("Shape", ["max_output"], ["target_shape"]),
+            helper.make_node("Expand", ["x", "target_shape"], ["y"], name="expand"),
+        ],
+        "expand",
+        [
+            helper.make_tensor_value_info("x", TensorProto.INT64, [1, 1, 1, 1]),
+            helper.make_tensor_value_info("target", TensorProto.INT64, [1, 1, 1, 4]),
+        ],
+        [helper.make_tensor_value_info("y", TensorProto.INT64, [1, 1, 1, 4])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+
+    lower_opset_compatibility(model)
+
+    expand = next(node for node in model.graph.node if node.name == "expand")
+    assert expand.op_type == "Tile"
+    repeats = next(
+        tensor for tensor in model.graph.initializer if tensor.name == expand.input[1]
+    )
+    np.testing.assert_array_equal(numpy_helper.to_array(repeats), [1, 1, 1, 4])
+    onnx.checker.check_model(model, full_check=True)
+
+
+def test_identity_expand_is_lowered_to_identity() -> None:
+    shape = numpy_helper.from_array(np.array([2, 3], dtype=np.int64), "shape")
+    graph = helper.make_graph(
+        [helper.make_node("Expand", ["x", "shape"], ["y"], name="expand")],
+        "identity_expand",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 3])],
+        [shape],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+
+    lower_opset_compatibility(model)
+
+    expand = model.graph.node[0]
+    assert expand.op_type == "Identity"
+    assert list(expand.input) == ["x"]
+    onnx.checker.check_model(model, full_check=True)
