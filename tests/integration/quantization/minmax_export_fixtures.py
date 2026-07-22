@@ -112,7 +112,7 @@ def build_quantized_linear(case: MinMaxExportCase) -> tuple[nn.Module, torch.Ten
     with torch.no_grad():
         model[0].weight.copy_(torch.linspace(0.1, 1.2, 12, dtype=case.dtype).reshape(3, 4))
     inputs = torch.linspace(-2, 2, 24, dtype=case.dtype).reshape(2, 3, 4)
-    batches = [((inputs,), {})] if case.config.activation else ()
+    batches = [{"input": inputs}] if case.config.activation else ()
     quantize(model, case.config, batches)
     return model, inputs
 

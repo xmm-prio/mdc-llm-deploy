@@ -18,14 +18,11 @@ config = MinMaxConfig(
     activation_granularity="per_tensor",
 )
 batches = [
-    (
-        (),
-        {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "use_cache": False,
-        },
-    )
+    {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "use_cache": False,
+    }
 ]
 
 prepare(model, config)

@@ -8,7 +8,7 @@ from typing import Any, TypeAlias
 import torch
 from torch import nn
 
-CalibrationBatch: TypeAlias = tuple[tuple[Any, ...], Mapping[str, Any]]
+CalibrationBatch: TypeAlias = Mapping[str, Any]
 
 
 def run_calibration(model: nn.Module, batches: Iterable[CalibrationBatch]) -> None:
@@ -18,14 +18,9 @@ def run_calibration(model: nn.Module, batches: Iterable[CalibrationBatch]) -> No
     try:
         with torch.inference_mode():
             for batch in batches:
-                if not isinstance(batch, tuple) or len(batch) != 2:
-                    raise TypeError("each calibration batch must be an (args, kwargs) tuple")
-                args, kwargs = batch
-                if not isinstance(args, tuple):
-                    raise TypeError("calibration batch args must be a tuple")
-                if not isinstance(kwargs, Mapping):
-                    raise TypeError("calibration batch kwargs must be a mapping")
-                model(*args, **dict(kwargs))
+                if not isinstance(batch, Mapping):
+                    raise TypeError("each calibration batch must be a mapping")
+                model(**dict(batch))
     finally:
         model.train(training)
 

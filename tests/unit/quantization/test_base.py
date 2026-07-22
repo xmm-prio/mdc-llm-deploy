@@ -59,7 +59,7 @@ def test_three_stage_api_is_in_place_and_tracks_state() -> None:
 
     assert prepare(model, MinMaxConfig()) is model
     assert quantization_state(model) is QuantizationState.PREPARED
-    assert calibrate(model, [((inputs,), {})]) is model
+    assert calibrate(model, [{"inputs": inputs}]) is model
     assert quantization_state(model) is QuantizationState.CALIBRATED
     assert model.training
     assert model.observed_training is False
@@ -98,7 +98,7 @@ def test_one_step_failure_removes_partial_lifecycle() -> None:
     model = _RecordingModel()
     original = model.linear
 
-    with pytest.raises(TypeError, match=r"\(args, kwargs\)"):
+    with pytest.raises(TypeError, match="mapping"):
         quantize(model, MinMaxConfig(), batches=[object()])  # type: ignore[list-item]
 
     assert model.linear is original

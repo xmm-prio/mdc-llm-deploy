@@ -62,7 +62,7 @@ def quantize_w8a8(
         activation_symmetric=True,
     )
     calibration_inputs = {**inputs, "use_cache": False}
-    quantize(model, config, [((), calibration_inputs)])
+    quantize(model, config, [calibration_inputs])
 
 
 def export_graphs(

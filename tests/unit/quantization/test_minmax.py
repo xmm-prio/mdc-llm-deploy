@@ -200,7 +200,7 @@ def test_all_24_configurations_support_eager_dtypes(
 ) -> None:
     model = nn.Sequential(nn.Linear(4, 3, dtype=dtype))
     inputs = torch.linspace(-2, 2, 24, dtype=dtype).reshape(2, 3, 4)
-    batches = [((inputs,), {})] if config.activation else ()
+    batches = [{"input": inputs}] if config.activation else ()
 
     quantize(model, config, batches)
     output = model(inputs)
@@ -252,7 +252,7 @@ def test_per_token_observer_streams_by_position_and_freezes_broadcast_shape() ->
         activation_granularity="per_token",
     )
 
-    quantize(model, config, [((first,), {}), ((second,), {})])
+    quantize(model, config, [{"input": first}, {"input": second}])
 
     assert isinstance(model[0], MinMaxLinear)
     torch.testing.assert_close(
@@ -275,13 +275,13 @@ def test_per_token_rejects_calibration_and_inference_shape_changes() -> None:
         calibrate(
             model,
             [
-                ((torch.ones(1, 2, 2),), {}),
-                ((torch.ones(1, 3, 2),), {}),
+                {"input": torch.ones(1, 2, 2)},
+                {"input": torch.ones(1, 3, 2)},
             ],
         )
 
     model = nn.Sequential(nn.Linear(2, 2))
-    quantize(model, config, [((torch.ones(1, 2, 2),), {})])
+    quantize(model, config, [{"input": torch.ones(1, 2, 2)}])
     with pytest.raises(ValueError, match="activation length changed"):
         model(torch.ones(1, 3, 2))
     with pytest.raises(ValueError, match="activation rank changed"):
@@ -301,7 +301,7 @@ def test_convert_requires_activation_coverage_for_every_target() -> None:
     model = PartialModel()
     config = MinMaxConfig(weight=False, activation=True)
     prepare(model, config)
-    calibrate(model, [((torch.ones(1, 2),), {})])
+    calibrate(model, [{"inputs": torch.ones(1, 2)}])
 
     with pytest.raises(RuntimeError, match=r"did not cover.*unused"):
         convert(model)
@@ -323,7 +323,7 @@ def test_load_quantized_state_dict_strictly_restores_converted_structure() -> No
     )
     source = nn.Sequential(nn.Linear(4, 3))
     inputs = torch.randn(2, 5, 4)
-    quantize(source, config, [((inputs,), {})])
+    quantize(source, config, [{"input": inputs}])
     expected = source(inputs)
     checkpoint = {name: value.clone() for name, value in source.state_dict().items()}
 

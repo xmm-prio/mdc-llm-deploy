@@ -70,8 +70,8 @@ def _w8a8_config() -> MinMaxConfig:
     )
 
 
-def _calibration_batches() -> list[tuple[tuple[object, ...], dict[str, object]]]:
-    return [((), dict(_INPUTS))]
+def _calibration_batches() -> list[dict[str, object]]:
+    return [dict(_INPUTS)]
 
 
 def _assert_finite_inference(model: nn.Module) -> torch.Tensor:
