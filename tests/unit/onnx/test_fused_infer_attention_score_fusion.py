@@ -104,6 +104,11 @@ def test_fuses_sdpa_after_expand_compatibility_lowering() -> None:
     assert result.fused_count == 1
     fused = _only_node(model, FUSED_INFER_ATTENTION_SCORE_OP)
     assert list(fused.input[:3]) == ["query", "key", "value"]
+    attributes = {
+        attribute.name: helper.get_attribute_value(attribute) for attribute in fused.attribute
+    }
+    assert attributes["num_heads"] == 4
+    assert attributes["num_key_value_heads"] == 2
     assert not _nodes(model, "Tile")
     _check_model(model)
 
