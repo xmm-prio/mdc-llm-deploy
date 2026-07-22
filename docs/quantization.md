@@ -48,14 +48,10 @@ calibrate(model, batches, show_progress=False)
 quantize(model, config, batches, show_progress=False)
 ```
 
-库使用 Python `logging` 记录量化和 ONNX 处理的阶段、耗时及汇总信息，但不配置全局
-handler。应用可按需启用：
-
-```python
-import logging
-
-logging.basicConfig(level=logging.INFO)
-```
+库使用 Python `logging` 记录量化和 ONNX 处理的阶段、耗时及汇总信息。首次导入
+`mdc_llm_deploy` 时自动通过 Rich 启用彩色日志，默认打印 `INFO` 及以上级别。若应用、
+测试框架或服务框架已配置 root handler，库会保留现有配置，不添加或替换 handler；
+需要定制格式、输出位置或级别时，应在导入本库前完成应用级日志配置。
 
 阶段边界使用 `INFO`，未验证的依赖版本使用 `WARNING`，模块名称等诊断细节使用 `DEBUG`。
 

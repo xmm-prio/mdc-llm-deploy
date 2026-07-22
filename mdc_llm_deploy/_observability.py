@@ -7,7 +7,22 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from time import perf_counter
 
+from rich.logging import RichHandler
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+
+
+def configure_logging() -> None:
+    """Configure colored root logging unless the application already configured it."""
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        return
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(rich_tracebacks=True)],
+    )
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -60,4 +75,4 @@ def progress_task(
         yield advance
 
 
-__all__ = ["get_logger", "log_stage", "progress_task"]
+__all__ = ["configure_logging", "get_logger", "log_stage", "progress_task"]
