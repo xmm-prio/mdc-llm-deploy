@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+import pytest
+import torch
+from torch import Tensor, nn
+
+from mdc_llm_deploy.quantization import (
+    MinMaxConfig,
+    QuantizationState,
+    TargetSelector,
+    calibrate,
+    convert,
+    prepare,
+    quantization_state,
+    quantize,
+)
+
+
+class _RecordingModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(2, 2)
+        self.observed_training: bool | None = None
+        self.observed_grad_enabled: bool | None = None
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        self.observed_training = self.training
+        self.observed_grad_enabled = torch.is_grad_enabled()
+        return self.linear(inputs)
+
+
+def test_selector_uses_include_and_exclude_with_exclude_priority() -> None:
+    selector = TargetSelector(include=("encoder.*",), exclude=("*.output",))
+
+    assert selector.matches("encoder.input")
+    assert not selector.matches("encoder.output")
+    assert not selector.matches("decoder.input")
+
+
+@pytest.mark.parametrize(
+    ("include", "exclude"),
+    [
+        ((), ()),
+        (("",), ()),
+        (("*",), ("",)),
+    ],
+)
+def test_selector_rejects_invalid_patterns(
+    include: tuple[str, ...],
+    exclude: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError):
+        TargetSelector(include=include, exclude=exclude)
+
+
+def test_three_stage_api_is_in_place_and_tracks_state() -> None:
+    model = _RecordingModel().train()
+    inputs = torch.ones(1, 2)
+
+    assert prepare(model, MinMaxConfig()) is model
+    assert quantization_state(model) is QuantizationState.PREPARED
+    assert calibrate(model, [((inputs,), {})]) is model
+    assert quantization_state(model) is QuantizationState.CALIBRATED
+    assert model.training
+    assert model.observed_training is False
+    assert model.observed_grad_enabled is False
+    assert convert(model) is model
+    assert quantization_state(model) is QuantizationState.CONVERTED
+
+
+def test_lifecycle_rejects_out_of_order_operations() -> None:
+    model = nn.Sequential(nn.Linear(2, 2))
+
+    with pytest.raises(RuntimeError, match="has not been prepared"):
+        calibrate(model)
+
+    prepare(model, MinMaxConfig())
+    with pytest.raises(RuntimeError, match="calibrated"):
+        convert(model)
+    with pytest.raises(RuntimeError, match="active quantization lifecycle"):
+        prepare(model, MinMaxConfig())
+
+
+def test_prepare_failure_is_atomic() -> None:
+    model = nn.Sequential(nn.Linear(2, 2))
+    original = model[0]
+    with torch.no_grad():
+        model[0].weight[0, 0] = torch.nan
+
+    with pytest.raises(ValueError, match="finite"):
+        prepare(model, MinMaxConfig())
+
+    assert model[0] is original
+    assert quantization_state(model) is QuantizationState.UNPREPARED
+
+
+def test_one_step_failure_removes_partial_lifecycle() -> None:
+    model = _RecordingModel()
+    original = model.linear
+
+    with pytest.raises(TypeError, match=r"\(args, kwargs\)"):
+        quantize(model, MinMaxConfig(), batches=[object()])  # type: ignore[list-item]
+
+    assert model.linear is original
+    assert quantization_state(model) is QuantizationState.UNPREPARED
+
+
+def test_convert_rejects_structure_change_before_replacement() -> None:
+    model = nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
+    original_second = model[1]
+    prepare(model, MinMaxConfig())
+    calibrate(model)
+    model[0] = nn.Linear(2, 2)
+
+    with pytest.raises(RuntimeError, match="changed after prepare"):
+        convert(model)
+
+    assert model[1] is original_second
+    assert quantization_state(model) is QuantizationState.CALIBRATED

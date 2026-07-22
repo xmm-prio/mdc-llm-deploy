@@ -13,6 +13,7 @@ EXPECTED_DOCUMENTS = {
     "docs/operators/AscendQuantV2.md",
     "docs/operators/FusedInferAttentionScore.md",
     "docs/operators/RmsNorm.md",
+    "docs/quantization.md",
 }
 
 

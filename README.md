@@ -11,6 +11,20 @@ MDC LLM Deploy 是面向 MDC 部署的 Transformers-compatible LLM 压缩与 ONN
 .venv\Scripts\python.exe -m pip install .
 ```
 
+## MinMax 量化
+
+Linear MinMax INT8 fake-quant 支持三阶段与一步式原地 API：
+
+```python
+from mdc_llm_deploy.quantization import MinMaxConfig, quantize
+
+config = MinMaxConfig(weight=True, activation=True)
+quantize(model, config, calibration_batches)
+```
+
+支持矩阵、checkpoint 恢复、opset 21 QDQ 导出及 MDC lowering 边界见
+[MinMax 量化](docs/quantization.md)。
+
 ## MDC ONNX 图处理
 
 `process_onnx` 是 MDC ONNX 图处理的公开总入口：
