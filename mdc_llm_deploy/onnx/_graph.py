@@ -80,7 +80,9 @@ def attribute_int(node: NodeProto, name: str, default: int | None = None) -> int
     for attribute in node.attribute:
         if attribute.name == name:
             if attribute.type != onnx.AttributeProto.INT:
-                raise ValueError(f"node '{node.name or node.op_type}' attribute '{name}' must be INT")
+                raise ValueError(
+                    f"node '{node.name or node.op_type}' attribute '{name}' must be INT"
+                )
             return int(attribute.i)
     return default
 
@@ -90,7 +92,9 @@ def attribute_ints(node: NodeProto, name: str) -> tuple[int, ...] | None:
     for attribute in node.attribute:
         if attribute.name == name:
             if attribute.type != onnx.AttributeProto.INTS:
-                raise ValueError(f"node '{node.name or node.op_type}' attribute '{name}' must be INTS")
+                raise ValueError(
+                    f"node '{node.name or node.op_type}' attribute '{name}' must be INTS"
+                )
             return tuple(int(value) for value in attribute.ints)
     return None
 
@@ -106,6 +110,14 @@ def constant_array(index: GraphIndex, value_name: str) -> np.ndarray | None:
             if attribute.name == "value" and attribute.type == onnx.AttributeProto.TENSOR:
                 tensor = attribute.t
                 break
+            if attribute.name == "value_float" and attribute.type == onnx.AttributeProto.FLOAT:
+                return np.asarray(attribute.f, dtype=np.float32)
+            if attribute.name == "value_floats" and attribute.type == onnx.AttributeProto.FLOATS:
+                return np.asarray(attribute.floats, dtype=np.float32)
+            if attribute.name == "value_int" and attribute.type == onnx.AttributeProto.INT:
+                return np.asarray(attribute.i, dtype=np.int64)
+            if attribute.name == "value_ints" and attribute.type == onnx.AttributeProto.INTS:
+                return np.asarray(attribute.ints, dtype=np.int64)
     if tensor is None:
         return None
     if tensor.data_location == TensorProto.EXTERNAL and not tensor.raw_data:

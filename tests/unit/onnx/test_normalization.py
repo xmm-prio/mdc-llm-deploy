@@ -118,9 +118,7 @@ def test_removes_lossless_float_cast_round_trip() -> None:
 
     assert [node.op_type for node in model.graph.node] == ["Neg"]
     assert list(model.graph.node[0].input) == ["x"]
-    assert all(
-        value.name not in {"wide", "restored"} for value in model.graph.value_info
-    )
+    assert all(value.name not in {"wide", "restored"} for value in model.graph.value_info)
     onnx.checker.check_model(model, full_check=True)
 
 
@@ -168,6 +166,34 @@ def test_folds_constant_float_cast_and_removes_source_initializer() -> None:
     initializers = {tensor.name: tensor for tensor in model.graph.initializer}
     assert set(initializers) == {"scale", "unrelated"}
     assert numpy_helper.to_array(initializers["scale"]) == np.float16(0.5)
+    onnx.checker.check_model(model, full_check=True)
+
+
+def test_folds_constant_integer_cast_and_reshape_chain() -> None:
+    graph = helper.make_graph(
+        [
+            helper.make_node("Constant", [], ["shape"], value_ints=[1]),
+            helper.make_node("Cast", ["scalar"], ["cast"], to=TensorProto.INT64),
+            helper.make_node("Reshape", ["cast", "shape"], ["vector"]),
+        ],
+        "constant_expression_normalization",
+        [],
+        [helper.make_tensor_value_info("vector", TensorProto.INT64, [1])],
+        [
+            numpy_helper.from_array(np.asarray(-1, dtype=np.int32), "scalar"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+
+    normalize_graph(model)
+
+    assert not model.graph.node
+    initializers = {tensor.name: tensor for tensor in model.graph.initializer}
+    assert set(initializers) == {"vector"}
+    np.testing.assert_array_equal(
+        numpy_helper.to_array(initializers["vector"]),
+        np.asarray([-1], dtype=np.int64),
+    )
     onnx.checker.check_model(model, full_check=True)
 
 

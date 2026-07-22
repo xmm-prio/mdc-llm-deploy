@@ -23,8 +23,22 @@ _LOSSLESS_FLOAT_WIDENINGS = frozenset(
         (TensorProto.FLOAT, TensorProto.DOUBLE),
     }
 )
-_FOLDABLE_FLOAT_DTYPES = frozenset(
-    {TensorProto.FLOAT16, TensorProto.BFLOAT16, TensorProto.FLOAT, TensorProto.DOUBLE}
+_FOLDABLE_CAST_DTYPES = frozenset(
+    {
+        TensorProto.BOOL,
+        TensorProto.INT8,
+        TensorProto.INT16,
+        TensorProto.INT32,
+        TensorProto.INT64,
+        TensorProto.UINT8,
+        TensorProto.UINT16,
+        TensorProto.UINT32,
+        TensorProto.UINT64,
+        TensorProto.FLOAT16,
+        TensorProto.BFLOAT16,
+        TensorProto.FLOAT,
+        TensorProto.DOUBLE,
+    }
 )
 
 
@@ -48,9 +62,7 @@ def _copy_missing_value_info(
 ) -> None:
     if output_info is None:
         return
-    known_names = {
-        value.name for value in (*graph.input, *graph.value_info, *graph.output)
-    }
+    known_names = {value.name for value in (*graph.input, *graph.value_info, *graph.output)}
     known_names.update(tensor.name for tensor in graph.initializer)
     if source_name in known_names:
         return
@@ -102,9 +114,7 @@ def _apply_aliases(
 def _eliminate_identities(model: onnx.ModelProto) -> bool:
     graph = model.graph
     graph_outputs = {value.name for value in graph.output}
-    removable = [
-        node for node in graph.node if _is_removable_identity(node, graph_outputs)
-    ]
+    removable = [node for node in graph.node if _is_removable_identity(node, graph_outputs)]
     if not removable:
         return False
 
@@ -125,31 +135,20 @@ def _is_cast(node: NodeProto | None) -> TypeGuard[NodeProto]:
     )
 
 
-def _fold_constant_casts(model: onnx.ModelProto) -> bool:
+def _fold_constant_expressions(model: onnx.ModelProto) -> bool:
     changed = False
     source_candidates: set[str] = set()
     while True:
         index = GraphIndex(model)
         replacements: dict[str, onnx.TensorProto] = {}
         for node in model.graph.node:
-            if not _is_cast(node):
-                continue
-            try:
-                target_type = attribute_int(node, "to")
-            except ValueError:
-                continue
-            if target_type not in _FOLDABLE_FLOAT_DTYPES:
-                continue
-            value = constant_array(index, node.input[0])
-            if value is None:
-                continue
-            try:
-                target_dtype = helper.tensor_dtype_to_np_dtype(target_type)
-                casted = np.asarray(value).astype(target_dtype)
-            except (TypeError, ValueError):
-                continue
-            replacements[node.output[0]] = numpy_helper.from_array(casted, node.output[0])
-            source_candidates.add(node.input[0])
+            folded = _fold_constant_node(index, node)
+            if folded is not None:
+                replacements[node.output[0]] = numpy_helper.from_array(
+                    folded,
+                    node.output[0],
+                )
+                source_candidates.update(name for name in node.input if name)
 
         if not replacements:
             break
@@ -173,7 +172,72 @@ def _fold_constant_casts(model: onnx.ModelProto) -> bool:
         ]
         del model.graph.initializer[:]
         model.graph.initializer.extend(kept)
+        kept_nodes = [
+            node
+            for node in model.graph.node
+            if not (
+                node.domain in ("", "ai.onnx")
+                and node.op_type == "Constant"
+                and len(node.output) == 1
+                and node.output[0] in source_candidates
+                and node.output[0] not in used
+            )
+        ]
+        del model.graph.node[:]
+        model.graph.node.extend(kept_nodes)
     return changed
+
+
+def _fold_constant_node(index: GraphIndex, node: NodeProto) -> np.ndarray | None:
+    if _is_cast(node):
+        try:
+            target_type = attribute_int(node, "to")
+        except ValueError:
+            return None
+        if target_type not in _FOLDABLE_CAST_DTYPES:
+            return None
+        value = constant_array(index, node.input[0])
+        if value is None:
+            return None
+        try:
+            target_dtype = helper.tensor_dtype_to_np_dtype(target_type)
+            return np.asarray(value).astype(target_dtype)
+        except (TypeError, ValueError):
+            return None
+
+    if not (
+        node.domain in ("", "ai.onnx")
+        and node.op_type == "Reshape"
+        and len(node.input) == 2
+        and len(node.output) == 1
+        and all(node.input)
+        and node.output[0]
+    ):
+        return None
+    value = constant_array(index, node.input[0])
+    shape = constant_array(index, node.input[1])
+    if value is None or shape is None or not np.issubdtype(shape.dtype, np.integer):
+        return None
+    try:
+        allowzero = attribute_int(node, "allowzero", 0)
+    except ValueError:
+        return None
+    target = [int(dimension) for dimension in np.asarray(shape).reshape(-1)]
+    if any(dimension < -1 for dimension in target) or target.count(-1) > 1:
+        return None
+    if allowzero == 0:
+        if any(dimension == 0 and index >= value.ndim for index, dimension in enumerate(target)):
+            return None
+        target = [
+            value.shape[index] if dimension == 0 else dimension
+            for index, dimension in enumerate(target)
+        ]
+    elif allowzero != 1:
+        return None
+    try:
+        return np.asarray(value).reshape(target)
+    except ValueError:
+        return None
 
 
 def _eliminate_lossless_cast_round_trips(model: onnx.ModelProto) -> bool:
@@ -204,8 +268,7 @@ def _eliminate_lossless_cast_round_trips(model: onnx.ModelProto) -> bool:
             or widened_info.shape != source_info.shape
             or input_target != widened_info.elem_type
             or output_target != source_info.elem_type
-            or (source_info.elem_type, widened_info.elem_type)
-            not in _LOSSLESS_FLOAT_WIDENINGS
+            or (source_info.elem_type, widened_info.elem_type) not in _LOSSLESS_FLOAT_WIDENINGS
         ):
             continue
         aliases[output_cast.output[0]] = input_cast.input[0]
@@ -225,7 +288,7 @@ def _eliminate_lossless_cast_round_trips(model: onnx.ModelProto) -> bool:
 def normalize_graph_core(model: onnx.ModelProto) -> onnx.ModelProto:
     """Canonicalize transparent main-graph nodes in place."""
     _eliminate_identities(model)
-    _fold_constant_casts(model)
+    _fold_constant_expressions(model)
     _eliminate_lossless_cast_round_trips(model)
     return model
 

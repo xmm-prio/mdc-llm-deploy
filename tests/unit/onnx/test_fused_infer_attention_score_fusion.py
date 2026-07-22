@@ -10,6 +10,7 @@ import torch
 from onnx import TensorProto, helper, numpy_helper
 from onnx.reference import ReferenceEvaluator
 
+from mdc_llm_deploy.onnx.compatibility_lowering import lower_opset_compatibility_core
 from mdc_llm_deploy.onnx.fusion_pass.fused_infer_attention_score import (
     fuse_fused_infer_attention_score,
 )
@@ -78,7 +79,9 @@ def test_fuses_supported_attention_matrix_with_exact_fia_abi(
     assert all(not name for name in fused.input[5:])
     assert fused.output[0] == "output"
     assert len(fused.output) == 2
-    attributes = {attribute.name: helper.get_attribute_value(attribute) for attribute in fused.attribute}
+    attributes = {
+        attribute.name: helper.get_attribute_value(attribute) for attribute in fused.attribute
+    }
     assert len(attributes) == 16
     assert attributes == {
         **_ATTRIBUTE_DEFAULTS,
@@ -88,6 +91,20 @@ def test_fuses_supported_attention_matrix_with_exact_fia_abi(
     }
     assert not _nodes(model, "Softmax")
     assert not _nodes(model, "Expand")
+    _check_model(model)
+
+
+def test_fuses_sdpa_after_expand_compatibility_lowering() -> None:
+    model = _attention_model(_AttentionCase(backend="sdpa"))
+    lower_opset_compatibility_core(model)
+    assert len(_nodes(model, "Tile")) == 2
+
+    result = fuse_fused_infer_attention_score(model)
+
+    assert result.fused_count == 1
+    fused = _only_node(model, FUSED_INFER_ATTENTION_SCORE_OP)
+    assert list(fused.input[:3]) == ["query", "key", "value"]
+    assert not _nodes(model, "Tile")
     _check_model(model)
 
 
@@ -162,7 +179,9 @@ def test_eager_gqa_visibility_mask_matches_pytorch_oracle() -> None:
 
     result = fuse_fused_infer_attention_score(model)
     fused = _only_node(model, FUSED_INFER_ATTENTION_SCORE_OP)
-    attributes = {attribute.name: helper.get_attribute_value(attribute) for attribute in fused.attribute}
+    attributes = {
+        attribute.name: helper.get_attribute_value(attribute) for attribute in fused.attribute
+    }
     expanded_key = torch.from_numpy(key).repeat_interleave(2, dim=1)
     expanded_value = torch.from_numpy(value).repeat_interleave(2, dim=1)
     scores = torch.matmul(
@@ -357,9 +376,7 @@ def _attention_model(case: _AttentionCase) -> onnx.ModelProto:
     )
     nodes.append(helper.make_node("Softmax", [softmax_input], ["probabilities"], axis=-1))
     probability_name = "probabilities"
-    value_info.append(
-        helper.make_tensor_value_info("probabilities", case.elem_type, score_shape)
-    )
+    value_info.append(helper.make_tensor_value_info("probabilities", case.elem_type, score_shape))
     if case.backend == "sdpa":
         initializers.append(_scalar_tensor("zero", case.elem_type, 0.0))
         nodes.extend(
@@ -533,9 +550,7 @@ def _add_mask(
         elif case.mask == "finite_bias":
             values = [0.0, -1.0] * (case.query_length * case.key_length // 2)
         else:
-            values = [0.0, negative, 1.0] * (
-                case.query_length * case.key_length // 3
-            )
+            values = [0.0, negative, 1.0] * (case.query_length * case.key_length // 3)
         size = case.query_length * case.key_length
         values = (values + [0.0] * size)[:size]
         initializers.append(
@@ -547,9 +562,7 @@ def _add_mask(
             )
         )
         nodes.append(helper.make_node("Add", ["scores", "mask"], ["masked_scores"]))
-    value_info.append(
-        helper.make_tensor_value_info("masked_scores", case.elem_type, score_shape)
-    )
+    value_info.append(helper.make_tensor_value_info("masked_scores", case.elem_type, score_shape))
     return "masked_scores"
 
 
@@ -577,13 +590,10 @@ def _expected_scale(backend: str, elem_type: int) -> float:
 
 
 def _prefix_graph(model: onnx.ModelProto, prefix: str) -> None:
-    names = {
-        name
-        for node in model.graph.node
-        for name in (*node.input, *node.output)
-        if name
-    }
-    names.update(value.name for value in (*model.graph.input, *model.graph.output, *model.graph.value_info))
+    names = {name for node in model.graph.node for name in (*node.input, *node.output) if name}
+    names.update(
+        value.name for value in (*model.graph.input, *model.graph.output, *model.graph.value_info)
+    )
     names.update(tensor.name for tensor in model.graph.initializer)
     mapping = {name: f"{prefix}{name}" for name in names}
     for node in model.graph.node:

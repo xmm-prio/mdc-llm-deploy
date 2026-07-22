@@ -10,7 +10,11 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 from transformers.exporters import OnnxConfig, OnnxExporter
 
 from mdc_llm_deploy.onnx import process_onnx
-from mdc_llm_deploy.onnx.schemas import FUSED_INFER_ATTENTION_SCORE_OP
+from mdc_llm_deploy.onnx.schemas import (
+    FUSED_INFER_ATTENTION_SCORE_OP,
+    RMS_NORM_OP,
+    ROTARY_POSITION_EMBEDDING_OP,
+)
 from mdc_llm_deploy.quantization import (
     MinMaxConfig,
     MinMaxLinear,
@@ -117,9 +121,7 @@ def _export_with_transformers(model: nn.Module) -> onnx.ModelProto:
 
 
 def _standard_operator_counts(model: onnx.ModelProto) -> Counter[str]:
-    return Counter(
-        node.op_type for node in model.graph.node if node.domain in ("", "ai.onnx")
-    )
+    return Counter(node.op_type for node in model.graph.node if node.domain in ("", "ai.onnx"))
 
 
 def _computational_operator_counts(model: onnx.ModelProto) -> Counter[str]:
@@ -176,9 +178,9 @@ def test_dense_qwen3_opset21_qdq_export_and_w8a8_lowering() -> None:
         exporter_name: _standard_operator_counts(exported)
         for exporter_name, exported in exports.items()
     }
-    assert _computational_operator_counts(
-        exports["pytorch"]
-    ) == _computational_operator_counts(exports["transformers"])
+    assert _computational_operator_counts(exports["pytorch"]) == _computational_operator_counts(
+        exports["transformers"]
+    )
 
     for exporter_name, exported in exports.items():
         onnx.checker.check_model(exported)
@@ -215,5 +217,7 @@ def test_dense_qwen3_w8a8_generation_fuses_fp16_attention() -> None:
         assert counts["DequantizeLinear"] == 0
         assert counts["NPUAscendQuantV2"] > 0
         assert counts["AscendDequant"] > 0
+        assert counts[RMS_NORM_OP] == 5
+        assert counts[ROTARY_POSITION_EMBEDDING_OP] == 1
         assert counts[FUSED_INFER_ATTENTION_SCORE_OP] == 1
         onnx.checker.check_model(exported)

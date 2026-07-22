@@ -271,7 +271,11 @@ def _match_additive_where(
         return None
     condition_info = index.tensor_info.get(where.input[0])
     output_info = index.tensor_info.get(where.output[0])
-    if condition_info is None or condition_info.elem_type != TensorProto.BOOL or output_info is None:
+    if (
+        condition_info is None
+        or condition_info.elem_type != TensorProto.BOOL
+        or output_info is None
+    ):
         return None
     true_value = _scalar(index, where.input[1])
     false_value = _scalar(index, where.input[2])
@@ -382,8 +386,7 @@ def _match_key(
         not isinstance(batch, int)
         or not isinstance(heads, int)
         or inner_info != TensorInfo(query_info.elem_type, (batch * heads, sequence, head_dim))
-        or transposed_info
-        != TensorInfo(query_info.elem_type, (batch * heads, head_dim, sequence))
+        or transposed_info != TensorInfo(query_info.elem_type, (batch * heads, head_dim, sequence))
         or outer_info != TensorInfo(query_info.elem_type, (batch, heads, head_dim, sequence))
     ):
         return None
@@ -399,63 +402,36 @@ def _match_repeated_bnsd(
     query_info: TensorInfo,
 ) -> _TensorMatch | None:
     value_info = index.tensor_info.get(value_name)
-    if value_info is None or len(value_info.shape) != 4:
+    if value_info is None:
+        return None
+    value_shape = _static_shape(value_info.shape, rank=4)
+    if value_shape is None:
         return None
     query_shape = _static_shape(query_info.shape, rank=4)
     if query_shape is None:
         return None
     batch, query_heads, _, head_dim = query_shape
+    value_batch, value_heads, sequence, value_head_dim = value_shape
     if (
         value_info.elem_type != query_info.elem_type
-        or value_info.shape[0] != batch
-        or value_info.shape[1] != query_heads
-        or value_info.shape[3] != head_dim
+        or value_batch != batch
+        or value_heads != query_heads
+        or value_head_dim != head_dim
     ):
         return None
 
     reshape = index.producer(value_name)
     if not _is_node(reshape, "Reshape", inputs=2, outputs=1):
         return _TensorMatch(value_name, ())
-    expand = index.producer(reshape.input[0])
-    if not _is_node(expand, "Expand", inputs=2, outputs=1):
+    expanded = _match_expanded_bnsd(index, reshape.input[0], query_info)
+    if expanded is None:
+        repeat = index.producer(reshape.input[0])
+        if _is_repeat_node(repeat):
+            return None
         return _TensorMatch(value_name, ())
-    unsqueeze = index.producer(expand.input[0])
-    if not _is_node(unsqueeze, "Unsqueeze", inputs=2, outputs=1):
-        return None
-    axes = constant_array(index, unsqueeze.input[1])
-    source_info = index.tensor_info.get(unsqueeze.input[0])
-    unsqueezed_info = index.tensor_info.get(unsqueeze.output[0])
-    expanded_info = index.tensor_info.get(expand.output[0])
-    if axes is None or tuple(int(value) for value in axes.reshape(-1)) != (2,):
-        return None
-    if source_info is None:
-        return None
-    source_shape = _static_shape(source_info.shape, rank=4)
-    if source_shape is None:
-        return None
-    source_batch, kv_heads, sequence, source_head_dim = source_shape
-    if (
-        source_info.elem_type != query_info.elem_type
-        or source_batch != batch
-        or source_head_dim != head_dim
-        or kv_heads <= 0
-        or query_heads % kv_heads
-    ):
-        return None
-    repeats = query_heads // kv_heads
-    expected_unsqueezed = TensorInfo(
-        source_info.elem_type,
-        (batch, kv_heads, 1, sequence, head_dim),
-    )
-    expected_expanded = TensorInfo(
-        source_info.elem_type,
-        (batch, kv_heads, repeats, sequence, head_dim),
-    )
-    if unsqueezed_info != expected_unsqueezed or expanded_info != expected_expanded:
-        return None
     if value_info.shape != (batch, query_heads, sequence, head_dim):
         return None
-    return _TensorMatch(unsqueeze.input[0], (unsqueeze, expand, reshape))
+    return _TensorMatch(expanded.source_name, (*expanded.nodes, reshape))
 
 
 def _match_expanded_bnsd(
@@ -464,10 +440,10 @@ def _match_expanded_bnsd(
     query_info: TensorInfo,
 ) -> _TensorMatch | None:
     expanded_info = index.tensor_info.get(value_name)
-    expand = index.producer(value_name)
-    if expanded_info is None or not _is_node(expand, "Expand", inputs=2, outputs=1):
+    repeat = index.producer(value_name)
+    if expanded_info is None or not _is_repeat_node(repeat):
         return None
-    unsqueeze = index.producer(expand.input[0])
+    unsqueeze = index.producer(repeat.input[0])
     if not _is_node(unsqueeze, "Unsqueeze", inputs=2, outputs=1):
         return None
     axes = constant_array(index, unsqueeze.input[1])
@@ -502,7 +478,30 @@ def _match_expanded_bnsd(
         (batch, kv_heads, repeats, sequence, head_dim),
     ):
         return None
-    return _TensorMatch(unsqueeze.input[0], (unsqueeze, expand))
+    if repeat.op_type == "Tile":
+        tile_repeats = _constant_integers(index, repeat.input[1])
+        if tile_repeats != (1, 1, repeats, 1, 1):
+            return None
+    return _TensorMatch(unsqueeze.input[0], (unsqueeze, repeat))
+
+
+def _is_repeat_node(node: NodeProto | None) -> TypeGuard[NodeProto]:
+    return (
+        node is not None
+        and node.domain in ("", "ai.onnx")
+        and node.op_type in {"Expand", "Tile"}
+        and len(node.input) == 2
+        and len(node.output) == 1
+        and all(node.input)
+        and node.output[0]
+    )
+
+
+def _constant_integers(index: GraphIndex, value_name: str) -> tuple[int, ...] | None:
+    value = constant_array(index, value_name)
+    if value is None or not np.issubdtype(value.dtype, np.integer):
+        return None
+    return tuple(int(item) for item in np.asarray(value).reshape(-1))
 
 
 def _valid_mask(
@@ -606,19 +605,14 @@ def _replace_match(model: onnx.ModelProto, match: _AttentionMatch) -> str:
         for index, node in enumerate(graph.node)
         if id(node) in removed_ids and match.output_name in node.output
     )
-    replacement_index = sum(
-        id(node) not in removed_ids for node in graph.node[:output_node_index]
-    )
+    replacement_index = sum(id(node) not in removed_ids for node in graph.node[:output_node_index])
     kept_nodes = [node for node in graph.node if id(node) not in removed_ids]
     kept_nodes[replacement_index:replacement_index] = [*preparation_nodes, fused_node]
     del graph.node[:]
     graph.node.extend(kept_nodes)
 
     stale_values = {
-        output
-        for node in match.nodes
-        for output in node.output
-        if output != match.output_name
+        output for node in match.nodes for output in node.output if output != match.output_name
     }
     remove_value_info(model, stale_values)
     _remove_dead_constants(model, match.nodes)
@@ -661,11 +655,7 @@ def _closed_match(
 
 
 def _supported_bnsd(info: TensorInfo | None) -> bool:
-    return (
-        info is not None
-        and info.elem_type in _SUPPORTED_DTYPES
-        and len(info.shape) == 4
-    )
+    return info is not None and info.elem_type in _SUPPORTED_DTYPES and len(info.shape) == 4
 
 
 def _static_shape(
@@ -707,8 +697,7 @@ def _broadcasts_to(
         return False
     padded = (1,) * (len(target) - len(source)) + source
     return all(
-        value == 1 or value == expected
-        for value, expected in zip(padded, target, strict=True)
+        value == 1 or value == expected for value, expected in zip(padded, target, strict=True)
     )
 
 
