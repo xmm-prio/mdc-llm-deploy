@@ -19,9 +19,10 @@ assert processed is model
 2. 执行 MDC parser compatibility lowering：把静态 `Split.num_outputs` 精确转换为
    opset 18 的 `split` 常量输入；
 3. 验证剩余标准算子可由 opset 18 表达，并把默认 domain opset 降至 18；
-4. 固定按 RMSNorm、RoPE、FIA 顺序运行融合；
-5. 扫描主图及子图，只注册实际出现的 MDC custom-op schema；
-6. 运行最终 ONNX checker，并确认主图无残余 QDQ。
+4. 规范化透明 `Identity`、常量 Cast 和无损浮点 Cast 往返；
+5. 固定按 RMSNorm、RoPE、FIA 顺序运行融合；
+6. 扫描主图及子图，只注册实际出现的 MDC custom-op schema；
+7. 运行最终 ONNX checker，并确认主图无残余 QDQ。
 
 lowering 产生的 custom op 会在 opset 检查前按需注册；融合新产生的 schema 会在最终
 checker 前再次按需注册。导入包本身仍无 registry 副作用。整个流程先处理模型副本，
@@ -56,8 +57,9 @@ runner 的明确契约，不等同于 `process_onnx` 的全流程原子契约。
 - RoPE：Qwen3 BNSD half-rotation Q/K 对，支持 FP16、BF16、FP32；
 - FIA：静态 BNSD eager/SDPA、Prefill/真实 KV-cache Decode、MHA/GQA，仅支持
   FP16、BF16；
-- FP32 attention、动态 shape、有限 attention bias、ALiBi/PSE、dropout、量化
-  attention 均保持小算子图，FIA 命中数为 0。
+- FP32 attention、动态 shape、有限 attention bias、ALiBi/PSE、dropout，以及 Q/K/V
+  直接为 INT8 的量化 attention 均保持小算子图，FIA 命中数为 0；W8A8 projection
+  经 `AscendDequant` 恢复为 FP16/BF16 后仍可融合。
 
 ## 支持范围
 

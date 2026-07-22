@@ -11,6 +11,7 @@ from .._observability import get_logger, log_stage, progress_task
 from ._graph import clone_model
 from .compatibility_lowering import lower_opset_compatibility_core
 from .fusion_pass import run_fusion_passes
+from .normalization import normalize_graph_core
 from .opset_downgrade import downgrade_opset_core
 from .quant_lowering import lower_qdq_core
 from .schemas import ALL_SCHEMA_NAMES, register_schemas
@@ -82,6 +83,7 @@ def process_onnx(
         ("schema registration before lowering", _register_required_schemas),
         ("compatibility lowering", lower_opset_compatibility_core),
         ("opset downgrade", downgrade_opset_core),
+        ("graph normalization", normalize_graph_core),
         ("fusion", run_fusion_passes),
         ("schema registration after fusion", _register_required_schemas),
         ("final validation", _validate_final_graph),

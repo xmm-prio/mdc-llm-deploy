@@ -10,6 +10,7 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 from transformers.exporters import OnnxConfig, OnnxExporter
 
 from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx.schemas import FUSED_INFER_ATTENTION_SCORE_OP
 from mdc_llm_deploy.quantization import (
     MinMaxConfig,
     MinMaxLinear,
@@ -38,7 +39,11 @@ def offline_export_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
 
 
-def _build_dense_qwen3() -> Qwen3ForCausalLM:
+def _build_dense_qwen3(
+    *,
+    dtype: torch.dtype = torch.float32,
+    use_cache: bool = False,
+) -> Qwen3ForCausalLM:
     torch.manual_seed(0)
     config = Qwen3Config(
         vocab_size=32,
@@ -49,14 +54,14 @@ def _build_dense_qwen3() -> Qwen3ForCausalLM:
         num_key_value_heads=2,
         head_dim=8,
         max_position_embeddings=32,
-        use_cache=False,
+        use_cache=use_cache,
         pad_token_id=0,
         eos_token_id=31,
-        dtype=torch.float32,
+        dtype=dtype,
     )
     model = Qwen3ForCausalLM(config)
     model.set_attn_implementation("eager")
-    return model.eval()
+    return model.eval().to(dtype=dtype)
 
 
 def _w8a8_config() -> MinMaxConfig:
@@ -188,4 +193,27 @@ def test_dense_qwen3_opset21_qdq_export_and_w8a8_lowering() -> None:
         assert lowered_counts["DequantizeLinear"] == 0
         assert sum(node.op_type == "NPUAscendQuantV2" for node in exported.graph.node) > 0
         assert sum(node.op_type == "AscendDequant" for node in exported.graph.node) > 0
+        onnx.checker.check_model(exported)
+
+
+def test_dense_qwen3_w8a8_generation_fuses_fp16_attention() -> None:
+    model = _build_dense_qwen3(dtype=torch.float16, use_cache=True)
+    quantize(model, _w8a8_config(), _calibration_batches())
+    programs = OnnxExporter().export_for_generation(
+        model,
+        {"inputs": _INPUTS["input_ids"]},
+        _export_config(),
+    )
+
+    for component_name in ("prefill", "decode"):
+        exported = programs[component_name].model_proto
+
+        assert process_onnx(exported) is exported
+
+        counts = _standard_operator_counts(exported)
+        assert counts["QuantizeLinear"] == 0
+        assert counts["DequantizeLinear"] == 0
+        assert counts["NPUAscendQuantV2"] > 0
+        assert counts["AscendDequant"] > 0
+        assert counts[FUSED_INFER_ATTENTION_SCORE_OP] == 1
         onnx.checker.check_model(exported)

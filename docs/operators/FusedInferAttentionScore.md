@@ -37,8 +37,10 @@ FIA pass 识别 Transformers Qwen3 静态 attention 子图：
 - Q/K/V 必须为静态 BNSD，dtype 为 FP16 或 BF16；
 - additive mask 仅接受精确 `{0, -inf}` 或 `{0, finfo(dtype).min}`；
 - 必须完整证明 scale、KV repeat、mask 广播和子图闭包；
-- FP32 attention、有限 bias、ALiBi/PSE、dropout、动态 shape 和量化 attention
-  保持原图。
+- FP32 attention、有限 bias、ALiBi/PSE、dropout、动态 shape，以及 Q/K/V 直接为
+  INT8 的量化 attention 保持原图；
+- Linear projection 可使用 W8A8。projection 输出经 `AscendDequant` 恢复为 FP16
+  或 BF16 后，后续 attention 子图仍可融合为 FIA。
 
 ```python
 import onnx
