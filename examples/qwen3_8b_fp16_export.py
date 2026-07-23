@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import gc
+from contextlib import chdir
 from dataclasses import dataclass
 from pathlib import Path
 
 import onnx
 import torch
+from onnx import TensorProto
+from onnx.external_data_helper import (
+    ExternalDataInfo,
+    load_external_data_for_tensor,
+    uses_external_data,
+)
 from onnxscript import optimizer
 from torch import nn
 from torch.onnx import ONNXProgram
@@ -33,6 +41,7 @@ from mdc_llm_deploy.onnx.schemas import (
 MODEL_ID = "Qwen/Qwen3-8B"
 PREFILL_LENGTH = 2048
 KV_CAPACITY = 32000
+INLINE_CONSTANT_LIMIT = 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +204,8 @@ def export_config() -> OnnxConfig:
 def adapt_without_fia(
     model: onnx.ModelProto,
     num_hidden_layers: int,
+    *,
+    validate: bool = True,
 ) -> onnx.ModelProto:
     """Apply MDC compatibility transforms while keeping Attention unfused."""
     lower_opset_compatibility(model)
@@ -215,7 +226,8 @@ def adapt_without_fia(
             f"Expected {num_hidden_layers} RoPE fusions, got {rope_result.fused_count}"
         )
     register_schemas(RMS_NORM_OP, ROTARY_POSITION_EMBEDDING_OP)
-    onnx.checker.check_model(model, full_check=True)
+    if validate:
+        onnx.checker.check_model(model, full_check=True)
     operators = {node.op_type for node in model.graph.node}
     if FUSED_INFER_ATTENTION_SCORE_OP in operators:
         raise ValueError("Attention must remain unfused")
@@ -228,28 +240,59 @@ def adapt_without_fia(
 def export_stage(
     module: ChunkedQwen3,
     inputs: dict[str, torch.Tensor],
+    *,
+    output_path: Path | None = None,
 ) -> onnx.ModelProto:
     """Export and adapt one static graph."""
     program = OnnxExporter().export(module, inputs, export_config())
     if not isinstance(program, ONNXProgram):
         raise TypeError(f"Expected ONNXProgram, got {type(program).__name__}")
+    if output_path is not None:
+        return _adapt_external_program(program, output_path, module.num_hidden_layers)
     return adapt_without_fia(program.model_proto, module.num_hidden_layers)
 
 
-def save_external(model: onnx.ModelProto, path: Path) -> None:
-    """Save one ONNX graph and all weights in one external data file."""
+def _adapt_external_program(
+    program: ONNXProgram,
+    path: Path,
+    num_hidden_layers: int,
+) -> onnx.ModelProto:
+    """Adapt a large export without serializing its weight payload in protobuf."""
+    path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     data_name = f"{path.name}.data"
+    data_path = path.parent / data_name
     path.unlink(missing_ok=True)
-    (path.parent / data_name).unlink(missing_ok=True)
-    onnx.save_model(
-        model,
-        path,
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=data_name,
-        size_threshold=0,
-    )
+    data_path.unlink(missing_ok=True)
+    model: onnx.ModelProto | None = None
+    try:
+        program.save(path, external_data=True)
+        model = onnx.load(path, load_external_data=False)
+        _inline_small_constants(model, path.parent)
+        with chdir(path.parent):
+            adapt_without_fia(model, num_hidden_layers, validate=False)
+        onnx.save_model(model, path)
+        onnx.checker.check_model(path, full_check=True)
+        return model
+    except BaseException:
+        del model
+        gc.collect()
+        path.unlink(missing_ok=True)
+        data_path.unlink(missing_ok=True)
+        raise
+
+
+def _inline_small_constants(model: onnx.ModelProto, base_dir: Path) -> None:
+    """Load small constants needed by graph rewrites while weights stay external."""
+    for tensor in model.graph.initializer:
+        if not uses_external_data(tensor):
+            continue
+        length = ExternalDataInfo(tensor).length
+        if length is None or length > INLINE_CONSTANT_LIMIT:
+            continue
+        load_external_data_for_tensor(tensor, str(base_dir))
+        tensor.data_location = TensorProto.DEFAULT
+        del tensor.external_data[:]
 
 
 def run_export(
@@ -267,9 +310,8 @@ def run_export(
         print(f"Preparing {spec.name} inputs")
         inputs = make_stage_inputs(model, spec, device, seed=seed)
         print(f"Exporting {spec.name}")
-        graph = export_stage(module, inputs)
         model_path = output_dir / f"{spec.name}.onnx"
-        save_external(graph, model_path)
+        graph = export_stage(module, inputs, output_path=model_path)
         del graph, inputs
 
     del module, model

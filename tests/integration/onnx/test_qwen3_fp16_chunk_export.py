@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections import Counter
+from pathlib import Path
 
 import onnx
 import pytest
 import torch
+from onnx.external_data_helper import uses_external_data
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from examples.qwen3_8b_fp16_export import (
@@ -116,6 +118,7 @@ def test_exported_graph_has_static_abi_and_small_operator_attention(
     stage_spec: StageSpec,
     expected_input_shapes: tuple[tuple[int, ...], ...],
     expected_output_shapes: tuple[tuple[int, ...], ...],
+    tmp_path: Path,
 ) -> None:
     inputs = make_stage_inputs(
         tiny_model,
@@ -124,8 +127,12 @@ def test_exported_graph_has_static_abi_and_small_operator_attention(
         seed=0,
     )
 
-    graph = export_stage(ChunkedQwen3(tiny_model), inputs)
+    model_path = tmp_path / f"{stage_spec.name}.onnx"
+    graph = export_stage(ChunkedQwen3(tiny_model), inputs, output_path=model_path)
 
+    assert model_path.is_file()
+    assert (tmp_path / f"{model_path.name}.data").is_file()
+    assert any(uses_external_data(tensor) for tensor in graph.graph.initializer)
     assert [value.name for value in graph.graph.input] == [
         "input_ids",
         "past_key",
