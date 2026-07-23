@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from time import perf_counter
 from typing import Final
 
@@ -29,12 +30,17 @@ _FUSION_PASSES: Final[tuple[FusionPass, ...]] = (
 )
 
 
-def run_fusion_passes(model: onnx.ModelProto) -> FusionReport:
-    """Run every fusion pass in stable order, preserving prior successful rewrites."""
+def run_fusion_passes(
+    model: onnx.ModelProto,
+    *,
+    passes: Sequence[FusionPass] | None = None,
+) -> FusionReport:
+    """Run selected fusion passes in order, or every pass when unspecified."""
     if not isinstance(model, onnx.ModelProto):
         raise TypeError("model must be an onnx.ModelProto")
+    selected_passes = _FUSION_PASSES if passes is None else tuple(passes)
     results: list[FusionPassResult] = []
-    for fusion_pass in _FUSION_PASSES:
+    for fusion_pass in selected_passes:
         started_at = perf_counter()
         result = fusion_pass.apply(model)
         results.append(result)

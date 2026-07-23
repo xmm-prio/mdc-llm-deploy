@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import onnx
-from onnx import NodeProto, TensorProto, ValueInfoProto, numpy_helper
+from onnx import NodeProto, TensorProto, ValueInfoProto, helper, numpy_helper
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,23 +96,82 @@ def attribute_ints(node: NodeProto, name: str) -> tuple[int, ...] | None:
 
 
 def constant_array(index: GraphIndex, value_name: str) -> np.ndarray | None:
-    """Return initializer/Constant data, or None for a dynamic value."""
+    """Evaluate supported constant-only values, or return None when dynamic."""
+    return _constant_array(index, value_name, set())
+
+
+def _constant_array(
+    index: GraphIndex,
+    value_name: str,
+    visiting: set[str],
+) -> np.ndarray | None:
+    if value_name in visiting:
+        return None
+    visiting.add(value_name)
+    try:
+        return _constant_array_impl(index, value_name, visiting)
+    finally:
+        visiting.remove(value_name)
+
+
+def _constant_array_impl(
+    index: GraphIndex,
+    value_name: str,
+    visiting: set[str],
+) -> np.ndarray | None:
     tensor = index.initializers.get(value_name)
-    if tensor is None:
-        producer = index.producer(value_name)
-        if producer is None or producer.op_type != "Constant":
-            return None
+    if tensor is not None:
+        if tensor.data_location == TensorProto.EXTERNAL and not tensor.raw_data:
+            raise ValueError(
+                f"initializer '{value_name}' uses unloaded external data; "
+                "load it before calling MDC ONNX"
+            )
+        return np.asarray(numpy_helper.to_array(tensor))
+
+    producer = index.producer(value_name)
+    if producer is None:
+        return None
+    if producer.op_type == "Constant":
         for attribute in producer.attribute:
             if attribute.name == "value" and attribute.type == onnx.AttributeProto.TENSOR:
-                tensor = attribute.t
-                break
-    if tensor is None:
+                return np.asarray(numpy_helper.to_array(attribute.t))
+            if attribute.name == "value_int" and attribute.type == onnx.AttributeProto.INT:
+                return np.asarray(attribute.i, dtype=np.int64)
+            if attribute.name == "value_ints" and attribute.type == onnx.AttributeProto.INTS:
+                return np.asarray(attribute.ints, dtype=np.int64)
+            if attribute.name == "value_float" and attribute.type == onnx.AttributeProto.FLOAT:
+                return np.asarray(attribute.f, dtype=np.float32)
+            if attribute.name == "value_floats" and attribute.type == onnx.AttributeProto.FLOATS:
+                return np.asarray(attribute.floats, dtype=np.float32)
         return None
-    if tensor.data_location == TensorProto.EXTERNAL and not tensor.raw_data:
-        raise ValueError(
-            f"initializer '{value_name}' uses unloaded external data; load it before calling MDC ONNX"
-        )
-    return np.asarray(numpy_helper.to_array(tensor))
+    if producer.op_type == "Identity" and len(producer.input) == 1:
+        return _constant_array(index, producer.input[0], visiting)
+    if producer.op_type == "Cast" and len(producer.input) == 1:
+        source = _constant_array(index, producer.input[0], visiting)
+        destination_type = attribute_int(producer, "to")
+        if source is None or destination_type is None:
+            return None
+        try:
+            return source.astype(helper.tensor_dtype_to_np_dtype(destination_type))
+        except (TypeError, ValueError):
+            return None
+    if producer.op_type != "Reshape" or len(producer.input) != 2:
+        return None
+
+    source = _constant_array(index, producer.input[0], visiting)
+    shape_array = _constant_array(index, producer.input[1], visiting)
+    if source is None or shape_array is None or not np.issubdtype(shape_array.dtype, np.integer):
+        return None
+    shape = [int(dimension) for dimension in shape_array.reshape(-1)]
+    if attribute_int(producer, "allowzero", 0) == 0:
+        shape = [
+            source.shape[index] if dimension == 0 and index < source.ndim else dimension
+            for index, dimension in enumerate(shape)
+        ]
+    try:
+        return np.asarray(source.reshape(shape))
+    except ValueError:
+        return None
 
 
 def unique_name(existing: set[str], preferred: str) -> str:

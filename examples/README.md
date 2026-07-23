@@ -1,5 +1,55 @@
 # 示例
 
+## Qwen3-8B 单层精度验证
+
+`qwen3_8b_layer_accuracy` 使用独立的第 1 个 `DecoderLayer`，固定
+`batch=1, sequence=128`，不包含 embedding、末尾 norm、lm head 和 KV cache。验证三组配置：
+
+- FP16；
+- W8A8：权重 per-channel、激活静态 per-token，均为对称 INT8；
+- W8A8：权重 per-channel、激活静态 per-tensor，均为对称 INT8。
+
+校准集与评估集使用不同的内置文本。文本先经过 Qwen3 tokenizer 和 embedding，生成
+`inputs_embeds`；图输入还包含 token mask 和 position ids，因果 mask 与 RoPE 在 Layer
+编排内生成。三组模型共用相同评估输入。
+
+生成 Torch、raw QDQ ONNX 和 MDC ONNX：
+
+```powershell
+.venv\Scripts\python.exe -m examples.qwen3_8b_layer_accuracy generate `
+  --model C:\models\Qwen3-8B `
+  --output-dir output\qwen3_8b_layer_accuracy
+```
+
+输出目录包含：
+
+```text
+output/qwen3_8b_layer_accuracy/
+├── inputs/                         # 三组真实文本评估输入，NPY 与 BIN
+├── fp16/
+│   ├── layer_raw.onnx
+│   ├── layer_mdc.onnx
+│   └── torch_output_case_*.npy
+├── w8a8_per_token/
+├── w8a8_per_tensor/
+├── manifest.json                   # ABI、shape、dtype、scale、饱和率
+└── local_report.md                 # 量化 Torch 相对 FP16 Torch
+```
+
+板端输出必须与同配置 Torch 输出比较，不能用 FP16 Torch 直接验收 W8A8。读取板端 FP16
+二进制并执行 `cosine >= 0.999` 验收：
+
+```powershell
+.venv\Scripts\python.exe -m examples.qwen3_8b_layer_accuracy compare `
+  --reference output\qwen3_8b_layer_accuracy\w8a8_per_token\torch_output_case_0.npy `
+  --actual output\board\output_0.bin `
+  --actual-dtype float16 `
+  --actual-shape 1,128,4096
+```
+
+静态 per-token scale 固定 token 位置。本流程只验证 seq=128 Prefill；改变长度必须重新校准
+并导出。
+
 ## Qwen3-8B 单层 W8A8 导出
 
 `qwen3_8b_w8a8_export.py` 完成以下流程：

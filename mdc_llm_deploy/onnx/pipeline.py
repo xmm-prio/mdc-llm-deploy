@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 
 import onnx
 from onnx import GraphProto, NodeProto
@@ -10,7 +10,7 @@ from onnx import GraphProto, NodeProto
 from .._observability import get_logger, log_stage, progress_task
 from ._graph import clone_model
 from .compatibility_lowering import lower_opset_compatibility_core
-from .fusion_pass import run_fusion_passes
+from .fusion_pass import FusionPass, run_fusion_passes
 from .normalization import normalize_graph_core
 from .opset_downgrade import downgrade_opset_core
 from .quant_lowering import lower_qdq_core
@@ -73,8 +73,9 @@ def process_onnx(
     model: onnx.ModelProto,
     *,
     show_progress: bool = True,
+    fusion_passes: Sequence[FusionPass] | None = None,
 ) -> onnx.ModelProto:
-    """Run the atomic MDC pipeline in place and return the same ModelProto."""
+    """Run the atomic MDC pipeline with optional ordered fusion-pass selection."""
     if not isinstance(model, onnx.ModelProto):
         raise TypeError("model must be an onnx.ModelProto")
     working = clone_model(model)
@@ -84,7 +85,7 @@ def process_onnx(
         ("compatibility lowering", lower_opset_compatibility_core),
         ("opset downgrade", downgrade_opset_core),
         ("graph normalization", normalize_graph_core),
-        ("fusion", run_fusion_passes),
+        ("fusion", lambda graph: run_fusion_passes(graph, passes=fusion_passes)),
         ("schema registration after fusion", _register_required_schemas),
         ("final validation", _validate_final_graph),
     )

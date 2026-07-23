@@ -47,6 +47,16 @@ def test_run_fusion_passes_uses_stable_public_order() -> None:
     assert report.total_fused_count == 0
 
 
+def test_run_fusion_passes_accepts_explicit_ordered_subset() -> None:
+    model = _identity_model()
+    passes = (_RecordingPass("second"), _RecordingPass("first"))
+
+    report = run_fusion_passes(model, passes=passes)
+
+    assert tuple(report.counts) == ("second", "first")
+    assert model.doc_string == "secondfirst"
+
+
 def test_run_fusion_passes_keeps_prior_results_when_later_pass_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
