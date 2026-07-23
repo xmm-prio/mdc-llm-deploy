@@ -10,19 +10,24 @@ from time import perf_counter
 from rich.logging import RichHandler
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
+_PACKAGE_LOGGER_NAME = "mdc_llm_deploy"
+
 
 def configure_logging() -> None:
-    """Configure colored root logging unless the application already configured it."""
+    """Configure colored package logging unless the application already configured logging."""
     root_logger = logging.getLogger()
     if root_logger.handlers:
         return
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        datefmt="[%X]",
-        handlers=[RichHandler(rich_tracebacks=True)],
-    )
+    package_logger = logging.getLogger(_PACKAGE_LOGGER_NAME)
+    if package_logger.handlers:
+        return
+
+    handler = RichHandler(rich_tracebacks=True)
+    handler.setFormatter(logging.Formatter("%(message)s", datefmt="[%X]"))
+    package_logger.addHandler(handler)
+    package_logger.setLevel(logging.INFO)
+    package_logger.propagate = False
 
 
 def get_logger(name: str) -> logging.Logger:
