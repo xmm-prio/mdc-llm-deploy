@@ -205,15 +205,17 @@ def adapt_without_fia(
     model: onnx.ModelProto,
     num_hidden_layers: int,
     *,
+    optimize: bool = True,
     validate: bool = True,
 ) -> onnx.ModelProto:
     """Apply MDC compatibility transforms while keeping Attention unfused."""
     lower_opset_compatibility(model)
     downgrade_opset(model)
     normalize_graph(model)
-    optimized = optimizer.optimize(model)
-    if optimized is not model:
-        model.CopyFrom(optimized)
+    if optimize:
+        optimized = optimizer.optimize(model)
+        if optimized is not model:
+            model.CopyFrom(optimized)
     rms_norm_result = fuse_rms_norm(model)
     rope_result = fuse_apply_rotary_pos_emb(model)
     expected_rms_norm_count = 4 * num_hidden_layers + 1
@@ -266,11 +268,17 @@ def _adapt_external_program(
     data_path.unlink(missing_ok=True)
     model: onnx.ModelProto | None = None
     try:
+        optimizer.optimize(program.model)
         program.save(path, external_data=True)
         model = onnx.load(path, load_external_data=False)
         _inline_small_constants(model, path.parent)
         with chdir(path.parent):
-            adapt_without_fia(model, num_hidden_layers, validate=False)
+            adapt_without_fia(
+                model,
+                num_hidden_layers,
+                optimize=False,
+                validate=False,
+            )
         onnx.save_model(model, path)
         onnx.checker.check_model(path, full_check=True)
         return model
