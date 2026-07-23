@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import onnx
 import pytest
@@ -9,10 +10,12 @@ import torch
 from onnx.external_data_helper import uses_external_data
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
+import examples.qwen3_8b_fp16_export as export_example
 from examples.qwen3_8b_fp16_export import (
     ChunkedQwen3,
     StageSpec,
     export_stage,
+    load_model,
     make_stage_inputs,
     position_ids_from_mask,
 )
@@ -46,6 +49,21 @@ def tiny_model() -> Qwen3ForCausalLM:
 
 def _shape(value: onnx.ValueInfoProto) -> tuple[int, ...]:
     return tuple(dimension.dim_value for dimension in value.type.tensor_type.shape.dim)
+
+
+@pytest.mark.parametrize("num_hidden_layers", [0, 37])
+def test_load_model_rejects_invalid_layer_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    num_hidden_layers: int,
+) -> None:
+    monkeypatch.setattr(
+        export_example.AutoConfig,
+        "from_pretrained",
+        lambda _model_id: SimpleNamespace(num_hidden_layers=36),
+    )
+
+    with pytest.raises(ValueError, match=r"within \[1, 36\]"):
+        load_model("unused", num_hidden_layers=num_hidden_layers)
 
 
 def test_chunked_prefill_and_decode_return_only_current_kv(

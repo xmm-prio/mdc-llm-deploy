@@ -43,6 +43,8 @@ PREFILL_LENGTH = 2048
 KV_CAPACITY = 32000
 INLINE_CONSTANT_LIMIT = 1024
 
+# Keep the default as the full release model. Routine validation must use
+# --num-hidden-layers 2; full-network export is too slow for smoke testing.
 
 @dataclass(frozen=True, slots=True)
 class StageSpec:
@@ -121,9 +123,21 @@ def select_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def load_model(model_id: str) -> PreTrainedModel:
-    """Load the complete pretrained Qwen3-8B FP16 model."""
+def load_model(
+    model_id: str,
+    *,
+    num_hidden_layers: int | None = None,
+) -> PreTrainedModel:
+    """Load pretrained Qwen3-8B FP16 weights with an optional layer limit."""
     config = AutoConfig.from_pretrained(model_id)
+    configured_layers = int(config.num_hidden_layers)
+    if num_hidden_layers is not None:
+        if not 1 <= num_hidden_layers <= configured_layers:
+            raise ValueError(
+                f"num_hidden_layers must be within [1, {configured_layers}], "
+                f"got {num_hidden_layers}"
+            )
+        config.num_hidden_layers = num_hidden_layers
     config.use_cache = True
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
@@ -306,11 +320,14 @@ def _inline_small_constants(model: onnx.ModelProto, base_dir: Path) -> None:
 def run_export(
     model_id: str,
     output_dir: Path,
+    *,
+    num_hidden_layers: int | None = None,
 ) -> None:
-    """Load and export the full Qwen3-8B model."""
+    """Load and export Qwen3-8B with an optional smoke-test layer limit."""
     device = select_device()
-    print(f"Loading full model from {model_id} on {device}")
-    model = load_model(model_id).to(device)
+    layer_scope = "full" if num_hidden_layers is None else f"{num_hidden_layers}-layer"
+    print(f"Loading {layer_scope} model from {model_id} on {device}")
+    model = load_model(model_id, num_hidden_layers=num_hidden_layers).to(device)
     module = ChunkedQwen3(model).eval()
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -332,6 +349,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=MODEL_ID, help="Hugging Face model ID or path")
     parser.add_argument(
+        "--num-hidden-layers",
+        type=int,
+        default=None,
+        help="Limit loaded layers for smoke validation; use 2 instead of validating full 8B",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("output/qwen3_8b_fp16_chunked"),
@@ -343,7 +366,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     """Run the export experiment."""
     args = parse_args()
-    run_export(args.model, args.output_dir)
+    run_export(
+        args.model,
+        args.output_dir,
+        num_hidden_layers=args.num_hidden_layers,
+    )
     return 0
 
 
