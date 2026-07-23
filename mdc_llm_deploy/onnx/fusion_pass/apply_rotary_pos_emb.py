@@ -84,10 +84,31 @@ def _find_next_match(model: onnx.ModelProto) -> _RotaryPairMatch | None:
     for branch in branches:
         coefficient_groups.setdefault((branch.cos_name, branch.sin_name), []).append(branch)
 
+    positions = {id(node): position for position, node in enumerate(model.graph.node)}
     for candidates in coefficient_groups.values():
-        if len(candidates) != 2:
+        if len(candidates) < 2 or len(candidates) % 2:
             continue
-        pair = _validate_pair(index, candidates[0], candidates[1])
+        pair = _find_nearest_pair(model, index, candidates, positions)
+        if pair is not None:
+            return pair
+    return None
+
+
+def _find_nearest_pair(
+    model: onnx.ModelProto,
+    index: GraphIndex,
+    candidates: list[_RotaryBranch],
+    positions: dict[int, int],
+) -> _RotaryPairMatch | None:
+    """Find the closest valid Q/K pair among branches sharing RoPE coefficients."""
+    ranked_pairs: list[tuple[int, _RotaryBranch, _RotaryBranch]] = []
+    for first_index, first in enumerate(candidates):
+        for second in candidates[first_index + 1 :]:
+            distance = abs(positions[id(first.nodes[-1])] - positions[id(second.nodes[-1])])
+            ranked_pairs.append((distance, first, second))
+
+    for _, first, second in sorted(ranked_pairs, key=lambda item: item[0]):
+        pair = _validate_pair(index, first, second)
         if pair is not None and _has_replacement_position(model, index, pair):
             return pair
     return None
