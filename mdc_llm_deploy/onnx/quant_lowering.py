@@ -348,26 +348,26 @@ def _pack_fp32_scale(scale: np.ndarray) -> np.ndarray:
     return contiguous.view(np.uint32).astype(np.uint64)
 
 
-def _activation_quant_bias(plan: _LoweringPlan) -> np.ndarray | None:
+def _activation_zero_point_correction(plan: _LoweringPlan) -> np.ndarray | None:
     zero_point = plan.activation.zero_point
     if zero_point is None or not np.any(zero_point):
         return None
 
     weight_sum = plan.quantized_weight.astype(np.int64).sum(axis=0)
     if plan.per_token:
-        quant_bias = -zero_point.astype(np.int64).reshape(-1, 1) * weight_sum.reshape(1, -1)
+        correction = zero_point.astype(np.int64).reshape(-1, 1) * weight_sum.reshape(1, -1)
         broadcast_shape = [1] * (len(plan.output_info.shape) - 2)
-        quant_bias = quant_bias.reshape(*broadcast_shape, *quant_bias.shape)
+        correction = correction.reshape(*broadcast_shape, *correction.shape)
     else:
-        quant_bias = -int(zero_point.reshape(())) * weight_sum
+        correction = int(zero_point.reshape(())) * weight_sum
 
     int32 = np.iinfo(np.int32)
-    if np.any(quant_bias < int32.min) or np.any(quant_bias > int32.max):
+    if np.any(correction < int32.min) or np.any(correction > int32.max):
         raise ValueError(
             f"MatMul '{_node_label(plan.matmul)}': activation zero-point compensation "
             "does not fit INT32"
         )
-    return quant_bias.astype(np.int32)
+    return correction.astype(np.int32)
 
 
 def _emit_plan(
@@ -429,15 +429,15 @@ def _emit_plan(
 
     accumulator = matmul_accumulator
     trailing: list[NodeProto] = []
-    quant_bias = _activation_quant_bias(plan)
-    if quant_bias is not None:
-        quant_bias_name = unique_name(names, f"{prefix}_quant_bias")
-        graph.initializer.append(numpy_helper.from_array(quant_bias, quant_bias_name))
+    correction = _activation_zero_point_correction(plan)
+    if correction is not None:
+        correction_name = unique_name(names, f"{prefix}_zero_point_correction")
+        graph.initializer.append(numpy_helper.from_array(correction, correction_name))
         accumulator = unique_name(names, f"{original_output}_corrected_int32")
         trailing.append(
             helper.make_node(
-                "Add",
-                [matmul_accumulator, quant_bias_name],
+                "Sub",
+                [matmul_accumulator, correction_name],
                 [accumulator],
                 name=unique_name(names, f"{prefix}_zero_point_correction"),
             )
