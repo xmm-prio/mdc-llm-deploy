@@ -165,7 +165,7 @@ def _validate_activation(
     *,
     where: str,
 ) -> bool:
-    if pair.scale.size == 1:
+    if pair.scale.ndim == 0:
         return False
     axis = _normal_axis(pair.axis, len(info.shape), where=where)
     if axis != len(info.shape) - 2:

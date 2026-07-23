@@ -11,21 +11,22 @@ from mdc_llm_deploy.onnx import lower_qdq
 def _model(
     *,
     per_token: bool = False,
+    tokens: int = 2,
     transpose_weight: bool = False,
     activation_zero_point: int = 0,
     weight_zero_point: int = 0,
     output_dtype: int = TensorProto.FLOAT16,
 ) -> onnx.ModelProto:
     float_dtype = np.float16 if output_dtype == TensorProto.FLOAT16 else np.float32
-    activation_shape = [1, 2, 3]
-    output_shape = [1, 2, 4]
+    activation_shape = [1, tokens, 3]
+    output_shape = [1, tokens, 4]
     activation_scale = (
-        np.array([0.25, 0.5], dtype=float_dtype)
+        np.linspace(0.25, 0.5, tokens, dtype=float_dtype)
         if per_token
         else np.array(0.25, dtype=float_dtype)
     )
     activation_zp = (
-        np.full((2,), activation_zero_point, dtype=np.int8)
+        np.full((tokens,), activation_zero_point, dtype=np.int8)
         if per_token
         else np.array(activation_zero_point, dtype=np.int8)
     )
@@ -161,6 +162,23 @@ def test_lower_per_token_asymmetric_activation() -> None:
     packed = initializers[dequant.input[1]]
     expected = np.array([0.5, 0.25, 0.125, 0.0625], dtype=np.float32)
     np.testing.assert_array_equal(packed, expected.view(np.uint32).astype(np.uint64))
+
+
+def test_single_token_vector_scale_remains_per_token() -> None:
+    model = _model(per_token=True, tokens=1, activation_zero_point=7)
+
+    lower_qdq(model)
+
+    assert [node.op_type for node in model.graph.node] == [
+        "NPUAscendQuantV2",
+        "MatMul",
+        "AscendDequant",
+        "Mul",
+    ]
+    quant, _, _, mul = model.graph.node
+    assert _attribute(quant, "axis") == -2
+    initializers = {tensor.name: numpy_helper.to_array(tensor) for tensor in model.graph.initializer}
+    np.testing.assert_array_equal(initializers[mul.input[1]], np.array([[[0.25]]], dtype=np.float16))
 
 
 def test_nonzero_weight_zero_point_rolls_back() -> None:
