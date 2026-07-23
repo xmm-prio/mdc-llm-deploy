@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +21,11 @@ from examples.qwen3_8b_fp16_export import (
     write_manifest,
     write_validation_stage,
 )
-from mdc_llm_deploy.onnx.schemas import FUSED_INFER_ATTENTION_SCORE_OP
+from mdc_llm_deploy.onnx.schemas import (
+    FUSED_INFER_ATTENTION_SCORE_OP,
+    RMS_NORM_OP,
+    ROTARY_POSITION_EMBEDDING_OP,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -141,9 +146,11 @@ def test_exported_graph_has_static_abi_and_small_operator_attention(
         "present_value",
     ]
     assert tuple(_shape(value) for value in graph.graph.output) == expected_output_shapes
-    operators = {node.op_type for node in graph.graph.node}
-    assert {"MatMul", "Softmax"} <= operators
-    assert FUSED_INFER_ATTENTION_SCORE_OP not in operators
+    operators = Counter(node.op_type for node in graph.graph.node)
+    assert operators.keys() >= {"MatMul", "Softmax"}
+    assert operators[RMS_NORM_OP] == 5
+    assert operators[ROTARY_POSITION_EMBEDDING_OP] == 1
+    assert operators[FUSED_INFER_ATTENTION_SCORE_OP] == 0
     assert [
         opset.version for opset in graph.opset_import if opset.domain in ("", "ai.onnx")
     ] == [18]

@@ -42,6 +42,8 @@ KV_CAPACITY = 32000
 VOCAB_SIZE = 1024
 _STAGES = ("prefill", "decode")
 _OUTPUT_NAMES = ("logits", "present_key", "present_value")
+_EXPECTED_RMS_NORM_COUNT = 5
+_EXPECTED_ROPE_COUNT = 1
 _ATC_FUSION_SWITCH = "atc_fusion_switch.json"
 _DISABLED_GRAPH_FUSIONS = (
     "VenBatchMatMulActEltwiseFusionPassManager",
@@ -210,12 +212,21 @@ def adapt_without_fia(model: onnx.ModelProto) -> onnx.ModelProto:
     lower_opset_compatibility(model)
     downgrade_opset(model)
     normalize_graph(model)
-    fuse_rms_norm(model)
-    fuse_apply_rotary_pos_emb(model)
-    register_schemas(RMS_NORM_OP, ROTARY_POSITION_EMBEDDING_OP)
     optimized = optimizer.optimize(model)
     if optimized is not model:
         model.CopyFrom(optimized)
+    rms_norm_result = fuse_rms_norm(model)
+    rope_result = fuse_apply_rotary_pos_emb(model)
+    if rms_norm_result.fused_count != _EXPECTED_RMS_NORM_COUNT:
+        raise ValueError(
+            f"Expected {_EXPECTED_RMS_NORM_COUNT} RMSNorm fusions, "
+            f"got {rms_norm_result.fused_count}"
+        )
+    if rope_result.fused_count != _EXPECTED_ROPE_COUNT:
+        raise ValueError(
+            f"Expected {_EXPECTED_ROPE_COUNT} RoPE fusion, got {rope_result.fused_count}"
+        )
+    register_schemas(RMS_NORM_OP, ROTARY_POSITION_EMBEDDING_OP)
     onnx.checker.check_model(model, full_check=True)
     operators = {node.op_type for node in model.graph.node}
     if FUSED_INFER_ATTENTION_SCORE_OP in operators:
