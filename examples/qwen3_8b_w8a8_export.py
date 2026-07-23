@@ -117,17 +117,19 @@ def main(model_id: str, output_dir: Path, vocab_size: int) -> None:
     if vocab_size <= 0:
         raise ValueError("vocab_size must be positive")
     output_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"Loading one layer from {model_id}")
-    model = load_one_layer(model_id, vocab_size).cuda()
-    inputs = send_to_device(random_inputs(model), device="cuda")
+    print(f"Loading one layer from {model_id} on {device}")
+    model = load_one_layer(model_id, vocab_size).to(device)
+    inputs = send_to_device(random_inputs(model), device=device)
 
     print("Calibrating and converting symmetric per-tensor W8A8")
     quantize_w8a8(model, inputs)
 
     model = model.cpu()
     inputs = send_to_device(inputs, device="cpu")
-    torch.cuda.empty_cache()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     print("Exporting static prefill and decode graphs")
     programs = export_graphs(model, inputs)
