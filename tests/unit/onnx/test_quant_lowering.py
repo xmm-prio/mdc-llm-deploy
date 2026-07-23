@@ -148,19 +148,19 @@ def test_lower_per_token_asymmetric_activation() -> None:
     assert [node.op_type for node in model.graph.node] == [
         "NPUAscendQuantV2",
         "MatMul",
-        "Sub",
         "AscendDequant",
+        "Sub",
         "Mul",
     ]
-    quant, matmul, subtract, dequant, mul = model.graph.node
+    quant, matmul, dequant, subtract, mul = model.graph.node
     assert _attribute(quant, "axis") == -2
-    assert subtract.input[0] == matmul.output[0]
-    assert dequant.input[0] == subtract.output[0]
+    assert dequant.input[0] == matmul.output[0]
+    assert subtract.input[0] == dequant.output[0]
     initializers = {tensor.name: numpy_helper.to_array(tensor) for tensor in model.graph.initializer}
     np.testing.assert_array_equal(initializers[quant.input[2]], np.array([7, 7], dtype=np.float16))
     np.testing.assert_array_equal(
         initializers[subtract.input[1]],
-        np.array([[[7, -7, 14, 112], [7, -7, 14, 112]]], dtype=np.int32),
+        np.array([[[3.5, -1.75, 1.75, 7.0], [3.5, -1.75, 1.75, 7.0]]], dtype=np.float16),
     )
     np.testing.assert_array_equal(
         initializers[mul.input[1]],
@@ -179,16 +179,16 @@ def test_single_token_vector_scale_remains_per_token() -> None:
     assert [node.op_type for node in model.graph.node] == [
         "NPUAscendQuantV2",
         "MatMul",
-        "Sub",
         "AscendDequant",
+        "Sub",
         "Mul",
     ]
-    quant, _, subtract, _, mul = model.graph.node
+    quant, _, _, subtract, mul = model.graph.node
     assert _attribute(quant, "axis") == -2
     initializers = {tensor.name: numpy_helper.to_array(tensor) for tensor in model.graph.initializer}
     np.testing.assert_array_equal(
         initializers[subtract.input[1]],
-        np.array([[[7, -7, 14, 112]]], dtype=np.int32),
+        np.array([[[3.5, -1.75, 1.75, 7.0]]], dtype=np.float16),
     )
     np.testing.assert_array_equal(initializers[mul.input[1]], np.array([[[0.25]]], dtype=np.float16))
 
@@ -201,16 +201,16 @@ def test_per_tensor_asymmetric_activation_uses_static_correction() -> None:
     assert [node.op_type for node in model.graph.node] == [
         "NPUAscendQuantV2",
         "MatMul",
-        "Sub",
         "AscendDequant",
+        "Sub",
     ]
-    _, matmul, subtract, dequant = model.graph.node
-    assert subtract.input[0] == matmul.output[0]
-    assert dequant.input[0] == subtract.output[0]
+    _, matmul, dequant, subtract = model.graph.node
+    assert dequant.input[0] == matmul.output[0]
+    assert subtract.input[0] == dequant.output[0]
     initializers = {tensor.name: numpy_helper.to_array(tensor) for tensor in model.graph.initializer}
     np.testing.assert_array_equal(
         initializers[subtract.input[1]],
-        np.array([7, -7, 14, 112], dtype=np.int32),
+        np.array([0.875, -0.4375, 0.4375, 1.75], dtype=np.float16),
     )
 
 

@@ -348,7 +348,10 @@ def _pack_fp32_scale(scale: np.ndarray) -> np.ndarray:
     return contiguous.view(np.uint32).astype(np.uint64)
 
 
-def _activation_zero_point_correction(plan: _LoweringPlan) -> np.ndarray | None:
+def _activation_zero_point_correction(
+    plan: _LoweringPlan,
+    dequant_scale: np.ndarray,
+) -> np.ndarray | None:
     zero_point = plan.activation.zero_point
     if zero_point is None or not np.any(zero_point):
         return None
@@ -361,13 +364,15 @@ def _activation_zero_point_correction(plan: _LoweringPlan) -> np.ndarray | None:
     else:
         correction = int(zero_point.reshape(())) * weight_sum
 
-    int32 = np.iinfo(np.int32)
-    if np.any(correction < int32.min) or np.any(correction > int32.max):
+    correction = correction.astype(np.float64) * dequant_scale.astype(np.float64)
+    float_dtype = _numpy_dtype(plan.output_info.elem_type)
+    correction = correction.astype(float_dtype)
+    if not np.all(np.isfinite(correction)):
         raise ValueError(
             f"MatMul '{_node_label(plan.matmul)}': activation zero-point compensation "
-            "does not fit INT32"
+            "is not finite in the output dtype"
         )
-    return correction.astype(np.int32)
+    return correction
 
 
 def _emit_plan(
@@ -427,22 +432,7 @@ def _emit_plan(
     matmul.input[1] = weight_name
     matmul.output[0] = matmul_accumulator
 
-    accumulator = matmul_accumulator
     trailing: list[NodeProto] = []
-    correction = _activation_zero_point_correction(plan)
-    if correction is not None:
-        correction_name = unique_name(names, f"{prefix}_zero_point_correction")
-        graph.initializer.append(numpy_helper.from_array(correction, correction_name))
-        accumulator = unique_name(names, f"{original_output}_corrected_int32")
-        trailing.append(
-            helper.make_node(
-                "Sub",
-                [matmul_accumulator, correction_name],
-                [accumulator],
-                name=unique_name(names, f"{prefix}_zero_point_correction"),
-            )
-        )
-
     output_dtype_attribute = 1 if plan.output_info.elem_type == TensorProto.FLOAT16 else 0
     if plan.per_token:
         dequant_scale = plan.weight_scale
@@ -456,17 +446,38 @@ def _emit_plan(
         numpy_helper.from_array(_pack_fp32_scale(dequant_scale), dequant_scale_name)
     )
 
+    correction = _activation_zero_point_correction(plan, dequant_scale)
     dequant_output = (
-        unique_name(names, f"{original_output}_dequant") if plan.per_token else original_output
+        unique_name(names, f"{original_output}_dequant")
+        if plan.per_token or correction is not None
+        else original_output
     )
     dequant_node = helper.make_node(
         ASCEND_DEQUANT_OP,
-        [accumulator, dequant_scale_name],
+        [matmul_accumulator, dequant_scale_name],
         [dequant_output],
         name=unique_name(names, f"{prefix}_{ASCEND_DEQUANT_OP}"),
         dtype=output_dtype_attribute,
     )
     trailing.append(dequant_node)
+
+    scaled_output = dequant_output
+    if correction is not None:
+        correction_name = unique_name(names, f"{prefix}_zero_point_correction")
+        graph.initializer.append(numpy_helper.from_array(correction, correction_name))
+        scaled_output = (
+            unique_name(names, f"{original_output}_corrected")
+            if plan.per_token
+            else original_output
+        )
+        trailing.append(
+            helper.make_node(
+                "Sub",
+                [dequant_output, correction_name],
+                [scaled_output],
+                name=unique_name(names, f"{prefix}_zero_point_correction"),
+            )
+        )
 
     if plan.per_token:
         rank = len(plan.output_info.shape)
@@ -480,25 +491,19 @@ def _emit_plan(
         trailing.append(
             helper.make_node(
                 "Mul",
-                [dequant_output, token_scale_name],
+                [scaled_output, token_scale_name],
                 [original_output],
                 name=unique_name(names, f"{prefix}_token_scale_mul"),
             )
         )
 
-    value_names = (
-        (matmul_accumulator,)
-        if accumulator == matmul_accumulator
-        else (matmul_accumulator, accumulator)
-    )
-    for value_name in value_names:
-        graph.value_info.append(
-            helper.make_tensor_value_info(
-                value_name,
-                TensorProto.INT32,
-                list(plan.output_info.shape),
-            )
+    graph.value_info.append(
+        helper.make_tensor_value_info(
+            matmul_accumulator,
+            TensorProto.INT32,
+            list(plan.output_info.shape),
         )
+    )
     return [quant_node], trailing, stale_values
 
 
