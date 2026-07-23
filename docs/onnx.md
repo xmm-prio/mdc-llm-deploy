@@ -105,9 +105,33 @@ ONNX registry 不受该锁约束，仍可在预检和写入期间产生竞态。
 
 ## 已知验证边界
 
-非对称激活的 offset 修正依赖 ATC 的 MatmulQuantToFixpipeFusion。当前自动验收覆盖
-图结构、参数转换和 MC62CM12AA ATC 编译；ATC 编译不能证明非对称路径的最终数值精度，
-该项需要后续真机精度验证。
+### W8A8 非对称激活
+
+2026-07-23 在 MC62CM12AA、CANN 9.1.0 上验证提交 `1c8ea6b`。验证对象为 FP16
+输入输出的 QuantLinear：激活 INT8 per-token 非对称量化，权重 INT8
+per-output-channel 对称量化。lowering 前标准 QDQ ONNX 作为 ONNX Runtime golden，
+lowering 后模型经 ATC 编译并在 MDC 单板执行。
+
+三组静态 shape 均可通过 ATC 编译和 ACL 推理，但部署精度不通过：
+
+- decode normal，输入 `[1, 1, 32]`、输出 `[1, 1, 64]`：cosine `0.905809`，
+  max absolute error `1.023926`；
+- prefill biased，输入 `[1, 16, 32]`、输出 `[1, 16, 64]`：cosine `0.689495`，
+  max absolute error `4.935547`；
+- prefill odd/outlier，输入 `[2, 17, 64]`、输出 `[2, 17, 96]`：cosine
+  `0.246523`，max absolute error `21.444336`。
+
+三组真机输出均为有限、非全零 FP16。将同一输入按未扣除 activation zero-point 的
+`q_a @ q_w * scale_a * scale_w` 公式计算，所得结果与真机输出的 cosine 分别为
+`0.999997`、`1.000000`、`1.000000`。这表明当前
+`MatmulQuantToFixpipeFusion` 未完成非对称 activation offset 补偿。现阶段不得把
+per-token 非对称激活 QuantLinear 标记为 MDC 数值可用；ATC 编译成功只证明图和 ABI
+可接受。
+
+硬件用例由 `tests.hardware.onnx.quant_linear_cases` 生成。bundle 同时包含 lowering
+前 `raw.onnx` 和 lowering 后 `adapted.onnx`，不持久化输入或真机输出。mailbox 当前
+通用精度脚本按 FP32 读取单板输出，不适用于本节 FP16 输出；本次按 ONNX 输出 dtype
+读取后计算 cosine、max absolute error 和 mean absolute error。
 
 Qwen3 FIA 硬件 bundle 同时包含：
 
