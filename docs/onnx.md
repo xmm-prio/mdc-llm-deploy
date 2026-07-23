@@ -15,7 +15,8 @@ assert processed is model
 `process_onnx` 按固定顺序执行：
 
 1. 将受支持的 static W8A8 MatMul QDQ 子图 lowering 为
-   `NPUAscendQuantV2 + INT8 MatMul + AscendDequant`；
+   `NPUAscendQuantV2 + INT8 MatMul + AscendDequant`，非对称激活追加显式
+   zero-point 补偿，per-token 激活再恢复逐 token scale；
 2. 执行 MDC parser compatibility lowering：把静态 `Split.num_outputs` 精确转换为
    opset 18 的 `split` 常量输入；
 3. 验证剩余标准算子可由 opset 18 表达，并把默认 domain opset 降至 18；
@@ -105,9 +106,43 @@ ONNX registry 不受该锁约束，仍可在预检和写入期间产生竞态。
 
 ## 已知验证边界
 
-非对称激活的 offset 修正依赖 ATC 的 MatmulQuantToFixpipeFusion。当前自动验收覆盖
-图结构、参数转换和 MC62CM12AA ATC 编译；ATC 编译不能证明非对称路径的最终数值精度，
-该项需要后续真机精度验证。
+### W8A8 非对称激活
+
+2026-07-23 在 MC62CM12AA、CANN 9.1.0 上验证。验证对象为 FP16
+输入输出的 QuantLinear：激活 INT8 per-token 非对称量化，权重 INT8
+per-output-channel 对称量化。lowering 前标准 QDQ ONNX 作为 ONNX Runtime golden，
+lowering 后模型经 ATC 编译并在 MDC 单板执行。
+
+提交 `1c8ea6b` 仅依赖 `MatmulQuantToFixpipeFusion` 处理 activation offset。三组真机
+输出与未扣除 zero-point 的 `q_a @ q_w * scale_a * scale_w` 结果 cosine 分别为
+`0.999997`、`1.000000`、`1.000000`，证明 MC62 上该融合没有完成 offset 补偿。
+
+提交 `991a988` 增加显式补偿。先保持
+`NPUAscendQuantV2 + INT8 MatMul + AscendDequant` 相邻，使 ATC 继续使用量化 MatMul；
+再于浮点输出上减去：
+
+```text
+zero_point[..., None] * sum(weight_q, axis=K) * dequant_scale
+```
+
+per-token 场景最后再乘 activation scale。三组静态 shape 均通过 ATC、ACL 和
+`cosine >= 0.999`：
+
+- decode normal，输入 `[1, 1, 32]`、输出 `[1, 1, 64]`：cosine `0.999821`，
+  max absolute error `0.054688`；
+- prefill biased，输入 `[1, 16, 32]`、输出 `[1, 16, 64]`：cosine `0.999911`，
+  max absolute error `0.078125`；
+- prefill odd/outlier，输入 `[2, 17, 64]`、输出 `[2, 17, 96]`：cosine
+  `0.999742`，max absolute error `0.199219`。
+
+三组真机输出均为有限、非全零 FP16。补偿不能放在 INT8 MatMul 与 AscendDequant
+之间，否则会破坏 MC62 的量化 MatMul 融合；使用 INT32 `Add` 还会触发不支持 INT8
+输入的 `VenFusedBatchMatMulV3`。
+
+硬件用例由 `tests.hardware.onnx.quant_linear_cases` 生成。bundle 同时包含 lowering
+前 `raw.onnx` 和 lowering 后 `adapted.onnx`，不持久化输入或真机输出。mailbox 当前
+通用精度脚本按 FP32 读取单板输出，不适用于本节 FP16 输出；本次按 ONNX 输出 dtype
+读取后计算 cosine、max absolute error 和 mean absolute error。
 
 Qwen3 FIA 硬件 bundle 同时包含：
 
