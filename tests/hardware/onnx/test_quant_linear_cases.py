@@ -138,10 +138,11 @@ def test_adapted_models_have_mdc_per_token_pipeline(
     assert [node.op_type for node in model.graph.node] == [
         "NPUAscendQuantV2",
         "MatMul",
+        "Add",
         "AscendDequant",
         "Mul",
     ]
-    quant, matmul, dequant, multiply = model.graph.node
+    quant, matmul, add, dequant, multiply = model.graph.node
     initializers = _initializers(model)
 
     assert _attribute(quant, "axis") == -2
@@ -151,6 +152,14 @@ def test_adapted_models_have_mdc_per_token_pipeline(
     assert initializers[quant.input[2]].dtype == np.float16
     assert initializers[matmul.input[1]].dtype == np.int8
     assert initializers[matmul.input[1]].shape == (case.in_features, case.out_features)
+    expected_quant_bias = (
+        -initializers[quant.input[2]].astype(np.int64).reshape(case.tokens, 1)
+        * initializers[matmul.input[1]].astype(np.int64).sum(axis=0).reshape(1, case.out_features)
+    ).astype(np.int32)
+    expected_quant_bias = expected_quant_bias.reshape(1, case.tokens, case.out_features)
+    np.testing.assert_array_equal(initializers[add.input[1]], expected_quant_bias)
+    assert add.input[0] == matmul.output[0]
+    assert dequant.input[0] == add.output[0]
     assert _attribute(dequant, "dtype") == 1
     assert initializers[dequant.input[1]].shape == (case.out_features,)
     assert initializers[multiply.input[1]].shape == (1, case.tokens, 1)

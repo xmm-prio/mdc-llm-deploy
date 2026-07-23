@@ -348,6 +348,28 @@ def _pack_fp32_scale(scale: np.ndarray) -> np.ndarray:
     return contiguous.view(np.uint32).astype(np.uint64)
 
 
+def _activation_quant_bias(plan: _LoweringPlan) -> np.ndarray | None:
+    zero_point = plan.activation.zero_point
+    if zero_point is None or not np.any(zero_point):
+        return None
+
+    weight_sum = plan.quantized_weight.astype(np.int64).sum(axis=0)
+    if plan.per_token:
+        quant_bias = -zero_point.astype(np.int64).reshape(-1, 1) * weight_sum.reshape(1, -1)
+        broadcast_shape = [1] * (len(plan.output_info.shape) - 2)
+        quant_bias = quant_bias.reshape(*broadcast_shape, *quant_bias.shape)
+    else:
+        quant_bias = -int(zero_point.reshape(())) * weight_sum
+
+    int32 = np.iinfo(np.int32)
+    if np.any(quant_bias < int32.min) or np.any(quant_bias > int32.max):
+        raise ValueError(
+            f"MatMul '{_node_label(plan.matmul)}': activation zero-point compensation "
+            "does not fit INT32"
+        )
+    return quant_bias.astype(np.int32)
+
+
 def _emit_plan(
     model: onnx.ModelProto,
     plan: _LoweringPlan,
@@ -400,10 +422,26 @@ def _emit_plan(
     weight_name = unique_name(names, f"{prefix}_weight_int8")
     graph.initializer.append(numpy_helper.from_array(plan.quantized_weight, weight_name))
     original_output = matmul.output[0]
-    accumulator = unique_name(names, f"{original_output}_int32")
+    matmul_accumulator = unique_name(names, f"{original_output}_int32")
     matmul.input[0] = quant_output
     matmul.input[1] = weight_name
-    matmul.output[0] = accumulator
+    matmul.output[0] = matmul_accumulator
+
+    accumulator = matmul_accumulator
+    trailing: list[NodeProto] = []
+    quant_bias = _activation_quant_bias(plan)
+    if quant_bias is not None:
+        quant_bias_name = unique_name(names, f"{prefix}_quant_bias")
+        graph.initializer.append(numpy_helper.from_array(quant_bias, quant_bias_name))
+        accumulator = unique_name(names, f"{original_output}_corrected_int32")
+        trailing.append(
+            helper.make_node(
+                "Add",
+                [matmul_accumulator, quant_bias_name],
+                [accumulator],
+                name=unique_name(names, f"{prefix}_zero_point_correction"),
+            )
+        )
 
     output_dtype_attribute = 1 if plan.output_info.elem_type == TensorProto.FLOAT16 else 0
     if plan.per_token:
@@ -428,7 +466,7 @@ def _emit_plan(
         name=unique_name(names, f"{prefix}_{ASCEND_DEQUANT_OP}"),
         dtype=output_dtype_attribute,
     )
-    trailing: list[NodeProto] = [dequant_node]
+    trailing.append(dequant_node)
 
     if plan.per_token:
         rank = len(plan.output_info.shape)
@@ -448,13 +486,19 @@ def _emit_plan(
             )
         )
 
-    graph.value_info.append(
-        helper.make_tensor_value_info(
-            accumulator,
-            TensorProto.INT32,
-            list(plan.output_info.shape),
-        )
+    value_names = (
+        (matmul_accumulator,)
+        if accumulator == matmul_accumulator
+        else (matmul_accumulator, accumulator)
     )
+    for value_name in value_names:
+        graph.value_info.append(
+            helper.make_tensor_value_info(
+                value_name,
+                TensorProto.INT32,
+                list(plan.output_info.shape),
+            )
+        )
     return [quant_node], trailing, stale_values
 
 

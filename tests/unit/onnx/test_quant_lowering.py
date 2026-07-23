@@ -148,13 +148,20 @@ def test_lower_per_token_asymmetric_activation() -> None:
     assert [node.op_type for node in model.graph.node] == [
         "NPUAscendQuantV2",
         "MatMul",
+        "Add",
         "AscendDequant",
         "Mul",
     ]
-    quant, _, dequant, mul = model.graph.node
+    quant, matmul, add, dequant, mul = model.graph.node
     assert _attribute(quant, "axis") == -2
+    assert add.input[0] == matmul.output[0]
+    assert dequant.input[0] == add.output[0]
     initializers = {tensor.name: numpy_helper.to_array(tensor) for tensor in model.graph.initializer}
     np.testing.assert_array_equal(initializers[quant.input[2]], np.array([7, 7], dtype=np.float16))
+    np.testing.assert_array_equal(
+        initializers[add.input[1]],
+        np.array([[[-7, 7, -14, -112], [-7, 7, -14, -112]]], dtype=np.int32),
+    )
     np.testing.assert_array_equal(
         initializers[mul.input[1]],
         np.array([[[0.25], [0.5]]], dtype=np.float16),
@@ -172,13 +179,39 @@ def test_single_token_vector_scale_remains_per_token() -> None:
     assert [node.op_type for node in model.graph.node] == [
         "NPUAscendQuantV2",
         "MatMul",
+        "Add",
         "AscendDequant",
         "Mul",
     ]
-    quant, _, _, mul = model.graph.node
+    quant, _, add, _, mul = model.graph.node
     assert _attribute(quant, "axis") == -2
     initializers = {tensor.name: numpy_helper.to_array(tensor) for tensor in model.graph.initializer}
+    np.testing.assert_array_equal(
+        initializers[add.input[1]],
+        np.array([[[-7, 7, -14, -112]]], dtype=np.int32),
+    )
     np.testing.assert_array_equal(initializers[mul.input[1]], np.array([[[0.25]]], dtype=np.float16))
+
+
+def test_per_tensor_asymmetric_activation_uses_static_quant_bias() -> None:
+    model = _model(activation_zero_point=7)
+
+    lower_qdq(model)
+
+    assert [node.op_type for node in model.graph.node] == [
+        "NPUAscendQuantV2",
+        "MatMul",
+        "Add",
+        "AscendDequant",
+    ]
+    _, matmul, add, dequant = model.graph.node
+    assert add.input[0] == matmul.output[0]
+    assert dequant.input[0] == add.output[0]
+    initializers = {tensor.name: numpy_helper.to_array(tensor) for tensor in model.graph.initializer}
+    np.testing.assert_array_equal(
+        initializers[add.input[1]],
+        np.array([-7, 7, -14, -112], dtype=np.int32),
+    )
 
 
 def test_nonzero_weight_zero_point_rolls_back() -> None:
