@@ -12,7 +12,7 @@ NPURmsNorm(x, gamma, epsilon: FLOAT = 1e-6) -> (y, rstd)
 ```
 
 节点固定包含 2 个输入、2 个输出，属性名为 `epsilon`。schema 由
-`mdc_llm_deploy.onnx.schemas` 集中声明，`process_onnx` 按模型实际节点注册。
+`mdc_llm_deploy.onnx.schemas` 集中声明，`OnnxAdapter` 按模型实际节点注册。
 
 ## 融合范围
 
@@ -26,10 +26,10 @@ RMSNorm pass 识别 Qwen3 的 FP32 累加分解：
 ```python
 import onnx
 
-from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 
 model = onnx.load("model.onnx")
-process_onnx(model)
+OnnxAdapter(AdapterConfig())(model)
 ```
 
 流程完成融合、按需 schema 注册和最终 ONNX checker 校验。新进程单独校验已生成模型

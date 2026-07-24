@@ -11,7 +11,7 @@ import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
 
-from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 
 from . import qwen3_fia_cases
 
@@ -97,7 +97,7 @@ def generate_qdq_cases(output_root: Path) -> tuple[Path, ...]:
         temporary.mkdir(parents=True)
         try:
             model = _qdq_model(zero_point)
-            process_onnx(model)
+            OnnxAdapter(AdapterConfig())(model)
             onnx.checker.check_model(model)
             model_path = temporary / "adapted.onnx"
             onnx.save(model, model_path)

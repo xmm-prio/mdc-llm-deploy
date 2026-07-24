@@ -27,7 +27,7 @@ q_start_idx, kv_start_idx
 
 输出固定为 `attention_out`、`softmax_lse`。`num_heads` 为必填属性；其余属性和
 默认值与冻结源码一致。schema 由 `mdc_llm_deploy.onnx.schemas` 集中声明，
-`process_onnx` 按模型实际节点注册。
+`OnnxAdapter` 按模型实际节点注册。
 
 ## 融合范围
 
@@ -45,10 +45,10 @@ FIA pass 识别 Transformers Qwen3 静态 attention 子图：
 ```python
 import onnx
 
-from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 
 model = onnx.load("model.onnx")
-process_onnx(model)
+OnnxAdapter(AdapterConfig())(model)
 ```
 
 流程完成融合、按需 schema 注册和最终 ONNX checker 校验。新进程单独校验已生成模型

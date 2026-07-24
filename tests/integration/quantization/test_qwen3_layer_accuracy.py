@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
+from dataclasses import replace
 
 import onnx
 import pytest
@@ -9,10 +10,10 @@ import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
 from transformers.exporters import OnnxConfig, OnnxExporter
 
-from examples.qwen3_8b_layer_accuracy.artifacts import LAYER_FUSION_PASSES
+from examples.qwen3_8b_layer_accuracy.artifacts import LAYER_ADAPTER_CONFIG
 from examples.qwen3_8b_layer_accuracy.metrics import SaturationCollector, compare_tensors
 from examples.qwen3_8b_layer_accuracy.modeling import Qwen3DecoderLayerHarness
-from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx import OnnxAdapter
 from mdc_llm_deploy.onnx.schemas import (
     FUSED_INFER_ATTENTION_SCORE_OP,
     RMS_NORM_OP,
@@ -102,7 +103,7 @@ def test_layer_w8a8_torch_and_mdc_export(activation_granularity: str) -> None:
     assert raw_counts["QuantizeLinear"] > 0
     assert raw_counts["QuantizeLinear"] == raw_counts["DequantizeLinear"]
 
-    process_onnx(graph, show_progress=False, fusion_passes=LAYER_FUSION_PASSES)
+    OnnxAdapter(replace(LAYER_ADAPTER_CONFIG, show_progress=False))(graph)
     lowered_counts = Counter(node.op_type for node in graph.graph.node)
     assert lowered_counts["QuantizeLinear"] == 0
     assert lowered_counts["DequantizeLinear"] == 0

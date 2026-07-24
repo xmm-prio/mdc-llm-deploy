@@ -16,11 +16,7 @@ from torch import Tensor, nn
 from torch.onnx import ONNXProgram
 from transformers.exporters import OnnxConfig, OnnxExporter
 
-from mdc_llm_deploy.onnx import process_onnx
-from mdc_llm_deploy.onnx.fusion_pass import (
-    APPLY_ROTARY_POS_EMB_FUSION_PASS,
-    RMS_NORM_FUSION_PASS,
-)
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 from mdc_llm_deploy.quantization import MinMaxConfig, MinMaxLinear, quantize
 
 from .metrics import AccuracyMetrics, SaturationCollector, compare_tensors
@@ -44,9 +40,8 @@ VALIDATION_MODES: tuple[ValidationMode, ...] = (
 )
 INPUT_NAMES = ("inputs_embeds", "attention_mask", "position_ids")
 OUTPUT_NAME = "logits"
-LAYER_FUSION_PASSES = (
-    RMS_NORM_FUSION_PASS,
-    APPLY_ROTARY_POS_EMB_FUSION_PASS,
+LAYER_ADAPTER_CONFIG = AdapterConfig(
+    fuse_fused_infer_attention_score=False,
 )
 
 
@@ -151,7 +146,7 @@ def _export_raw(
 
 def _save_processed(raw_path: Path, processed_path: Path) -> None:
     graph = onnx.load(raw_path, load_external_data=True)
-    process_onnx(graph, fusion_passes=LAYER_FUSION_PASSES)
+    OnnxAdapter(LAYER_ADAPTER_CONFIG)(graph)
     processed_path.unlink(missing_ok=True)
     data_path = processed_path.with_suffix(".onnx.data")
     data_path.unlink(missing_ok=True)
@@ -328,7 +323,7 @@ def generate_artifacts(
 
 __all__ = [
     "INPUT_NAMES",
-    "LAYER_FUSION_PASSES",
+    "LAYER_ADAPTER_CONFIG",
     "OUTPUT_NAME",
     "VALIDATION_MODES",
     "GenerationConfig",

@@ -5,7 +5,7 @@ import pytest
 import torch
 from onnx import TensorProto, helper, numpy_helper
 
-from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 
 from .minmax_export_fixtures import (
     LOWERING_SUPPORTED_CASES,
@@ -152,7 +152,7 @@ def test_raw_qdq_matrix_exports_standard_opset21(case: MinMaxExportCase) -> None
 def test_supported_qdq_subset_lowers_without_residual_qdq(case: MinMaxExportCase) -> None:
     model = export_quantized_linear(case)
 
-    returned = process_onnx(model)
+    returned = OnnxAdapter(AdapterConfig())(model)
 
     assert returned is model
     assert next(opset.version for opset in model.opset_import if opset.domain == "") == 18
@@ -167,12 +167,12 @@ def test_supported_qdq_subset_lowers_without_residual_qdq(case: MinMaxExportCase
 
 @pytest.mark.integration
 @pytest.mark.parametrize("case", LOWERING_UNSUPPORTED_CASES, ids=lambda case: case.id)
-def test_unsupported_qdq_matrix_fails_process_onnx_explicitly(case: MinMaxExportCase) -> None:
+def test_unsupported_qdq_matrix_fails_adapter_explicitly(case: MinMaxExportCase) -> None:
     model = export_quantized_linear(case)
     original = model.SerializeToString()
 
     with pytest.raises(ValueError, match=_expected_lowering_error(case)):
-        process_onnx(model)
+        OnnxAdapter(AdapterConfig())(model)
 
     assert model.SerializeToString() == original
 

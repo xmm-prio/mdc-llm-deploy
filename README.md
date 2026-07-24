@@ -27,15 +27,16 @@ quantize(model, config, calibration_batches)
 
 ## MDC ONNX 图处理
 
-`process_onnx` 是 MDC ONNX 图处理的公开总入口：
+`OnnxAdapter` 是 MDC ONNX 图处理的公开总入口：
 
 ```python
 import onnx
 
-from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 
 model = onnx.load("model.onnx")
-processed = process_onnx(model)
+adapter = OnnxAdapter(AdapterConfig())
+processed = adapter(model)
 assert processed is model
 ```
 
@@ -53,11 +54,11 @@ print(report.counts)
 ```
 
 独立编排器固定按 RMSNorm、RoPE、FIA 顺序原地执行。后续 pass 失败时，前序成功结果
-保留；需要全流程失败回滚时应使用 `process_onnx`。
+保留；需要全流程失败回滚时应使用 `OnnxAdapter`。
 
 ## ONNX 算子
 
-标准 ONNX 导出图经 `process_onnx` 完成 lowering、融合、schema 注册和校验。
+标准 ONNX 导出图经 `OnnxAdapter` 完成 lowering、融合、schema 注册和校验。
 当前算子 ABI 与融合限制由对应文档维护：
 
 - [ApplyRotaryPosEmb](docs/operators/ApplyRotaryPosEmb.md)

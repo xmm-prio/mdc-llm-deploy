@@ -12,7 +12,7 @@ from torch.onnx import ONNXProgram
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
 from transformers.exporters import OnnxConfig, OnnxExporter
 
-from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 from mdc_llm_deploy.quantization import MinMaxConfig, quantize
 
 MODEL_ID = "Qwen/Qwen3-8B"
@@ -140,7 +140,7 @@ def main(model_id: str, output_dir: Path, vocab_size: int) -> None:
             raise TypeError(f"Expected ONNXProgram, got {type(program).__name__}")
         graph = program.model_proto
         print(f"Processing and saving {component}")
-        process_onnx(graph)
+        OnnxAdapter(AdapterConfig())(graph)
         save_external(graph, output_dir, component)
 
 

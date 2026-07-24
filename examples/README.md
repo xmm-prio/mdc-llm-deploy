@@ -58,7 +58,7 @@ output/qwen3_8b_layer_accuracy/
    token 对应的 embedding 和 lm head 预训练权重；
 2. 用一批固定随机 token 数据执行 W8A8、权重/激活 per-tensor 对称静态量化；
 3. 使用 Transformers `OnnxExporter` 导出静态 prefill 和 decode 图；
-4. 使用 `mdc_llm_deploy.onnx.process_onnx` 完成 MDC lowering 与图融合；
+4. 使用 `mdc_llm_deploy.onnx.OnnxAdapter` 完成 MDC lowering 与图融合；
 5. 将每张 ONNX 图及其权重分开保存。
 
 从仓库根目录运行：
