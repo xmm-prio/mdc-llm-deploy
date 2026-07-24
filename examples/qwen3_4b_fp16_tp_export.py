@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import gc
 from contextlib import chdir
-from dataclasses import dataclass
 from pathlib import Path
 
 import onnx
@@ -28,7 +27,7 @@ from mdc_llm_deploy.onnx.schema import register_schema_objects
 
 MODEL_ID = "Qwen/Qwen3-4B"
 TP_SIZE = 2
-PREFILL_LENGTH = 2048
+MAX_CHUNK_SIZE = 2048
 KV_CAPACITY = 32000
 VOCAB_SIZE = 1024
 INLINE_CONSTANT_LIMIT = 1024
@@ -37,31 +36,16 @@ HCOM_GROUP = "hccl_sub_group"
 MDC_ONNX_OPSET = 18
 
 
-@dataclass(frozen=True, slots=True)
-class StageSpec:
-    """Describe one static chunked-attention graph."""
-
-    name: str
-    query_length: int
-    valid_kv_length: int
-    kv_capacity: int
-
-    @property
-    def attention_length(self) -> int:
-        """Return physical KV-cache length."""
-        return self.kv_capacity
-
-
 class ScatterCache(DynamicCache):
     """Write current K/V tensors into fixed-capacity layer buffers."""
 
     def __init__(
         self,
         cache_data: list[tuple[torch.Tensor, torch.Tensor]],
-        index: torch.Tensor,
+        actual_seq_len: torch.Tensor,
     ) -> None:
         super().__init__(cache_data)
-        self.index = index
+        self.actual_seq_len = actual_seq_len
 
     def update(
         self,
@@ -73,7 +57,7 @@ class ScatterCache(DynamicCache):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Scatter current K/V states and return full buffers."""
         del args, kwargs
-        positions = self.index + torch.arange(
+        positions = self.actual_seq_len + torch.arange(
             key_states.shape[-2],
             device=key_states.device,
         )
@@ -95,40 +79,28 @@ class ChunkedQwen3(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        actual_seq_len: torch.Tensor,
         past_key: torch.Tensor,
         past_value: torch.Tensor,
-        attention_mask: torch.Tensor,
-        index: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Run one chunk using rank-local attention heads and fixed caches."""
         query_length = input_ids.shape[1]
-        position_ids = index.unsqueeze(1) + torch.arange(
-            query_length,
-            device=index.device,
+        position_ids = (
+            actual_seq_len
+            + torch.arange(
+                query_length,
+                device=actual_seq_len.device,
+            )
         ).unsqueeze(0)
         cache = ScatterCache(
             [
                 (past_key[layer_index], past_value[layer_index])
                 for layer_index in range(self.num_hidden_layers)
             ],
-            index,
+            actual_seq_len,
         )
-        key_positions = torch.arange(
-            past_key.shape[-2],
-            device=input_ids.device,
-        ).view(1, 1, 1, -1)
-        query_positions = position_ids.view(1, 1, query_length, 1)
-        visible = (key_positions <= query_positions) & attention_mask[:, None, None, :].bool()
-        attention_bias = torch.where(
-            visible,
-            torch.zeros((), dtype=self.model.dtype, device=input_ids.device),
-            torch.full(
-                (),
-                torch.finfo(self.model.dtype).min,
-                dtype=self.model.dtype,
-                device=input_ids.device,
-            ),
-        )
+        attention_bias = attention_mask[:, :, :query_length, :]
         outputs = self.model(
             input_ids=input_ids,
             attention_mask={"full_attention": attention_bias},
@@ -245,26 +217,25 @@ def load_rank_model(
     return model.eval()
 
 
-def make_stage_inputs(
+def make_export_inputs(
     model: PreTrainedModel,
-    spec: StageSpec,
+    chunk_size: int,
+    kv_capacity: int,
     device: torch.device,
     *,
     seed: int,
 ) -> dict[str, torch.Tensor]:
-    """Create deterministic tensors for one rank-local static graph."""
-    if spec.query_length <= 0 or spec.kv_capacity <= 0:
-        raise ValueError("query_length and kv_capacity must be positive")
-    if not 0 <= spec.valid_kv_length < spec.kv_capacity:
-        raise ValueError("valid_kv_length must be within the KV buffer")
-    if spec.valid_kv_length + spec.query_length > spec.kv_capacity:
-        raise ValueError("query chunk exceeds KV buffer capacity")
+    """Create deterministic tensors matching the chunk graph ABI."""
+    if not 1 <= chunk_size <= MAX_CHUNK_SIZE:
+        raise ValueError(f"chunk_size must be within [1, {MAX_CHUNK_SIZE}]")
+    if kv_capacity < chunk_size:
+        raise ValueError("kv_capacity must be at least chunk_size")
 
     config = model.config
     generator = torch.Generator().manual_seed(seed)
     input_ids = torch.randint(
         config.vocab_size,
-        (1, spec.query_length),
+        (1, chunk_size),
         generator=generator,
         dtype=torch.long,
     ).to(device)
@@ -272,23 +243,30 @@ def make_stage_inputs(
         config.num_hidden_layers,
         1,
         config.num_key_value_heads,
-        spec.kv_capacity,
+        kv_capacity,
         config.head_dim,
     )
     past_key = torch.zeros(cache_shape, dtype=model.dtype, device=device)
     past_value = torch.zeros_like(past_key)
-    attention_mask = torch.zeros(
-        (1, spec.attention_length),
-        dtype=torch.long,
+    mask_value = torch.finfo(model.dtype).min
+    attention_mask = torch.full(
+        (1, 1, MAX_CHUNK_SIZE, kv_capacity),
+        mask_value,
+        dtype=model.dtype,
         device=device,
     )
-    attention_mask[:, : spec.valid_kv_length + spec.query_length] = 1
+    causal_mask = torch.ones(
+        (chunk_size, chunk_size),
+        dtype=torch.bool,
+        device=device,
+    ).tril()
+    attention_mask[0, 0, :chunk_size, :chunk_size].masked_fill_(causal_mask, 0)
     return {
         "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "actual_seq_len": torch.tensor(0, dtype=torch.long, device=device),
         "past_key": past_key,
         "past_value": past_value,
-        "attention_mask": attention_mask,
-        "index": torch.tensor([spec.valid_kv_length], dtype=torch.long, device=device),
     }
 
 
@@ -470,7 +448,7 @@ def export_stage(
     inputs: dict[str, torch.Tensor],
     path: Path,
 ) -> onnx.ModelProto:
-    """Export and save one rank-local static stage."""
+    """Export and save one rank-local static chunk graph."""
     program = OnnxExporter().export(module, inputs, export_config())
     if not isinstance(program, ONNXProgram):
         raise TypeError(f"Expected ONNXProgram, got {type(program).__name__}")
@@ -484,16 +462,74 @@ def _attribute_values(node: onnx.NodeProto) -> dict[str, object]:
     }
 
 
+def _value_shape(value: onnx.ValueInfoProto) -> tuple[int, ...]:
+    return tuple(dimension.dim_value for dimension in value.type.tensor_type.shape.dim)
+
+
 def validate_export(
     model: onnx.ModelProto,
     path: Path,
     *,
+    inputs: dict[str, torch.Tensor],
     num_hidden_layers: int,
+    vocab_size: int,
 ) -> None:
-    """Validate TP communication structure and serialized external data."""
+    """Validate the static chunk ABI, TP communication, and external data."""
     operators = [node.op_type for node in model.graph.node]
+    required_operators = {"MatMul", "ScatterElements", "Softmax"}
+    if missing := required_operators.difference(operators):
+        raise ValueError(f"Chunk graph is missing operators: {sorted(missing)}")
     if "ReduceScatter" in operators:
         raise ValueError("ReduceScatter must not remain in exported graph")
+
+    expected_input_names = [
+        "input_ids",
+        "attention_mask",
+        "actual_seq_len",
+        "past_key",
+        "past_value",
+    ]
+    if [value.name for value in model.graph.input] != expected_input_names:
+        raise ValueError("Exported graph input names or order do not match the chunk ABI")
+    expected_input_shapes = [tuple(tensor.shape) for tensor in inputs.values()]
+    actual_input_shapes = [_value_shape(value) for value in model.graph.input]
+    if actual_input_shapes != expected_input_shapes:
+        raise ValueError(
+            f"Invalid input shapes: expected {expected_input_shapes}, got {actual_input_shapes}"
+        )
+    expected_input_types = [
+        TensorProto.INT64,
+        TensorProto.FLOAT16,
+        TensorProto.INT64,
+        TensorProto.FLOAT16,
+        TensorProto.FLOAT16,
+    ]
+    actual_input_types = [
+        value.type.tensor_type.elem_type for value in model.graph.input
+    ]
+    if actual_input_types != expected_input_types:
+        raise ValueError(
+            f"Invalid input types: expected {expected_input_types}, got {actual_input_types}"
+        )
+
+    expected_output_names = ["logits", "present_key", "present_value"]
+    if [value.name for value in model.graph.output] != expected_output_names:
+        raise ValueError("Exported graph output names or order do not match the chunk ABI")
+    cache_shape = tuple(inputs["past_key"].shape)
+    expected_output_shapes = [
+        (1, inputs["input_ids"].shape[1], vocab_size),
+        cache_shape,
+        cache_shape,
+    ]
+    actual_output_shapes = [_value_shape(value) for value in model.graph.output]
+    if actual_output_shapes != expected_output_shapes:
+        raise ValueError(
+            f"Invalid output shapes: expected {expected_output_shapes}, got {actual_output_shapes}"
+        )
+    output_types = [value.type.tensor_type.elem_type for value in model.graph.output]
+    if output_types != [TensorProto.FLOAT16] * len(expected_output_names):
+        raise ValueError(f"Chunk graph outputs must be float16, got {output_types}")
+
     hcom_nodes = [
         node for node in model.graph.node if node.op_type == HCOM_ALL_GATHER_OP
     ]
@@ -541,20 +577,16 @@ def run_export(
     *,
     num_hidden_layers: int | None,
     vocab_size: int | None,
-    prefill_length: int,
+    chunk_size: int,
     kv_capacity: int,
 ) -> None:
-    """Sequentially export rank0 and rank1 without distributed initialization."""
-    if prefill_length <= 0:
-        raise ValueError("prefill_length must be positive")
-    if kv_capacity <= prefill_length:
-        raise ValueError("kv_capacity must be greater than prefill_length")
+    """Sequentially export one static chunk graph for each TP rank."""
+    if not 1 <= chunk_size <= MAX_CHUNK_SIZE:
+        raise ValueError(f"chunk_size must be within [1, {MAX_CHUNK_SIZE}]")
+    if kv_capacity < chunk_size:
+        raise ValueError("kv_capacity must be at least chunk_size")
     register_hcom_schema()
     device = select_device()
-    specs = (
-        StageSpec("prefill", prefill_length, 0, kv_capacity),
-        StageSpec("decode", 1, prefill_length, kv_capacity),
-    )
 
     for rank in range(TP_SIZE):
         layer_scope = "full" if num_hidden_layers is None else f"{num_hidden_layers}-layer"
@@ -567,18 +599,19 @@ def run_export(
         ).to(device)
         module = ChunkedQwen3(model).eval()
         rank_dir = output_dir / f"rank{rank}"
-        for seed, spec in enumerate(specs):
-            print(f"Exporting rank{rank} {spec.name}")
-            inputs = make_stage_inputs(model, spec, device, seed=seed)
-            path = rank_dir / f"{spec.name}.onnx"
-            graph = export_stage(module, inputs, path)
-            validate_export(
-                graph,
-                path,
-                num_hidden_layers=module.num_hidden_layers,
-            )
-            del graph, inputs
-            gc.collect()
+        print(f"Exporting rank{rank} chunk_size={chunk_size}")
+        inputs = make_export_inputs(model, chunk_size, kv_capacity, device, seed=rank)
+        path = rank_dir / f"chunk_{chunk_size}.onnx"
+        graph = export_stage(module, inputs, path)
+        validate_export(
+            graph,
+            path,
+            inputs=inputs,
+            num_hidden_layers=module.num_hidden_layers,
+            vocab_size=model.config.vocab_size,
+        )
+        del graph, inputs
+        gc.collect()
         del module, model
         gc.collect()
         if device.type == "cuda":
@@ -608,10 +641,11 @@ def parse_args() -> argparse.Namespace:
         help=f"Retain leading vocabulary rows; use {VOCAB_SIZE} for fast validation",
     )
     parser.add_argument(
-        "--prefill-length",
+        "--chunk-size",
+        "--chunk_size",
         type=int,
-        default=PREFILL_LENGTH,
-        help="Static prefill query length",
+        default=MAX_CHUNK_SIZE,
+        help=f"Static query chunk size within [1, {MAX_CHUNK_SIZE}]",
     )
     parser.add_argument(
         "--kv-capacity",
@@ -630,7 +664,7 @@ def main() -> int:
         args.output_dir,
         num_hidden_layers=args.num_hidden_layers,
         vocab_size=args.vocab_size,
-        prefill_length=args.prefill_length,
+        chunk_size=args.chunk_size,
         kv_capacity=args.kv_capacity,
     )
     return 0
