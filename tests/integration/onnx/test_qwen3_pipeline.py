@@ -6,7 +6,7 @@ import onnx
 import pytest
 import torch
 
-from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 from mdc_llm_deploy.onnx.schemas import (
     FUSED_INFER_ATTENTION_SCORE_OP,
     RMS_NORM_OP,
@@ -31,7 +31,7 @@ def test_qwen3_prefill_and_real_decode_complete_pipeline(case: Qwen3ExportCase) 
     for component_name in ("prefill", "decode"):
         model = components[component_name]
 
-        returned = process_onnx(model)
+        returned = OnnxAdapter(AdapterConfig())(model)
 
         operators = Counter(node.op_type for node in model.graph.node)
         assert returned is model

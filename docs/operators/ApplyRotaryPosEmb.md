@@ -17,7 +17,7 @@ ApplyRotaryPosEmb(
 
 节点固定包含 4 个输入、2 个输出。当前 Qwen3 融合固定生成 `layout=3`（BNSD）和
 `rotary_mode="half"`。schema 由 `mdc_llm_deploy.onnx.schemas` 集中声明，
-`process_onnx` 按模型实际节点注册。
+`OnnxAdapter` 按模型实际节点注册。
 
 ## 融合范围
 
@@ -32,10 +32,10 @@ RoPE pass 识别 Qwen3 的 half-rotation Q/K 子图：
 ```python
 import onnx
 
-from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 
 model = onnx.load("model.onnx")
-process_onnx(model)
+OnnxAdapter(AdapterConfig())(model)
 ```
 
 流程完成融合、按需 schema 注册和最终 ONNX checker 校验。新进程单独校验已生成模型

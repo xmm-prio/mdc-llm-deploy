@@ -15,7 +15,7 @@ import torch
 from google.protobuf.message import Message
 from onnx import TensorProto, ValueInfoProto, helper
 
-from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 from mdc_llm_deploy.onnx.schemas import (
     CANN_FIA_SOURCE_COMMIT,
     FUSED_INFER_ATTENTION_SCORE_OP,
@@ -281,7 +281,7 @@ def _generate_bundle(temporary_dir: Path) -> dict[str, object]:
 
     for case in HARDWARE_CASES:
         model = _export_case(case)
-        process_onnx(model)
+        OnnxAdapter(AdapterConfig())(model)
         _strip_export_metadata(model)
         onnx.checker.check_model(model, full_check=True)
         _validate_fia_abi(model)

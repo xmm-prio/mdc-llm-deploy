@@ -6,13 +6,25 @@
 ## 总入口
 
 ```python
-from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 
-processed = process_onnx(model)
+adapter = OnnxAdapter(AdapterConfig())
+processed = adapter(model)
 assert processed is model
 ```
 
-`process_onnx` 按固定顺序执行：
+`AdapterConfig` 是不可变配置，四个开关默认均为 `True`：
+
+- `fuse_rms_norm`；
+- `fuse_apply_rotary_pos_emb`；
+- `fuse_fused_infer_attention_score`；
+- `show_progress`。
+
+三个融合开关彼此独立，允许全部关闭。关闭某项只跳过对应 pass，不影响其他 pass；
+已有 custom op 仍会按图中实际节点注册 schema。`show_progress=False` 只隐藏 Rich
+进度，阶段日志不受影响。
+
+`OnnxAdapter` 按固定顺序执行：
 
 1. 将受支持的 static W8A8 MatMul QDQ 子图 lowering 为
    `NPUAscendQuantV2 + INT8 MatMul + AscendDequant`，非对称激活追加显式
@@ -50,7 +62,8 @@ assert tuple(report.counts) == (
 `run_fusion_passes` 直接原地逐 pass 修改模型并返回不可变 `FusionReport`。
 `counts` 记录每个 pass 命中数，`total_fused_count` 记录总命中数。不匹配图是安全
 no-op，三个计数均为 0。后续 pass 抛错时不会撤销前序 pass 的成功修改；这是独立
-runner 的明确契约，不等同于 `process_onnx` 的全流程原子契约。
+runner 的明确契约，不等同于 `OnnxAdapter` 的全流程原子契约。Adapter 只编排内置
+pass；需要运行自定义 pass 时，应显式调用该独立编排器。
 
 当前融合范围：
 

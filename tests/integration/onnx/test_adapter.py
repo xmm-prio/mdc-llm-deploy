@@ -9,7 +9,8 @@ import onnx
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
-from mdc_llm_deploy.onnx import pipeline, process_onnx
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
+from mdc_llm_deploy.onnx import adapter as adapter_module
 
 
 def _identity_model(*, opset: int = 21) -> onnx.ModelProto:
@@ -42,7 +43,7 @@ def _qdq_model() -> onnx.ModelProto:
     ]
     graph = helper.make_graph(
         nodes,
-        "pipeline",
+        "adapter",
         [helper.make_tensor_value_info("x", TensorProto.FLOAT16, [1, 2, 3])],
         [helper.make_tensor_value_info("y", TensorProto.FLOAT16, [1, 2, 4])],
         initializer=[
@@ -62,10 +63,10 @@ def _qdq_model() -> onnx.ModelProto:
     return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
 
 
-def test_process_onnx_runs_complete_atomic_pipeline() -> None:
+def test_adapter_runs_complete_atomic_pipeline() -> None:
     model = _qdq_model()
 
-    returned = process_onnx(model)
+    returned = OnnxAdapter(AdapterConfig())(model)
 
     assert returned is model
     assert model.opset_import[0].version == 18
@@ -77,52 +78,54 @@ def test_process_onnx_runs_complete_atomic_pipeline() -> None:
     onnx.checker.check_model(model)
 
 
-def test_pipeline_progress_and_stage_logs_can_be_controlled(
+def test_adapter_progress_and_stage_logs_can_be_controlled(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    with caplog.at_level("INFO", logger="mdc_llm_deploy.onnx.pipeline"):
-        process_onnx(_identity_model(), show_progress=True)
+    with caplog.at_level("INFO", logger="mdc_llm_deploy.onnx.adapter"):
+        OnnxAdapter(AdapterConfig(show_progress=True))(_identity_model())
 
     captured = capsys.readouterr()
     assert "Processing ONNX pipeline" in captured.out + captured.err
-    assert "ONNX pipeline completed" in caplog.text
+    assert "ONNX adapter completed" in caplog.text
     assert "ONNX final validation completed" in caplog.text
 
-    process_onnx(_identity_model(), show_progress=False)
+    OnnxAdapter(AdapterConfig(show_progress=False))(_identity_model())
     captured = capsys.readouterr()
     assert "Processing ONNX pipeline" not in captured.out + captured.err
 
 
-def test_pipeline_stage_order(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_adapter_stage_order(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
     model = _identity_model()
 
-    def stage(name: str) -> Callable[[onnx.ModelProto], object]:
-        def record(_model: onnx.ModelProto) -> object:
+    def stage(name: str) -> Callable[..., object]:
+        def record(_model: onnx.ModelProto, **_kwargs: object) -> object:
             calls.append(name)
             return object()
 
         return record
 
-    monkeypatch.setattr(pipeline, "lower_qdq_core", stage("lower"))
-    monkeypatch.setattr(pipeline, "_register_required_schemas", stage("register"))
+    monkeypatch.setattr(adapter_module, "lower_qdq_core", stage("lower"))
+    monkeypatch.setattr(adapter_module, "_register_required_schemas", stage("register"))
     monkeypatch.setattr(
-        pipeline,
+        adapter_module,
         "lower_opset_compatibility_core",
         stage("compatibility"),
     )
-    monkeypatch.setattr(pipeline, "downgrade_opset_core", stage("downgrade"))
-    monkeypatch.setattr(pipeline, "run_fusion_passes", stage("fusion"))
-    monkeypatch.setattr(pipeline, "_validate_final_graph", stage("checker"))
+    monkeypatch.setattr(adapter_module, "downgrade_opset_core", stage("downgrade"))
+    monkeypatch.setattr(adapter_module, "normalize_graph_core", stage("normalization"))
+    monkeypatch.setattr(adapter_module, "run_fusion_passes", stage("fusion"))
+    monkeypatch.setattr(adapter_module, "_validate_final_graph", stage("checker"))
 
-    process_onnx(model)
+    OnnxAdapter(AdapterConfig(show_progress=False))(model)
 
     assert calls == [
         "lower",
         "register",
         "compatibility",
         "downgrade",
+        "normalization",
         "fusion",
         "register",
         "checker",
@@ -131,32 +134,47 @@ def test_pipeline_stage_order(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.parametrize(
     "failing_stage",
-    ["lower", "compatibility", "downgrade", "fusion", "checker"],
+    [
+        "lower",
+        "register",
+        "compatibility",
+        "downgrade",
+        "normalization",
+        "fusion",
+        "checker",
+    ],
 )
-def test_pipeline_failure_rolls_back_original_model(
+def test_adapter_failure_rolls_back_original_model(
     monkeypatch: pytest.MonkeyPatch,
     failing_stage: str,
 ) -> None:
     model = _identity_model()
     original = model.SerializeToString()
 
-    def fail(working: onnx.ModelProto) -> None:
+    def fail(working: onnx.ModelProto, **_kwargs: object) -> None:
         working.doc_string = "mutated working clone"
         raise RuntimeError(f"{failing_stage} failed")
 
     target = {
         "lower": "lower_qdq_core",
+        "register": "_register_required_schemas",
         "compatibility": "lower_opset_compatibility_core",
         "downgrade": "downgrade_opset_core",
+        "normalization": "normalize_graph_core",
         "fusion": "run_fusion_passes",
         "checker": "_validate_final_graph",
     }[failing_stage]
-    monkeypatch.setattr(pipeline, target, fail)
+    monkeypatch.setattr(adapter_module, target, fail)
 
     with pytest.raises(RuntimeError, match=f"{failing_stage} failed"):
-        process_onnx(model)
+        OnnxAdapter(AdapterConfig(show_progress=False))(model)
 
     assert model.SerializeToString() == original
+
+
+def test_adapter_rejects_non_model() -> None:
+    with pytest.raises(TypeError, match=r"onnx\.ModelProto"):
+        OnnxAdapter(AdapterConfig())(object())  # type: ignore[arg-type]
 
 
 def test_package_import_has_no_schema_registration_side_effect() -> None:
@@ -181,11 +199,11 @@ for name in ALL_SCHEMA_NAMES:
     assert result.returncode == 0, result.stderr
 
 
-def test_process_registers_only_custom_schemas_present_in_graph() -> None:
+def test_adapter_registers_only_custom_schemas_present_in_graph() -> None:
     code = """
 import onnx
 from onnx import TensorProto, helper
-from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 from mdc_llm_deploy.onnx.schemas import ALL_SCHEMA_NAMES, RMS_NORM_OP
 
 graph = helper.make_graph(
@@ -201,7 +219,12 @@ graph = helper.make_graph(
     ],
 )
 model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
-assert process_onnx(model) is model
+config = AdapterConfig(
+    fuse_rms_norm=False,
+    fuse_apply_rotary_pos_emb=False,
+    fuse_fused_infer_attention_score=False,
+)
+assert OnnxAdapter(config)(model) is model
 assert onnx.defs.get_schema(RMS_NORM_OP, 18, "").since_version == 18
 for name in ALL_SCHEMA_NAMES:
     if name == RMS_NORM_OP:

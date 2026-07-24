@@ -9,7 +9,7 @@ from torch import nn
 from transformers import Qwen3Config, Qwen3ForCausalLM
 from transformers.exporters import OnnxConfig, OnnxExporter
 
-from mdc_llm_deploy.onnx import process_onnx
+from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 from mdc_llm_deploy.onnx.schemas import FUSED_INFER_ATTENTION_SCORE_OP
 from mdc_llm_deploy.quantization import (
     MinMaxConfig,
@@ -187,7 +187,7 @@ def test_dense_qwen3_opset21_qdq_export_and_w8a8_lowering() -> None:
         assert raw_counts["QuantizeLinear"] == raw_counts["DequantizeLinear"]
         assert raw_counts["QuantizeLinear"] > 0
 
-        assert process_onnx(exported) is exported
+        assert OnnxAdapter(AdapterConfig())(exported) is exported
         lowered_counts = _standard_operator_counts(exported)
         assert lowered_counts["QuantizeLinear"] == 0
         assert lowered_counts["DequantizeLinear"] == 0
@@ -208,7 +208,7 @@ def test_dense_qwen3_w8a8_generation_fuses_fp16_attention() -> None:
     for component_name in ("prefill", "decode"):
         exported = programs[component_name].model_proto
 
-        assert process_onnx(exported) is exported
+        assert OnnxAdapter(AdapterConfig())(exported) is exported
 
         counts = _standard_operator_counts(exported)
         assert counts["QuantizeLinear"] == 0
