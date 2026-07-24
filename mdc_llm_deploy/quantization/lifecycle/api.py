@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sized
 from dataclasses import dataclass
 from functools import singledispatch
 from typing import Any
@@ -25,6 +25,22 @@ class _QuantizationSession:
 
 
 @singledispatch
+def _config_details(config: QuantizationConfig) -> str:
+    return f"algorithm={type(config).__qualname__}"
+
+
+@_config_details.register
+def _(config: MinMaxConfig) -> str:
+    return (
+        f"algorithm=MinMax weight={config.weight} activation={config.activation} "
+        f"weight_granularity={config.weight_granularity} "
+        f"activation_granularity={config.activation_granularity} "
+        f"weight_symmetric={config.weight_symmetric} "
+        f"activation_symmetric={config.activation_symmetric}"
+    )
+
+
+@singledispatch
 def _create_quantizer(config: QuantizationConfig) -> Quantizer[Any]:
     raise TypeError(f"unsupported quantization config type: {type(config).__qualname__}")
 
@@ -42,7 +58,7 @@ def prepare(model: nn.Module, config: QuantizationConfig) -> nn.Module:
     with log_stage(
         _logger,
         "Quantization prepare",
-        details=f"quantizer={type(quantizer).__qualname__}",
+        details=_config_details(config),
     ):
         quantizer.prepare(model)
     setattr(model, _SESSION_ATTRIBUTE, _QuantizationSession(quantizer))
@@ -57,10 +73,15 @@ def calibrate(
 ) -> nn.Module:
     """Calibrate a prepared model in place and return the same object."""
     quantizer = _required_session(model).quantizer
+    batch_count = len(batches) if isinstance(batches, Sized) else None
     with log_stage(
         _logger,
         "Quantization calibration",
-        details=f"quantizer={type(quantizer).__qualname__}",
+        details=(
+            f"quantizer={type(quantizer).__qualname__} "
+            f"batch_count={batch_count if batch_count is not None else 'unknown'} "
+            f"show_progress={show_progress}"
+        ),
     ):
         quantizer.calibrate(model, batches, show_progress=show_progress)
     return model
@@ -75,6 +96,7 @@ def convert(model: nn.Module) -> nn.Module:
         details=f"quantizer={type(quantizer).__qualname__}",
     ):
         quantizer.convert(model)
+    _logger.info("Quantization lifecycle state: state=%s", quantizer.state.value)
     return model
 
 
@@ -87,15 +109,21 @@ def quantize(
 ) -> nn.Module:
     """Run prepare, calibrate, and convert in place."""
     started = False
-    _logger.info("Quantization workflow started")
+    current_stage = "prepare"
+    _logger.info("Quantization workflow started: %s", _config_details(config))
     try:
         prepare(model, config)
         started = True
+        current_stage = "calibration"
         calibrate(model, batches, show_progress=show_progress)
+        current_stage = "conversion"
         convert(model)
     except Exception:
         lifecycle_state_removed = False
         session = _session(model)
+        state_before_cleanup = (
+            QuantizationState.UNPREPARED if session is None else session.quantizer.state
+        )
         if (
             started
             and session is not None
@@ -104,7 +132,10 @@ def quantize(
             delattr(model, _SESSION_ATTRIBUTE)
             lifecycle_state_removed = True
         _logger.error(
-            "Quantization workflow failed: lifecycle_state_removed=%s",
+            "Quantization workflow failed: failed_stage=%s state_before_cleanup=%s "
+            "lifecycle_state_removed=%s",
+            current_stage,
+            state_before_cleanup.value,
             lifecycle_state_removed,
         )
         raise
@@ -124,7 +155,7 @@ def load_quantized_state_dict(
     with log_stage(
         _logger,
         "Quantized checkpoint restore",
-        details=f"quantizer={type(quantizer).__qualname__}",
+        details=f"{_config_details(config)} state_dict_keys={len(state_dict)}",
     ):
         quantizer.restore(model, state_dict)
     setattr(model, _SESSION_ATTRIBUTE, _QuantizationSession(quantizer))

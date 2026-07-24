@@ -64,6 +64,8 @@ def _register_required_schemas(model: onnx.ModelProto) -> None:
         )
     )
     if required:
+        _logger.info("Registering required ONNX schemas: count=%d", len(required))
+        _logger.debug("Required ONNX schemas: %s", required)
         register_schemas(*required)
 
 
@@ -77,8 +79,20 @@ def _validate_final_graph(model: onnx.ModelProto) -> None:
         }
     )
     if residual:
+        _logger.warning(
+            "ONNX final validation found residual QDQ operators: count=%d operators=%s",
+            len(residual),
+            residual,
+        )
         raise ValueError(f"main graph still contains residual QDQ operators: {residual}")
     onnx.checker.check_model(model)
+
+
+def _default_opset(model: onnx.ModelProto) -> int | None:
+    return next(
+        (opset.version for opset in model.opset_import if opset.domain in ("", "ai.onnx")),
+        None,
+    )
 
 
 def _run_stage(
@@ -115,6 +129,8 @@ class OnnxAdapter:
         if not isinstance(model, onnx.ModelProto):
             raise TypeError("model must be an onnx.ModelProto")
         working = clone_model(model)
+        source_nodes = sum(1 for _ in _nodes(working.graph))
+        source_opset = _default_opset(working)
         fusion_passes = self._selected_fusion_passes()
         stages: Sequence[tuple[str, Callable[[onnx.ModelProto], object]]] = (
             ("QDQ lowering", lower_qdq_core),
@@ -126,7 +142,20 @@ class OnnxAdapter:
             ("schema registration after fusion", _register_required_schemas),
             ("final validation", _validate_final_graph),
         )
-        _logger.info("ONNX adapter started: nodes=%d", sum(1 for _ in _nodes(working.graph)))
+        _logger.info(
+            "ONNX adapter started: nodes=%d source_opset=%s fusion_passes=%d show_progress=%s",
+            source_nodes,
+            source_opset,
+            len(fusion_passes),
+            self._config.show_progress,
+        )
+        _logger.debug(
+            "ONNX adapter configuration: fuse_rms_norm=%s "
+            "fuse_apply_rotary_pos_emb=%s fuse_fused_infer_attention_score=%s",
+            self._config.fuse_rms_norm,
+            self._config.fuse_apply_rotary_pos_emb,
+            self._config.fuse_fused_infer_attention_score,
+        )
         with progress_task(
             "Processing ONNX pipeline",
             total=len(stages),
@@ -136,7 +165,13 @@ class OnnxAdapter:
                 _run_stage(working, name, operation)
                 advance()
         model.CopyFrom(working)
-        _logger.info("ONNX adapter completed: nodes=%d", sum(1 for _ in _nodes(model.graph)))
+        final_nodes = sum(1 for _ in _nodes(model.graph))
+        _logger.info(
+            "ONNX adapter completed: nodes=%d node_delta=%+d target_opset=%s",
+            final_nodes,
+            final_nodes - source_nodes,
+            _default_opset(model),
+        )
         return model
 
     def _selected_fusion_passes(self) -> tuple[FusionPass, ...]:

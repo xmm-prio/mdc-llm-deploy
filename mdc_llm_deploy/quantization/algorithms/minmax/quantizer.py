@@ -95,10 +95,13 @@ class MinMaxQuantizer(Quantizer[MinMaxConfig]):
             raise ValueError("target selector did not match any Linear modules")
         self._model_reference = weakref.ref(model)
         self._targets = tuple(prepared)
+        selected_locations = sum(len(target.names) for target in prepared)
         _logger.info(
-            "MinMax target discovery completed: linear_modules=%d selected_targets=%d",
+            "MinMax target discovery completed: linear_modules=%d "
+            "unique_targets=%d selected_locations=%d",
             len(grouped),
             len(prepared),
+            selected_locations,
         )
         _logger.debug(
             "Selected MinMax targets: %s",
@@ -115,6 +118,13 @@ class MinMaxQuantizer(Quantizer[MinMaxConfig]):
         self._validate_model(model)
         self._validate_structure(model)
         handles: list[torch.utils.hooks.RemovableHandle] = []
+        observer_count = sum(target.activation_observer is not None for target in self._targets)
+        _logger.info(
+            "MinMax calibration started: target_count=%d observer_hooks=%d activation_enabled=%s",
+            len(self._targets),
+            observer_count,
+            self._activation_spec.enabled,
+        )
         try:
             for target in self._targets:
                 if target.activation_observer is None:
@@ -139,6 +149,17 @@ class MinMaxQuantizer(Quantizer[MinMaxConfig]):
         finally:
             for handle in handles:
                 handle.remove()
+        observed_count = sum(
+            target.activation_observer is not None and target.activation_observer.observed
+            for target in self._targets
+        )
+        _logger.info(
+            "MinMax calibration completed: observer_count=%d observed_targets=%d "
+            "missing_targets=%d",
+            observer_count,
+            observed_count,
+            observer_count - observed_count,
+        )
 
     def _convert(self, model: nn.Module) -> None:
         self._validate_model(model)
@@ -156,22 +177,47 @@ class MinMaxQuantizer(Quantizer[MinMaxConfig]):
             names = ", ".join(repr(name) for name in missing)
             raise RuntimeError(f"activation calibration did not cover target Linear modules: {names}")
 
-        wrappers = {
-            id(target.module): self._make_wrapper(
+        wrappers: dict[int, MinMaxLinear] = {}
+        for target in self._targets:
+            activation_binding = (
+                None
+                if target.activation_observer is None
+                else self._activation_spec.freeze(
+                    target.activation_observer,
+                    target.module,
+                )
+            )
+            wrappers[id(target.module)] = self._make_wrapper(
                 target,
                 weight_binding=target.weight_binding,
-                activation_binding=(
-                    None
-                    if target.activation_observer is None
-                    else self._activation_spec.freeze(
-                        target.activation_observer,
-                        target.module,
-                    )
-                ),
+                activation_binding=activation_binding,
             )
-            for target in self._targets
-        }
+            self._log_qparam_metadata(
+                target,
+                weight_binding=target.weight_binding,
+                activation_binding=activation_binding,
+            )
         return wrappers
+
+    def _log_qparam_metadata(
+        self,
+        target: _PreparedTarget,
+        *,
+        weight_binding: _QParamBinding | None,
+        activation_binding: _QParamBinding | None,
+    ) -> None:
+        _logger.debug(
+            "MinMax qparams prepared: target=%s weight_scale_shape=%s "
+            "weight_axis=%s weight_zero_point=%s activation_scale_shape=%s "
+            "activation_axis=%s activation_zero_point=%s",
+            target.names[0],
+            None if weight_binding is None else tuple(weight_binding.scale.shape),
+            None if weight_binding is None else weight_binding.axis,
+            weight_binding is not None and weight_binding.zero_point is not None,
+            None if activation_binding is None else tuple(activation_binding.scale.shape),
+            None if activation_binding is None else activation_binding.axis,
+            activation_binding is not None and activation_binding.zero_point is not None,
+        )
 
     def _make_wrapper(
         self,
@@ -222,8 +268,19 @@ class MinMaxQuantizer(Quantizer[MinMaxConfig]):
         except Exception:
             for replacement in reversed(applied):
                 setattr(replacement.parent, replacement.attribute, replacement.original)
+            _logger.warning(
+                "MinMax conversion rolled back: applied_replacements=%d rollback_completed=True",
+                len(applied),
+            )
             raise
-        _logger.info("MinMax conversion replaced %d module locations", len(applied))
+        _logger.info(
+            "MinMax conversion completed: replacement_locations=%d",
+            len(applied),
+        )
+        _logger.debug(
+            "MinMax replacement attributes: %s",
+            tuple(replacement.attribute for replacement in applied),
+        )
 
     def restore(self, model: nn.Module, state_dict: Mapping[str, Tensor]) -> nn.Module:
         """Rebuild converted wrappers from frozen checkpoint qparams."""
@@ -272,6 +329,14 @@ class MinMaxQuantizer(Quantizer[MinMaxConfig]):
         missing = sorted(expected - actual)
         unexpected = sorted(actual - expected)
         if missing or unexpected:
+            _logger.debug(
+                "Quantized checkpoint key mismatch: expected_keys=%d actual_keys=%d "
+                "missing_keys=%d unexpected_keys=%d",
+                len(expected),
+                len(actual),
+                len(missing),
+                len(unexpected),
+            )
             raise RuntimeError(
                 f"quantized state_dict keys mismatch; missing={missing}, unexpected={unexpected}"
             )

@@ -48,18 +48,24 @@ def test_run_fusion_passes_uses_stable_public_order() -> None:
     assert report.total_fused_count == 0
 
 
-def test_run_fusion_passes_accepts_explicit_ordered_subset() -> None:
+def test_run_fusion_passes_accepts_explicit_ordered_subset(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     model = _identity_model()
     passes = (_RecordingPass("second"), _RecordingPass("first"))
 
-    report = run_fusion_passes(model, passes=passes)
+    with caplog.at_level("INFO", logger="mdc_llm_deploy.onnx.fusion.runner"):
+        report = run_fusion_passes(model, passes=passes)
 
     assert tuple(report.counts) == ("second", "first")
     assert model.doc_string == "secondfirst"
+    assert "Fusion passes started: pass_count=2 passes=('second', 'first')" in caplog.text
+    assert "changed_pass_count=0 total_fused_count=0" in caplog.text
 
 
 def test_run_fusion_passes_keeps_prior_results_when_later_pass_fails(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     model = _identity_model()
     monkeypatch.setattr(
@@ -68,10 +74,20 @@ def test_run_fusion_passes_keeps_prior_results_when_later_pass_fails(
         (_RecordingPass("first"), _RecordingPass("second", fail=True)),
     )
 
-    with pytest.raises(RuntimeError, match="second failed"):
+    with (
+        caplog.at_level("ERROR", logger="mdc_llm_deploy.onnx.fusion.runner"),
+        pytest.raises(RuntimeError, match="second failed"),
+    ):
         run_fusion_passes(model)
 
     assert model.doc_string == "firstsecond"
+    failures = [
+        record
+        for record in caplog.records
+        if record.levelname == "ERROR" and "Fusion pass second failed" in record.message
+    ]
+    assert len(failures) == 1
+    assert failures[0].exc_info is None
 
 
 def test_run_fusion_passes_rejects_non_model() -> None:

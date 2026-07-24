@@ -82,13 +82,16 @@ def test_adapter_progress_and_stage_logs_can_be_controlled(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    with caplog.at_level("INFO", logger="mdc_llm_deploy.onnx.adapter"):
+    with caplog.at_level("DEBUG", logger="mdc_llm_deploy.onnx.pipeline.adapter"):
         OnnxAdapter(AdapterConfig(show_progress=True))(_identity_model())
 
     captured = capsys.readouterr()
     assert "Processing ONNX pipeline" in captured.out + captured.err
     assert "ONNX adapter completed" in caplog.text
     assert "ONNX final validation completed" in caplog.text
+    assert "source_opset=21 fusion_passes=3 show_progress=True" in caplog.text
+    assert "target_opset=18" in caplog.text
+    assert "fuse_rms_norm=True" in caplog.text
 
     OnnxAdapter(AdapterConfig(show_progress=False))(_identity_model())
     captured = capsys.readouterr()

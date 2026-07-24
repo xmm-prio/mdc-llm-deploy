@@ -136,6 +136,26 @@ def test_selector_only_converts_matching_linear_modules() -> None:
     assert type(model[1]) is nn.Linear
 
 
+def test_minmax_logs_aggregate_targets_and_qparam_metadata(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    model = nn.Sequential(nn.Linear(2, 2))
+    with torch.no_grad():
+        model[0].weight.fill_(123.456)
+
+    with caplog.at_level(
+        "DEBUG",
+        logger="mdc_llm_deploy.quantization.algorithms.minmax.quantizer",
+    ):
+        quantize(model, MinMaxConfig(weight_granularity="per_channel"))
+
+    assert "unique_targets=1 selected_locations=1" in caplog.text
+    assert "observer_hooks=0 activation_enabled=False" in caplog.text
+    assert "weight_scale_shape=(2, 1) weight_axis=0" in caplog.text
+    assert "replacement_locations=1" in caplog.text
+    assert "123.456" not in caplog.text
+
+
 def test_shared_linear_aliases_use_one_replacement() -> None:
     class SharedModel(nn.Module):
         def __init__(self) -> None:

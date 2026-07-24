@@ -170,8 +170,24 @@ def test_lazy_registration_is_thread_safe_and_idempotent() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_registration_logs_first_registration_and_reuse() -> None:
+    result = _run_isolated(
+        "import logging\n"
+        "logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(message)s')\n"
+        "from mdc_llm_deploy.quantization.operators.qdq import register_qdq_operator\n"
+        "register_qdq_operator()\n"
+        "register_qdq_operator()\n"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "INFO:QDQ operator registered: operator=mdc_llm_deploy::qdq" in result.stderr
+    assert "DEBUG:QDQ operator already registered: operator=mdc_llm_deploy::qdq" in result.stderr
+
+
 def test_existing_operator_name_conflict_fails_strictly() -> None:
     result = _run_isolated(
+        "import logging\n"
+        "logging.basicConfig(level=logging.ERROR, format='%(levelname)s:%(message)s')\n"
         "import torch\n"
         "@torch.library.custom_op('mdc_llm_deploy::qdq', mutates_args=())\n"
         "def occupied(inputs: torch.Tensor, scale: torch.Tensor, "
@@ -183,6 +199,7 @@ def test_existing_operator_name_conflict_fails_strictly() -> None:
 
     assert result.returncode != 0
     assert "already" in result.stderr.lower()
+    assert "ERROR:QDQ operator registration conflict: operator=mdc_llm_deploy::qdq" in result.stderr
 
 
 @pytest.mark.parametrize("asymmetric", [False, True])

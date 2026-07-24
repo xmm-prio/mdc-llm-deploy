@@ -19,14 +19,7 @@ _REGISTRATION_LOCK = threading.Lock()
 _operator: Callable[[Tensor, Tensor, Tensor | None, int | None], Tensor] | None = None
 _logger = get_logger(__name__)
 _OnnxAttribute = (
-    int
-    | float
-    | str
-    | bool
-    | Sequence[int]
-    | Sequence[float]
-    | Sequence[str]
-    | Sequence[bool]
+    int | float | str | bool | Sequence[int] | Sequence[float] | Sequence[str] | Sequence[bool]
 )
 
 
@@ -120,16 +113,21 @@ def register_qdq_operator() -> Callable[[Tensor, Tensor, Tensor | None, int | No
     global _operator
     operator = _registered_operator()
     if operator is not None:
+        _logger.debug("QDQ operator already registered: operator=%s", _OPERATOR_NAME)
         return operator
 
     with _REGISTRATION_LOCK:
         operator = _registered_operator()
         if operator is not None:
+            _logger.debug("QDQ operator already registered: operator=%s", _OPERATOR_NAME)
             return operator
 
         warn_unvalidated_torch_version()
         if _OPERATOR_NAME in torch._C._dispatch_get_all_op_names():
-            raise RuntimeError(f"Custom operator registration conflict: {_OPERATOR_NAME} already exists")
+            _logger.error("QDQ operator registration conflict: operator=%s", _OPERATOR_NAME)
+            raise RuntimeError(
+                f"Custom operator registration conflict: {_OPERATOR_NAME} already exists"
+            )
         custom_operator = torch.library.custom_op(
             _OPERATOR_NAME,
             _eager_qdq,
@@ -141,6 +139,11 @@ def register_qdq_operator() -> Callable[[Tensor, Tensor, Tensor | None, int | No
         _operator = cast(
             Callable[[Tensor, Tensor, Tensor | None, int | None], Tensor],
             overload,
+        )
+        _logger.info(
+            "QDQ operator registered: operator=%s torch_version=%s",
+            _OPERATOR_NAME,
+            metadata.version("torch"),
         )
         return _operator
 

@@ -31,10 +31,23 @@ def run_fusion_passes(
     if not isinstance(model, onnx.ModelProto):
         raise TypeError("model must be an onnx.ModelProto")
     selected_passes = _FUSION_PASSES if passes is None else tuple(passes)
+    _logger.info(
+        "Fusion passes started: pass_count=%d passes=%s",
+        len(selected_passes),
+        tuple(fusion_pass.name for fusion_pass in selected_passes),
+    )
     results: list[FusionPassResult] = []
     for fusion_pass in selected_passes:
         started_at = perf_counter()
-        result = fusion_pass.apply(model)
+        try:
+            result = fusion_pass.apply(model)
+        except Exception:
+            _logger.error(
+                "Fusion pass %s failed after %.3fs",
+                fusion_pass.name,
+                perf_counter() - started_at,
+            )
+            raise
         results.append(result)
         _logger.info(
             "Fusion pass %s completed in %.3fs: fused_count=%d",
@@ -48,7 +61,13 @@ def run_fusion_passes(
             result.fused_node_names,
         )
     report = FusionReport(tuple(results))
-    _logger.info("Fusion passes completed: total_fused_count=%d", report.total_fused_count)
+    changed_pass_count = sum(result.changed for result in report.pass_results)
+    _logger.info(
+        "Fusion passes completed: pass_count=%d changed_pass_count=%d total_fused_count=%d",
+        len(report.pass_results),
+        changed_pass_count,
+        report.total_fused_count,
+    )
     return report
 
 

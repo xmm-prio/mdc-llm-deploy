@@ -78,12 +78,14 @@ def test_calibration_progress_and_stage_logs_can_be_controlled(
     prepare(model, MinMaxConfig())
     capsys.readouterr()
 
-    with caplog.at_level("INFO", logger="mdc_llm_deploy.quantization.lifecycle.api"):
+    with caplog.at_level("INFO"):
         calibrate(model, [{"inputs": torch.ones(1, 2)}], show_progress=True)
 
     captured = capsys.readouterr()
     assert "Calibrating batches" in captured.out + captured.err
     assert "Quantization calibration completed" in caplog.text
+    assert "batch_count=1 show_progress=True" in caplog.text
+    assert "processed_batches=1 restored_training=True" in caplog.text
 
     second_model = _RecordingModel()
     prepare(second_model, MinMaxConfig())
@@ -138,15 +140,30 @@ def test_prepare_failure_is_atomic() -> None:
     assert quantization_state(model) is QuantizationState.UNPREPARED
 
 
-def test_one_step_failure_removes_partial_lifecycle() -> None:
+def test_one_step_failure_removes_partial_lifecycle(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     model = _RecordingModel()
     original = model.linear
 
-    with pytest.raises(TypeError, match="mapping"):
+    with (
+        caplog.at_level("ERROR", logger="mdc_llm_deploy.quantization.lifecycle.api"),
+        pytest.raises(TypeError, match="mapping"),
+    ):
         quantize(model, MinMaxConfig(), batches=[object()])  # type: ignore[list-item]
 
     assert model.linear is original
     assert quantization_state(model) is QuantizationState.UNPREPARED
+    failures = [
+        record
+        for record in caplog.records
+        if record.levelname == "ERROR" and record.message.startswith("Quantization workflow failed")
+    ]
+    assert len(failures) == 1
+    assert failures[0].exc_info is None
+    assert "failed_stage=calibration" in failures[0].message
+    assert "state_before_cleanup=prepared" in failures[0].message
+    assert "lifecycle_state_removed=True" in failures[0].message
 
 
 def test_convert_rejects_structure_change_before_replacement() -> None:
