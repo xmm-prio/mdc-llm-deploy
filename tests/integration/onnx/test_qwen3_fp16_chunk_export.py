@@ -17,7 +17,7 @@ from examples.qwen3_8b_fp16_export import (
     export_stage,
     load_model,
     make_stage_inputs,
-    position_ids_from_mask,
+    position_ids_from_index,
 )
 from mdc_llm_deploy.onnx.schemas import (
     FUSED_INFER_ATTENTION_SCORE_OP,
@@ -66,7 +66,7 @@ def test_load_model_rejects_invalid_layer_limit(
         load_model("unused", num_hidden_layers=num_hidden_layers)
 
 
-def test_chunked_prefill_and_decode_return_only_current_kv(
+def test_chunked_prefill_and_decode_scatter_into_fixed_kv(
     tiny_model: Qwen3ForCausalLM,
 ) -> None:
     module = ChunkedQwen3(tiny_model)
@@ -97,23 +97,33 @@ def test_chunked_prefill_and_decode_return_only_current_kv(
 
     assert torch.equal(prefill_inputs["past_key"], original_key)
     assert prefill_outputs["logits"].shape == (1, 3, 32)
-    assert prefill_outputs["present_key"].shape == (2, 1, 2, 3, 8)
-    assert prefill_outputs["present_value"].shape == (2, 1, 2, 3, 8)
+    assert prefill_outputs["present_key"].shape == (2, 1, 2, 16, 8)
+    assert prefill_outputs["present_value"].shape == (2, 1, 2, 16, 8)
+    assert torch.count_nonzero(prefill_outputs["present_key"][:, :, :, :3]) > 0
+    assert torch.count_nonzero(prefill_outputs["present_key"][:, :, :, 3:]) == 0
     assert decode_outputs["logits"].shape == (1, 1, 32)
-    assert decode_outputs["present_key"].shape == (2, 1, 2, 1, 8)
-    assert decode_outputs["present_value"].shape == (2, 1, 2, 1, 8)
+    assert decode_outputs["present_key"].shape == (2, 1, 2, 16, 8)
+    assert decode_outputs["present_value"].shape == (2, 1, 2, 16, 8)
     assert torch.equal(
         decode_inputs["past_key"][:, :, :, :3],
-        prefill_outputs["present_key"],
+        prefill_outputs["present_key"][:, :, :, :3],
     )
     assert torch.equal(
-        position_ids_from_mask(prefill_inputs["attention_mask"], 3),
+        decode_outputs["present_key"][:, :, :, :3],
+        prefill_outputs["present_key"][:, :, :, :3],
+    )
+    assert torch.count_nonzero(decode_outputs["present_key"][:, :, :, 3:4]) > 0
+    assert torch.count_nonzero(decode_outputs["present_key"][:, :, :, 4:]) == 0
+    assert torch.equal(
+        position_ids_from_index(prefill_inputs["index"], 3),
         torch.tensor([[0, 1, 2]]),
     )
     assert torch.equal(
-        position_ids_from_mask(decode_inputs["attention_mask"], 1),
+        position_ids_from_index(decode_inputs["index"], 1),
         torch.tensor([[3]]),
     )
+    assert prefill_inputs["attention_mask"].shape == (1, 16)
+    assert decode_inputs["attention_mask"].shape == (1, 16)
 
 
 @pytest.mark.parametrize(
@@ -121,13 +131,13 @@ def test_chunked_prefill_and_decode_return_only_current_kv(
     [
         (
             StageSpec("prefill", query_length=3, valid_kv_length=0, kv_capacity=16),
-            ((1, 3), (2, 1, 2, 16, 8), (2, 1, 2, 16, 8), (1, 19)),
-            ((1, 3, 32), (2, 1, 2, 3, 8), (2, 1, 2, 3, 8)),
+            ((1, 3), (2, 1, 2, 16, 8), (2, 1, 2, 16, 8), (1, 16), (1,)),
+            ((1, 3, 32), (2, 1, 2, 16, 8), (2, 1, 2, 16, 8)),
         ),
         (
-            StageSpec("decode", query_length=1, valid_kv_length=0, kv_capacity=16),
-            ((1, 1), (2, 1, 2, 16, 8), (2, 1, 2, 16, 8), (1, 17)),
-            ((1, 1, 32), (2, 1, 2, 1, 8), (2, 1, 2, 1, 8)),
+            StageSpec("decode", query_length=1, valid_kv_length=3, kv_capacity=16),
+            ((1, 1), (2, 1, 2, 16, 8), (2, 1, 2, 16, 8), (1, 16), (1,)),
+            ((1, 1, 32), (2, 1, 2, 16, 8), (2, 1, 2, 16, 8)),
         ),
     ],
 )
@@ -156,6 +166,7 @@ def test_exported_graph_has_static_abi_and_small_operator_attention(
         "past_key",
         "past_value",
         "attention_mask",
+        "index",
     ]
     assert tuple(_shape(value) for value in graph.graph.input) == expected_input_shapes
     assert [value.name for value in graph.graph.output] == [
@@ -165,7 +176,7 @@ def test_exported_graph_has_static_abi_and_small_operator_attention(
     ]
     assert tuple(_shape(value) for value in graph.graph.output) == expected_output_shapes
     operators = Counter(node.op_type for node in graph.graph.node)
-    assert operators.keys() >= {"MatMul", "Softmax"}
+    assert operators.keys() >= {"MatMul", "ScatterElements", "Softmax"}
     assert operators[RMS_NORM_OP] == 9
     assert operators[ROTARY_POSITION_EMBEDDING_OP] == 2
     assert operators[FUSED_INFER_ATTENTION_SCORE_OP] == 0

@@ -57,24 +57,56 @@ class StageSpec:
 
     @property
     def attention_length(self) -> int:
-        """Return physical cache plus current query length."""
-        return self.kv_capacity + self.query_length
+        """Return the fixed physical cache length."""
+        return self.kv_capacity
 
 
 PREFILL_SPEC = StageSpec("prefill", PREFILL_LENGTH, 0)
 DECODE_SPEC = StageSpec("decode", 1, PREFILL_LENGTH)
 
 
-def position_ids_from_mask(
-    attention_mask: torch.Tensor,
+def position_ids_from_index(
+    index: torch.Tensor,
     query_length: int,
 ) -> torch.Tensor:
-    """Derive positions for the current chunk from the valid-token mask."""
-    return (attention_mask.to(dtype=torch.long).cumsum(dim=-1)[:, -query_length:] - 1).clamp_min(0)
+    """Derive current chunk positions from its cache start index."""
+    return index.unsqueeze(1) + torch.arange(query_length, device=index.device).unsqueeze(0)
+
+
+class ScatterCache(DynamicCache):
+    """Write each layer's current KV tensors into fixed-capacity buffers."""
+
+    def __init__(
+        self,
+        cache_data: list[tuple[torch.Tensor, torch.Tensor]],
+        index: torch.Tensor,
+    ) -> None:
+        super().__init__(cache_data)
+        self.index = index
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Scatter current KV tensors at ``index`` and return full buffers."""
+        del args, kwargs
+        positions = self.index + torch.arange(
+            key_states.shape[-2],
+            device=key_states.device,
+        )
+        scatter_index = positions.view(1, 1, -1, 1).expand_as(key_states)
+        layer = self.layers[layer_idx]
+        layer.keys = layer.keys.scatter(-2, scatter_index, key_states)
+        layer.values = layer.values.scatter(-2, scatter_index, value_states)
+        return layer.keys, layer.values
 
 
 class ChunkedQwen3(nn.Module):
-    """Expose fixed KV buffers and return only KV produced by the current chunk."""
+    """Expose fixed KV buffers updated before each layer's Attention."""
 
     def __init__(self, model: PreTrainedModel) -> None:
         super().__init__()
@@ -87,19 +119,37 @@ class ChunkedQwen3(nn.Module):
         past_key: torch.Tensor,
         past_value: torch.Tensor,
         attention_mask: torch.Tensor,
+        index: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Run one chunk without writing the returned KV into the input buffers."""
+        """Scatter one chunk into fixed KV buffers and run Attention."""
         query_length = input_ids.shape[1]
-        position_ids = position_ids_from_mask(attention_mask, query_length)
-        cache = DynamicCache(
+        position_ids = position_ids_from_index(index, query_length)
+        cache = ScatterCache(
             [
                 (past_key[layer_index], past_value[layer_index])
                 for layer_index in range(self.num_hidden_layers)
-            ]
+            ],
+            index,
+        )
+        key_positions = torch.arange(
+            past_key.shape[-2],
+            device=input_ids.device,
+        ).view(1, 1, 1, -1)
+        query_positions = position_ids.view(1, 1, query_length, 1)
+        visible = (key_positions <= query_positions) & attention_mask[:, None, None, :].bool()
+        attention_bias = torch.where(
+            visible,
+            torch.zeros((), dtype=self.model.dtype, device=input_ids.device),
+            torch.full(
+                (),
+                torch.finfo(self.model.dtype).min,
+                dtype=self.model.dtype,
+                device=input_ids.device,
+            ),
         )
         outputs = self.model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
+            attention_mask={"full_attention": attention_bias},
             position_ids=position_ids,
             past_key_values=cache,
             use_cache=True,
@@ -109,12 +159,8 @@ class ChunkedQwen3(nn.Module):
             raise RuntimeError("Qwen3 did not return a KV cache")
         return {
             "logits": outputs.logits,
-            "present_key": torch.stack(
-                [layer.keys[:, :, -query_length:, :] for layer in updated_cache.layers]
-            ),
-            "present_value": torch.stack(
-                [layer.values[:, :, -query_length:, :] for layer in updated_cache.layers]
-            ),
+            "present_key": torch.stack([layer.keys for layer in updated_cache.layers]),
+            "present_value": torch.stack([layer.values for layer in updated_cache.layers]),
         }
 
 
@@ -182,10 +228,10 @@ def make_stage_inputs(
         initial_length = initial_key.shape[3]
         if initial_key.shape != initial_value.shape:
             raise ValueError("initial key and value shapes must match")
-        if initial_length != spec.valid_kv_length:
+        if initial_length not in (spec.valid_kv_length, spec.kv_capacity):
             raise ValueError(
-                f"initial cache length {initial_length} does not match "
-                f"valid_kv_length {spec.valid_kv_length}"
+                f"initial cache length {initial_length} must match valid_kv_length "
+                f"{spec.valid_kv_length} or kv_capacity {spec.kv_capacity}"
             )
         past_key[:, :, :, :initial_length, :].copy_(initial_key)
         past_value[:, :, :, :initial_length, :].copy_(initial_value)
@@ -195,13 +241,13 @@ def make_stage_inputs(
         dtype=torch.long,
         device=device,
     )
-    attention_mask[:, : spec.valid_kv_length] = 1
-    attention_mask[:, spec.kv_capacity :] = 1
+    attention_mask[:, : spec.valid_kv_length + spec.query_length] = 1
     return {
         "input_ids": input_ids,
         "past_key": past_key,
         "past_value": past_value,
         "attention_mask": attention_mask,
+        "index": torch.tensor([spec.valid_kv_length], dtype=torch.long, device=device),
     }
 
 
