@@ -104,9 +104,10 @@ onnx.save_model(
 )
 ```
 
-`OnnxAdapter` 按固定顺序完成 QDQ lowering、opset 兼容处理、图规范化、算子融合、
-schema 注册和检查。处理成功后原地返回同一 `ModelProto`；任一步失败时，输入模型保持
-不变。完整契约见 [MDC ONNX 图处理](docs/onnx.md)。
+`OnnxAdapter` 按固定顺序完成 QDQ lowering、常量折叠、opset 兼容处理、图规范化、
+算子融合、schema 注册和检查。常量折叠默认开启，可通过
+`AdapterConfig(fold_constants=False)` 关闭。处理成功后原地返回同一 `ModelProto`；
+任一步失败时，输入模型保持不变。完整契约见 [MDC ONNX 图处理](docs/onnx.md)。
 
 > [!IMPORTANT]
 > raw QDQ 支持范围大于 MDC lowering 支持范围。当前 lowering 面向静态 W8A8

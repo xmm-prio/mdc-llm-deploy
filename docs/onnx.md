@@ -13,29 +13,32 @@ processed = adapter(model)
 assert processed is model
 ```
 
-`AdapterConfig` 是不可变配置，四个开关默认均为 `True`：
+`AdapterConfig` 是不可变配置，五个开关默认均为 `True`：
 
+- `fold_constants`；
 - `fuse_rms_norm`；
 - `fuse_apply_rotary_pos_emb`；
 - `fuse_fused_infer_attention_score`；
 - `show_progress`。
 
-三个融合开关彼此独立，允许全部关闭。关闭某项只跳过对应 pass，不影响其他 pass；
-已有 custom op 仍会按图中实际节点注册 schema。`show_progress=False` 只隐藏 Rich
-进度，阶段日志不受影响。
+`fold_constants=False` 会完整跳过常量折叠阶段。三个融合开关彼此独立，允许全部
+关闭；关闭某项只跳过对应 pass，不影响其他 pass。已有 custom op 仍会按图中实际节点
+注册 schema。`show_progress=False` 只隐藏 Rich 进度，阶段日志不受影响。
 
 `OnnxAdapter` 按固定顺序执行：
 
 1. 将受支持的 static W8A8 MatMul QDQ 子图 lowering 为
    `NPUAscendQuantV2 + INT8 MatMul + AscendDequant`，非对称激活追加显式
    zero-point 补偿，per-token 激活再恢复逐 token scale；
-2. 执行 MDC parser compatibility lowering：把静态 `Split.num_outputs` 精确转换为
+2. 使用 `onnxscript` 折叠常量子图；该阶段位于 QDQ lowering 之后，避免提前改写专用
+   lowering 所需的 QDQ 模式；
+3. 执行 MDC parser compatibility lowering：把静态 `Split.num_outputs` 精确转换为
    opset 18 的 `split` 常量输入；
-3. 验证剩余标准算子可由 opset 18 表达，并把默认 domain opset 降至 18；
-4. 规范化透明 `Identity`、常量 Cast 和无损浮点 Cast 往返；
-5. 固定按 RMSNorm、RoPE、FIA 顺序运行融合；
-6. 扫描主图及子图，只注册实际出现的 MDC custom-op schema；
-7. 运行最终 ONNX checker，并确认主图无残余 QDQ。
+4. 验证剩余标准算子可由 opset 18 表达，并把默认 domain opset 降至 18；
+5. 规范化透明 `Identity`、常量 Cast 和无损浮点 Cast 往返；
+6. 固定按 RMSNorm、RoPE、FIA 顺序运行融合；
+7. 扫描主图及子图，只注册实际出现的 MDC custom-op schema；
+8. 运行最终 ONNX checker，并确认主图无残余 QDQ。
 
 lowering 产生的 custom op 会在 opset 检查前按需注册；融合新产生的 schema 会在最终
 checker 前再次按需注册。导入包本身仍无 registry 副作用。整个流程先处理模型副本，

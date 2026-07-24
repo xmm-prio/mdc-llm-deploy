@@ -11,6 +11,7 @@ from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
 def test_adapter_config_defaults_enable_complete_pipeline() -> None:
     config = AdapterConfig()
 
+    assert config.fold_constants
     assert config.fuse_rms_norm
     assert config.fuse_apply_rotary_pos_emb
     assert config.fuse_fused_infer_attention_score

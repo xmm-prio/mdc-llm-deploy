@@ -19,6 +19,7 @@ from ..fusion import (
 from ..graph import clone_model
 from ..schema import ALL_SCHEMA_NAMES, register_schemas
 from .compatibility import lower_opset_compatibility_core
+from .constant_folding import fold_constants_core
 from .normalization import normalize_graph_core
 from .opset import downgrade_opset_core
 from .qdq import lower_qdq_core
@@ -31,6 +32,7 @@ _logger = get_logger(__name__)
 class AdapterConfig:
     """Configure the MDC ONNX graph adapter."""
 
+    fold_constants: bool = True
     fuse_rms_norm: bool = True
     fuse_apply_rotary_pos_emb: bool = True
     fuse_fused_infer_attention_score: bool = True
@@ -132,9 +134,13 @@ class OnnxAdapter:
         source_nodes = sum(1 for _ in _nodes(working.graph))
         source_opset = _default_opset(working)
         fusion_passes = self._selected_fusion_passes()
+        constant_folding_stages: Sequence[tuple[str, Callable[[onnx.ModelProto], object]]] = (
+            (("constant folding", fold_constants_core),) if self._config.fold_constants else ()
+        )
         stages: Sequence[tuple[str, Callable[[onnx.ModelProto], object]]] = (
             ("QDQ lowering", lower_qdq_core),
             ("schema registration before lowering", _register_required_schemas),
+            *constant_folding_stages,
             ("compatibility lowering", lower_opset_compatibility_core),
             ("opset downgrade", downgrade_opset_core),
             ("graph normalization", normalize_graph_core),
@@ -150,8 +156,9 @@ class OnnxAdapter:
             self._config.show_progress,
         )
         _logger.debug(
-            "ONNX adapter configuration: fuse_rms_norm=%s "
+            "ONNX adapter configuration: fold_constants=%s fuse_rms_norm=%s "
             "fuse_apply_rotary_pos_emb=%s fuse_fused_infer_attention_score=%s",
+            self._config.fold_constants,
             self._config.fuse_rms_norm,
             self._config.fuse_apply_rotary_pos_emb,
             self._config.fuse_fused_infer_attention_score,

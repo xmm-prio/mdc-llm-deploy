@@ -23,6 +23,23 @@ def _identity_model(*, opset: int = 21) -> onnx.ModelProto:
     return helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)])
 
 
+def _constant_expression_model() -> onnx.ModelProto:
+    graph = helper.make_graph(
+        [
+            helper.make_node("Add", ["left", "right"], ["constant"]),
+            helper.make_node("Mul", ["x", "constant"], ["y"]),
+        ],
+        "constant_expression",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [2])],
+        initializer=[
+            numpy_helper.from_array(np.array([1.0, 2.0], dtype=np.float32), "left"),
+            numpy_helper.from_array(np.array([3.0, 4.0], dtype=np.float32), "right"),
+        ],
+    )
+    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+
+
 def _qdq_model() -> onnx.ModelProto:
     nodes = [
         helper.make_node("QuantizeLinear", ["x", "a_scale", "a_zp"], ["a_q"]),
@@ -78,6 +95,30 @@ def test_adapter_runs_complete_atomic_pipeline() -> None:
     onnx.checker.check_model(model)
 
 
+def test_adapter_folds_constant_subgraphs() -> None:
+    model = _constant_expression_model()
+
+    returned = OnnxAdapter(AdapterConfig(show_progress=False))(model)
+
+    assert returned is model
+    assert [node.op_type for node in model.graph.node] == ["Mul"]
+    initializers = {
+        tensor.name: numpy_helper.to_array(tensor) for tensor in model.graph.initializer
+    }
+    assert set(initializers) == {"constant"}
+    np.testing.assert_array_equal(initializers["constant"], [4.0, 6.0])
+    onnx.checker.check_model(model)
+
+
+def test_adapter_can_disable_constant_folding() -> None:
+    model = _constant_expression_model()
+
+    OnnxAdapter(AdapterConfig(fold_constants=False, show_progress=False))(model)
+
+    assert [node.op_type for node in model.graph.node] == ["Add", "Mul"]
+    assert {tensor.name for tensor in model.graph.initializer} == {"left", "right"}
+
+
 def test_adapter_progress_and_stage_logs_can_be_controlled(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
@@ -91,6 +132,7 @@ def test_adapter_progress_and_stage_logs_can_be_controlled(
     assert "ONNX final validation completed" in caplog.text
     assert "source_opset=21 fusion_passes=3 show_progress=True" in caplog.text
     assert "target_opset=18" in caplog.text
+    assert "fold_constants=True" in caplog.text
     assert "fuse_rms_norm=True" in caplog.text
 
     OnnxAdapter(AdapterConfig(show_progress=False))(_identity_model())
@@ -111,6 +153,7 @@ def test_adapter_stage_order(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(adapter_module, "lower_qdq_core", stage("lower"))
     monkeypatch.setattr(adapter_module, "_register_required_schemas", stage("register"))
+    monkeypatch.setattr(adapter_module, "fold_constants_core", stage("constant_folding"))
     monkeypatch.setattr(
         adapter_module,
         "lower_opset_compatibility_core",
@@ -126,6 +169,7 @@ def test_adapter_stage_order(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls == [
         "lower",
         "register",
+        "constant_folding",
         "compatibility",
         "downgrade",
         "normalization",
@@ -135,11 +179,27 @@ def test_adapter_stage_order(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
 
 
+def test_adapter_skips_disabled_constant_folding_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def record(_model: onnx.ModelProto) -> None:
+        calls.append("constant_folding")
+
+    monkeypatch.setattr(adapter_module, "fold_constants_core", record)
+
+    OnnxAdapter(AdapterConfig(fold_constants=False, show_progress=False))(_identity_model())
+
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     "failing_stage",
     [
         "lower",
         "register",
+        "constant_folding",
         "compatibility",
         "downgrade",
         "normalization",
@@ -161,6 +221,7 @@ def test_adapter_failure_rolls_back_original_model(
     target = {
         "lower": "lower_qdq_core",
         "register": "_register_required_schemas",
+        "constant_folding": "fold_constants_core",
         "compatibility": "lower_opset_compatibility_core",
         "downgrade": "downgrade_opset_core",
         "normalization": "normalize_graph_core",
