@@ -15,8 +15,8 @@ from mdc_llm_deploy.quantization import (
     quantization_state,
     quantize,
 )
-from mdc_llm_deploy.quantization.api import load_quantized_state_dict
-from mdc_llm_deploy.quantization.minmax.observer import QuantizationParameters
+from mdc_llm_deploy.quantization.algorithms.minmax.observer import QuantizationParameters
+from mdc_llm_deploy.quantization.lifecycle.api import load_quantized_state_dict
 
 
 def _supported_configs() -> list[MinMaxConfig]:

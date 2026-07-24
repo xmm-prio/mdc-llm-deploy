@@ -19,7 +19,7 @@ from examples.qwen3_8b_fp16_export import (
     make_stage_inputs,
     position_ids_from_index,
 )
-from mdc_llm_deploy.onnx.schemas import (
+from mdc_llm_deploy.onnx.schema import (
     FUSED_INFER_ATTENTION_SCORE_OP,
     RMS_NORM_OP,
     ROTARY_POSITION_EMBEDDING_OP,

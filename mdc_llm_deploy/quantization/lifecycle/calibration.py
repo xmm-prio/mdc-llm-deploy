@@ -8,7 +8,7 @@ from typing import Any, TypeAlias
 import torch
 from torch import nn
 
-from ..._observability import progress_task
+from ...core.observability import progress_task
 
 CalibrationBatch: TypeAlias = Mapping[str, Any]
 

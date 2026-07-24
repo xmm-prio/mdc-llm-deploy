@@ -1,6 +1,14 @@
 """Extensible in-place quantization API."""
 
-from .api import (
+from .algorithms.minmax import MinMaxConfig, MinMaxLinear, MinMaxQuantizer
+from .lifecycle import (
+    CalibrationBatch,
+    QuantizationConfig,
+    QuantizationState,
+    Quantizer,
+    TargetSelector,
+)
+from .lifecycle.api import (
     calibrate,
     convert,
     load_quantized_state_dict,
@@ -8,14 +16,6 @@ from .api import (
     quantization_state,
     quantize,
 )
-from .base import (
-    CalibrationBatch,
-    QuantizationConfig,
-    QuantizationState,
-    Quantizer,
-    TargetSelector,
-)
-from .minmax import MinMaxConfig, MinMaxLinear, MinMaxQuantizer
 
 __all__ = [
     "CalibrationBatch",

@@ -96,13 +96,13 @@ pass；需要运行自定义 pass 时，应显式调用该独立编排器。
 
 ## Schema 生命周期
 
-全部自定义 schema 集中在 `mdc_llm_deploy.onnx.schemas`，包括量化、
+全部自定义 schema 集中在 `mdc_llm_deploy.onnx.schema`，包括量化、
 `NPURmsNorm`、`ApplyRotaryPosEmb` 和 `FusedInferAttentionScore`。导入
 `mdc_llm_deploy.onnx` 或 schema 包都不会修改 ONNX 进程内 registry。
 调用方按节点名显式注册：
 
 ```python
-from mdc_llm_deploy.onnx.schemas import register_schemas
+from mdc_llm_deploy.onnx.schema import register_schemas
 
 register_schemas("NPURmsNorm", "ApplyRotaryPosEmb")
 ```

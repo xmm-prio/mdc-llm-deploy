@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
-from ..base import QuantizationConfig
+from ...lifecycle.config import QuantizationConfig
 
 WeightGranularity: TypeAlias = Literal["per_tensor", "per_channel"]
 ActivationGranularity: TypeAlias = Literal["per_tensor", "per_token"]

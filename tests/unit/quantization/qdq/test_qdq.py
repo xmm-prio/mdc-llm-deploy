@@ -13,7 +13,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.exporters import OnnxConfig, OnnxExporter
 
-from mdc_llm_deploy.quantization.qdq import (
+from mdc_llm_deploy.quantization.operators.qdq import (
     qdq,
     register_qdq_operator,
     warn_unvalidated_torch_version,
@@ -81,7 +81,7 @@ def _assert_standard_symmetric_qdq(model: onnx.ModelProto) -> None:
 def test_import_has_no_operator_registration_side_effect() -> None:
     result = _run_isolated(
         "import torch\n"
-        "import mdc_llm_deploy.quantization.qdq\n"
+        "import mdc_llm_deploy.quantization.operators.qdq\n"
         "names = torch._C._dispatch_get_all_op_names()\n"
         "assert 'mdc_llm_deploy::qdq' not in names\n"
     )
@@ -143,13 +143,13 @@ def test_version_mismatch_warns_and_continues(
         return "2.12.0+build"
 
     monkeypatch.setattr(
-        "mdc_llm_deploy.quantization.qdq._registration.metadata.version",
+        "mdc_llm_deploy.quantization.operators.qdq.registration.metadata.version",
         fake_version,
     )
 
     with caplog.at_level(
         "WARNING",
-        logger="mdc_llm_deploy.quantization.qdq._registration",
+        logger="mdc_llm_deploy.quantization.operators.qdq.registration",
     ):
         warn_unvalidated_torch_version()
 
@@ -161,7 +161,7 @@ def test_version_mismatch_warns_and_continues(
 def test_lazy_registration_is_thread_safe_and_idempotent() -> None:
     result = _run_isolated(
         "from concurrent.futures import ThreadPoolExecutor\n"
-        "from mdc_llm_deploy.quantization.qdq import register_qdq_operator\n"
+        "from mdc_llm_deploy.quantization.operators.qdq import register_qdq_operator\n"
         "with ThreadPoolExecutor(max_workers=16) as executor:\n"
         "    operators = list(executor.map(lambda _: register_qdq_operator(), range(64)))\n"
         "assert all(operator is operators[0] for operator in operators)\n"
@@ -177,7 +177,7 @@ def test_existing_operator_name_conflict_fails_strictly() -> None:
         "def occupied(inputs: torch.Tensor, scale: torch.Tensor, "
         "zero_point: torch.Tensor | None, axis: int | None) -> torch.Tensor:\n"
         "    return inputs\n"
-        "from mdc_llm_deploy.quantization.qdq import register_qdq_operator\n"
+        "from mdc_llm_deploy.quantization.operators.qdq import register_qdq_operator\n"
         "register_qdq_operator()\n"
     )
 

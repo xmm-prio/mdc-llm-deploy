@@ -2,8 +2,8 @@
 
 from .calibration import CalibrationBatch, run_calibration
 from .config import QuantizationConfig
-from .lifecycle import QuantizationState, Quantizer
 from .selector import TargetSelector
+from .state import QuantizationState, Quantizer
 
 __all__ = [
     "CalibrationBatch",

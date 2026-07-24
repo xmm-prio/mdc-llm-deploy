@@ -78,7 +78,7 @@ def test_calibration_progress_and_stage_logs_can_be_controlled(
     prepare(model, MinMaxConfig())
     capsys.readouterr()
 
-    with caplog.at_level("INFO", logger="mdc_llm_deploy.quantization.api"):
+    with caplog.at_level("INFO", logger="mdc_llm_deploy.quantization.lifecycle.api"):
         calibrate(model, [{"inputs": torch.ones(1, 2)}], show_progress=True)
 
     captured = capsys.readouterr()

@@ -9,12 +9,12 @@ from onnx import TensorProto, helper
 from onnx.reference import ReferenceEvaluator
 from onnx.reference.op_run import OpRun
 
-from mdc_llm_deploy.onnx.fusion_pass import (
+from mdc_llm_deploy.onnx.fusion import (
     FusionPassResult,
     FusionReport,
     fuse_rms_norm,
 )
-from mdc_llm_deploy.onnx.schemas import RMS_NORM_OP, register_schemas
+from mdc_llm_deploy.onnx.schema import RMS_NORM_OP, register_schemas
 
 _SHAPE = (2, 3, 4)
 _RSTD_SHAPE = (2, 3, 1)

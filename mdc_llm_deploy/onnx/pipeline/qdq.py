@@ -9,7 +9,7 @@ import numpy as np
 import onnx
 from onnx import NodeProto, TensorProto, helper, numpy_helper
 
-from ._graph import (
+from ..graph.utilities import (
     GraphIndex,
     TensorInfo,
     attribute_int,
@@ -21,7 +21,7 @@ from ._graph import (
     remove_value_info,
     unique_name,
 )
-from .schemas import ASCEND_DEQUANT_OP, ASCEND_QUANT_OP
+from ..schema import ASCEND_DEQUANT_OP, ASCEND_QUANT_OP
 
 _QDQ_OPS: Final = frozenset({"QuantizeLinear", "DequantizeLinear"})
 _FLOAT_DTYPES: Final = frozenset({TensorProto.FLOAT16, TensorProto.FLOAT})

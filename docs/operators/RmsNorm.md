@@ -12,7 +12,7 @@ NPURmsNorm(x, gamma, epsilon: FLOAT = 1e-6) -> (y, rstd)
 ```
 
 节点固定包含 2 个输入、2 个输出，属性名为 `epsilon`。schema 由
-`mdc_llm_deploy.onnx.schemas` 集中声明，`OnnxAdapter` 按模型实际节点注册。
+`mdc_llm_deploy.onnx.schema` 集中声明，`OnnxAdapter` 按模型实际节点注册。
 
 ## 融合范围
 

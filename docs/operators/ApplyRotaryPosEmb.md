@@ -16,7 +16,7 @@ ApplyRotaryPosEmb(
 ```
 
 节点固定包含 4 个输入、2 个输出。当前 Qwen3 融合固定生成 `layout=3`（BNSD）和
-`rotary_mode="half"`。schema 由 `mdc_llm_deploy.onnx.schemas` 集中声明，
+`rotary_mode="half"`。schema 由 `mdc_llm_deploy.onnx.schema` 集中声明，
 `OnnxAdapter` 按模型实际节点注册。
 
 ## 融合范围

@@ -10,7 +10,7 @@ import numpy as np
 import onnx
 from onnx import NodeProto, TensorProto, helper
 
-from .._graph import (
+from ..graph.utilities import (
     GraphIndex,
     TensorInfo,
     attribute_int,
@@ -20,8 +20,8 @@ from .._graph import (
     remove_value_info,
     unique_name,
 )
-from ..schemas import FUSED_INFER_ATTENTION_SCORE_OP
-from .base import FusionPassResult
+from ..schema import FUSED_INFER_ATTENTION_SCORE_OP
+from .contracts import FusionPassResult
 
 _PASS_NAME: Final = "fused_infer_attention_score"
 _SUPPORTED_DTYPES: Final = frozenset({TensorProto.FLOAT16, TensorProto.BFLOAT16})

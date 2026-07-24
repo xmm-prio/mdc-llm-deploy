@@ -7,7 +7,7 @@ import onnx
 import pytest
 from onnx.defs import OpSchema
 
-from mdc_llm_deploy.onnx.schemas import (
+from mdc_llm_deploy.onnx.schema import (
     ALL_SCHEMA_NAMES,
     ASCEND_DEQUANT_OP,
     ASCEND_QUANT_OP,
@@ -112,7 +112,7 @@ def test_schema_import_is_lazy_and_selected_registration_checks_model() -> None:
     _run_script(
         """
 import onnx
-from mdc_llm_deploy.onnx.schemas import (
+from mdc_llm_deploy.onnx.schema import (
     ALL_SCHEMA_NAMES, RMS_NORM_OP, register_schemas,
 )
 
@@ -162,7 +162,7 @@ def test_unknown_schema_name_is_rejected_before_registry_writes() -> None:
     _run_script(
         """
 import onnx
-from mdc_llm_deploy.onnx.schemas import ALL_SCHEMA_NAMES, register_schemas
+from mdc_llm_deploy.onnx.schema import ALL_SCHEMA_NAMES, register_schemas
 
 try:
     register_schemas("MissingMdcSchema")
@@ -187,7 +187,7 @@ def test_conflicting_existing_schema_is_rejected() -> None:
         """
 import onnx
 from onnx.defs import OpSchema
-from mdc_llm_deploy.onnx.schemas import OnnxSchemaConflictError, RMS_NORM_OP, register_schemas
+from mdc_llm_deploy.onnx.schema import OnnxSchemaConflictError, RMS_NORM_OP, register_schemas
 
 parameter = OpSchema.FormalParameter
 onnx.defs.register_schema(OpSchema(
@@ -209,7 +209,7 @@ else:
 
 
 def test_conflicting_duplicate_batch_is_rejected_before_write() -> None:
-    from mdc_llm_deploy.onnx.schemas import (
+    from mdc_llm_deploy.onnx.schema import (
         OnnxSchemaConflictError,
         register_schema_objects,
     )

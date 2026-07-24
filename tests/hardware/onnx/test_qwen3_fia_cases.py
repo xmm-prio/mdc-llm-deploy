@@ -10,7 +10,7 @@ from pathlib import Path
 import onnx
 import pytest
 
-from mdc_llm_deploy.onnx.schemas import FUSED_INFER_ATTENTION_SCORE_OP
+from mdc_llm_deploy.onnx.schema import FUSED_INFER_ATTENTION_SCORE_OP
 from tests.hardware.onnx.qwen3_fia_cases import HARDWARE_CASES, generate
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]

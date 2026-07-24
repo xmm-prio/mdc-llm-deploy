@@ -10,7 +10,7 @@ from typing import cast
 import torch
 from torch import Tensor
 
-from ..._observability import get_logger
+from ....core.observability import get_logger
 
 _EXPECTED_TORCH_VERSION = "2.12.0"
 _OPERATOR_NAME = "mdc_llm_deploy::qdq"

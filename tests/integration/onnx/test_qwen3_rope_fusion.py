@@ -4,10 +4,10 @@ import onnx
 import pytest
 import torch
 
-from mdc_llm_deploy.onnx.fusion_pass.apply_rotary_pos_emb import (
+from mdc_llm_deploy.onnx.fusion.apply_rotary_pos_emb import (
     fuse_apply_rotary_pos_emb,
 )
-from mdc_llm_deploy.onnx.schemas import (
+from mdc_llm_deploy.onnx.schema import (
     ROTARY_POSITION_EMBEDDING_OP,
     register_schemas,
 )

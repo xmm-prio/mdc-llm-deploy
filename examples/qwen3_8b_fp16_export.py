@@ -27,11 +27,11 @@ from mdc_llm_deploy.onnx import (
     lower_opset_compatibility,
     normalize_graph,
 )
-from mdc_llm_deploy.onnx.fusion_pass import (
+from mdc_llm_deploy.onnx.fusion import (
     fuse_apply_rotary_pos_emb,
     fuse_rms_norm,
 )
-from mdc_llm_deploy.onnx.schemas import (
+from mdc_llm_deploy.onnx.schema import (
     FUSED_INFER_ATTENTION_SCORE_OP,
     RMS_NORM_OP,
     ROTARY_POSITION_EMBEDDING_OP,

@@ -10,7 +10,7 @@ import numpy as np
 import onnx
 from onnx import NodeProto, TensorProto, helper, numpy_helper
 
-from .._graph import (
+from ..graph.utilities import (
     GraphIndex,
     TensorInfo,
     attribute_int,
@@ -19,8 +19,8 @@ from .._graph import (
     remove_value_info,
     unique_name,
 )
-from ..schemas import RMS_NORM_OP
-from .base import FusionPassResult
+from ..schema import RMS_NORM_OP
+from .contracts import FusionPassResult
 
 _PASS_NAME: Final = "rms_norm"
 _SUPPORTED_DTYPES: Final = frozenset(

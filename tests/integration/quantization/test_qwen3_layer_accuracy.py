@@ -14,7 +14,7 @@ from examples.qwen3_8b_layer_accuracy.artifacts import LAYER_ADAPTER_CONFIG
 from examples.qwen3_8b_layer_accuracy.metrics import SaturationCollector, compare_tensors
 from examples.qwen3_8b_layer_accuracy.modeling import Qwen3DecoderLayerHarness
 from mdc_llm_deploy.onnx import OnnxAdapter
-from mdc_llm_deploy.onnx.schemas import (
+from mdc_llm_deploy.onnx.schema import (
     FUSED_INFER_ATTENTION_SCORE_OP,
     RMS_NORM_OP,
     ROTARY_POSITION_EMBEDDING_OP,

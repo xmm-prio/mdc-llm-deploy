@@ -5,9 +5,9 @@ import pytest
 import torch
 from onnx import TensorProto, helper
 
-from mdc_llm_deploy.onnx._graph import GraphIndex
-from mdc_llm_deploy.onnx.fusion_pass import fuse_fused_infer_attention_score
-from mdc_llm_deploy.onnx.schemas import (
+from mdc_llm_deploy.onnx.fusion import fuse_fused_infer_attention_score
+from mdc_llm_deploy.onnx.graph import GraphIndex
+from mdc_llm_deploy.onnx.schema import (
     FUSED_INFER_ATTENTION_SCORE_OP,
     register_schemas,
 )

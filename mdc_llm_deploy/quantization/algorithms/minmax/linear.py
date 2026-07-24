@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as functional
 from torch import Tensor, nn
 
-from ..qdq import qdq
+from ...operators.qdq import qdq
 from .observer import MinMaxObserver, QuantizationParameters
 from .qparams import _QParamBinding, _QParamPrefix
 

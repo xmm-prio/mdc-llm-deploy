@@ -8,7 +8,7 @@ import numpy as np
 import onnx
 from onnx import GraphProto, NodeProto, TensorProto, ValueInfoProto, helper, numpy_helper
 
-from ._graph import (
+from ..graph.utilities import (
     GraphIndex,
     attribute_int,
     clone_model,

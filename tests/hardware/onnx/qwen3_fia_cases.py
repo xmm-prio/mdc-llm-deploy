@@ -16,7 +16,7 @@ from google.protobuf.message import Message
 from onnx import TensorProto, ValueInfoProto, helper
 
 from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
-from mdc_llm_deploy.onnx.schemas import (
+from mdc_llm_deploy.onnx.schema import (
     CANN_FIA_SOURCE_COMMIT,
     FUSED_INFER_ATTENTION_SCORE_OP,
 )

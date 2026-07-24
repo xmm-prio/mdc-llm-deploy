@@ -9,9 +9,11 @@ from typing import Any
 
 from torch import Tensor, nn
 
-from .._observability import get_logger, log_stage
-from .base import CalibrationBatch, QuantizationConfig, QuantizationState, Quantizer
-from .minmax import MinMaxConfig, MinMaxQuantizer
+from ...core.observability import get_logger, log_stage
+from ..algorithms.minmax import MinMaxConfig, MinMaxQuantizer
+from .calibration import CalibrationBatch
+from .config import QuantizationConfig
+from .state import QuantizationState, Quantizer
 
 _SESSION_ATTRIBUTE = "_mdc_quantization_session"
 _logger = get_logger(__name__)

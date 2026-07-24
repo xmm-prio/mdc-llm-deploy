@@ -9,10 +9,10 @@ from onnx import TensorProto, helper
 from onnx.reference import ReferenceEvaluator
 from onnx.reference.op_run import OpRun
 
-from mdc_llm_deploy.onnx.fusion_pass.apply_rotary_pos_emb import (
+from mdc_llm_deploy.onnx.fusion.apply_rotary_pos_emb import (
     fuse_apply_rotary_pos_emb,
 )
-from mdc_llm_deploy.onnx.schemas import (
+from mdc_llm_deploy.onnx.schema import (
     ROTARY_POSITION_EMBEDDING_OP,
     register_schemas,
 )

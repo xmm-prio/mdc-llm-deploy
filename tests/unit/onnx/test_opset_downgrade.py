@@ -5,8 +5,8 @@ import onnx
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
-from mdc_llm_deploy.onnx.opset_downgrade import downgrade_opset
-from mdc_llm_deploy.onnx.schemas import ASCEND_QUANT_OP, register_schemas
+from mdc_llm_deploy.onnx.pipeline.opset import downgrade_opset
+from mdc_llm_deploy.onnx.schema import ASCEND_QUANT_OP, register_schemas
 
 
 def _identity_model(opset: int = 21) -> onnx.ModelProto:

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
-from mdc_llm_deploy.onnx.schemas import (
+from mdc_llm_deploy.onnx.schema import (
     FUSED_INFER_ATTENTION_SCORE_OP,
     RMS_NORM_OP,
     ROTARY_POSITION_EMBEDDING_OP,

@@ -10,7 +10,7 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 from transformers.exporters import OnnxConfig, OnnxExporter
 
 from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
-from mdc_llm_deploy.onnx.schemas import FUSED_INFER_ATTENTION_SCORE_OP
+from mdc_llm_deploy.onnx.schema import FUSED_INFER_ATTENTION_SCORE_OP
 from mdc_llm_deploy.quantization import (
     MinMaxConfig,
     MinMaxLinear,

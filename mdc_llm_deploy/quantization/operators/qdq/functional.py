@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from ._registration import register_qdq_operator
+from .registration import register_qdq_operator
 
 
 def qdq(

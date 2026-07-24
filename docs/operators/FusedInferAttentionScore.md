@@ -26,7 +26,7 @@ q_start_idx, kv_start_idx
 ```
 
 输出固定为 `attention_out`、`softmax_lse`。`num_heads` 为必填属性；其余属性和
-默认值与冻结源码一致。schema 由 `mdc_llm_deploy.onnx.schemas` 集中声明，
+默认值与冻结源码一致。schema 由 `mdc_llm_deploy.onnx.schema` 集中声明，
 `OnnxAdapter` 按模型实际节点注册。
 
 ## 融合范围

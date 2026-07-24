@@ -7,8 +7,8 @@
 
 ## 源码映射
 
-- lowering：`mdc_llm_deploy.onnx.quant_lowering`
-- ONNX schema：`mdc_llm_deploy.onnx.schemas`
+- lowering：`mdc_llm_deploy.onnx.pipeline.qdq`
+- ONNX schema：`mdc_llm_deploy.onnx.schema`
 - 源码函数使用 snake_case，ONNX `op_type` 使用上方固定名称。
 
 ## ONNX OP 原型

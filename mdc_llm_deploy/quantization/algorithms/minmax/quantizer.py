@@ -9,8 +9,9 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from ..._observability import get_logger
-from ..base import CalibrationBatch, QuantizationState, Quantizer, run_calibration
+from ....core.observability import get_logger
+from ...lifecycle.calibration import CalibrationBatch, run_calibration
+from ...lifecycle.state import QuantizationState, Quantizer
 from .config import MinMaxConfig
 from .linear import MinMaxLinear
 from .observer import MinMaxObserver

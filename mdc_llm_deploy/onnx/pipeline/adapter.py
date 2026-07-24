@@ -8,20 +8,20 @@ from dataclasses import dataclass
 import onnx
 from onnx import GraphProto, NodeProto
 
-from .._observability import get_logger, log_stage, progress_task
-from ._graph import clone_model
-from .compatibility_lowering import lower_opset_compatibility_core
-from .fusion_pass import (
+from ...core.observability import get_logger, log_stage, progress_task
+from ..fusion import (
     APPLY_ROTARY_POS_EMB_FUSION_PASS,
     FUSED_INFER_ATTENTION_SCORE_FUSION_PASS,
     RMS_NORM_FUSION_PASS,
     FusionPass,
     run_fusion_passes,
 )
+from ..graph import clone_model
+from ..schema import ALL_SCHEMA_NAMES, register_schemas
+from .compatibility import lower_opset_compatibility_core
 from .normalization import normalize_graph_core
-from .opset_downgrade import downgrade_opset_core
-from .quant_lowering import lower_qdq_core
-from .schemas import ALL_SCHEMA_NAMES, register_schemas
+from .opset import downgrade_opset_core
+from .qdq import lower_qdq_core
 
 _CUSTOM_SCHEMA_NAMES = frozenset(ALL_SCHEMA_NAMES)
 _logger = get_logger(__name__)

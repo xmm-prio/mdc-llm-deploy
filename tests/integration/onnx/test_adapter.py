@@ -10,7 +10,7 @@ import pytest
 from onnx import TensorProto, helper, numpy_helper
 
 from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
-from mdc_llm_deploy.onnx import adapter as adapter_module
+from mdc_llm_deploy.onnx.pipeline import adapter as adapter_module
 
 
 def _identity_model(*, opset: int = 21) -> onnx.ModelProto:
@@ -180,7 +180,7 @@ def test_adapter_rejects_non_model() -> None:
 def test_package_import_has_no_schema_registration_side_effect() -> None:
     code = """
 import onnx
-from mdc_llm_deploy.onnx.schemas import ALL_SCHEMA_NAMES
+from mdc_llm_deploy.onnx.schema import ALL_SCHEMA_NAMES
 import mdc_llm_deploy.onnx
 for name in ALL_SCHEMA_NAMES:
     try:
@@ -204,7 +204,7 @@ def test_adapter_registers_only_custom_schemas_present_in_graph() -> None:
 import onnx
 from onnx import TensorProto, helper
 from mdc_llm_deploy.onnx import AdapterConfig, OnnxAdapter
-from mdc_llm_deploy.onnx.schemas import ALL_SCHEMA_NAMES, RMS_NORM_OP
+from mdc_llm_deploy.onnx.schema import ALL_SCHEMA_NAMES, RMS_NORM_OP
 
 graph = helper.make_graph(
     [helper.make_node(RMS_NORM_OP, ["x", "gamma"], ["y", "rstd"], epsilon=1e-6)],

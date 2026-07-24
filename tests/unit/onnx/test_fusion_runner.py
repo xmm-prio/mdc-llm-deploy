@@ -6,8 +6,9 @@ import onnx
 import pytest
 from onnx import TensorProto, helper
 
-from mdc_llm_deploy.onnx import FusionReport, fusion_pass, run_fusion_passes
-from mdc_llm_deploy.onnx.fusion_pass import FusionPassResult
+from mdc_llm_deploy.onnx import FusionReport, run_fusion_passes
+from mdc_llm_deploy.onnx.fusion import FusionPassResult
+from mdc_llm_deploy.onnx.fusion import runner as fusion_runner
 
 
 def _identity_model() -> onnx.ModelProto:
@@ -62,7 +63,7 @@ def test_run_fusion_passes_keeps_prior_results_when_later_pass_fails(
 ) -> None:
     model = _identity_model()
     monkeypatch.setattr(
-        fusion_pass,
+        fusion_runner,
         "_FUSION_PASSES",
         (_RecordingPass("first"), _RecordingPass("second", fail=True)),
     )

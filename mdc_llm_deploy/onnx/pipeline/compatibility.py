@@ -8,7 +8,7 @@ import numpy as np
 import onnx
 from onnx import AttributeProto, GraphProto, NodeProto, ValueInfoProto, numpy_helper
 
-from ._graph import clone_model
+from ..graph import clone_model
 
 
 def _static_shape(value: ValueInfoProto) -> tuple[int, ...] | None:

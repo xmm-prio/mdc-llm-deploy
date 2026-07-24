@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 from onnx import TensorProto, helper
 
-from mdc_llm_deploy.onnx._graph import GraphIndex, constant_array
+from mdc_llm_deploy.onnx.graph import GraphIndex, constant_array
 
 
 def test_constant_array_evaluates_constant_reshape() -> None:

@@ -5,7 +5,7 @@ import onnx
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
-from mdc_llm_deploy.onnx.compatibility_lowering import lower_opset_compatibility
+from mdc_llm_deploy.onnx.pipeline.compatibility import lower_opset_compatibility
 
 
 def _split_model(

@@ -10,10 +10,10 @@ import torch
 from onnx import TensorProto, helper, numpy_helper
 from onnx.reference import ReferenceEvaluator
 
-from mdc_llm_deploy.onnx.fusion_pass.fused_infer_attention_score import (
+from mdc_llm_deploy.onnx.fusion.fused_infer_attention_score import (
     fuse_fused_infer_attention_score,
 )
-from mdc_llm_deploy.onnx.schemas import (
+from mdc_llm_deploy.onnx.schema import (
     FUSED_INFER_ATTENTION_SCORE_OP,
     register_schemas,
 )

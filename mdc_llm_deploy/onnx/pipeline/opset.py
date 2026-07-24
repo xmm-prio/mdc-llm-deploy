@@ -7,8 +7,8 @@ from collections.abc import Iterator
 import onnx
 from onnx import GraphProto, NodeProto, defs
 
-from ._graph import clone_model
-from .schemas import ASCEND_DEQUANT_OP, ASCEND_QUANT_OP, MDC_ONNX_OPSET
+from ..graph import clone_model
+from ..schema import ASCEND_DEQUANT_OP, ASCEND_QUANT_OP, MDC_ONNX_OPSET
 
 _MDC_OPERATORS = frozenset({ASCEND_QUANT_OP, ASCEND_DEQUANT_OP})
 
